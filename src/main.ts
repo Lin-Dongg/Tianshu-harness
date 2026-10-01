@@ -24,7 +24,7 @@ installEpermFilter()
 // start when it cannot. No-op outside a staged layout (tsx dev runs).
 assertStagedRuntimeIntact(dirname(fileURLToPath(import.meta.url)))
 
-import { bootstrapInteractiveSession, createShutdownHandler, switchAgentRuntime, restorePlanModeFromMeta } from './bootstrap.js'
+import { bootstrapInteractiveSession, createShutdownHandler, switchAgentRuntime, restorePlanModeFromMeta, getOrCreateSessionId, wasSessionResumed } from './bootstrap.js'
 import type { BootstrapContext } from './bootstrap.js'
 import { resolveCapabilities } from './api/provider.js'
 import { createExitFuse } from './platform/exit-fuse.js'
@@ -424,7 +424,12 @@ async function main() {
       ? (tryResolveCredentialKey({ name: prov.name, keyRef: ownerKey.keyRef, apiKey: ownerKey.apiKey, apiKeyEnv: ownerKey.apiKeyEnv }) ?? '')
       : (prov.apiKey ?? process.env[prov.apiKeyEnv ?? ''])
     if (!key) { process.stderr.write(`API key not set. Export ${prov.apiKeyEnv ?? 'API_KEY'} or run: rivet config setup ${prov.name}\n`); process.exit(1) }
-    const sessionId = crypto.randomUUID()
+    // Session selection (Claude Code parity): resolve through the same contract the TUI
+    // uses so `--continue` / `--resume <id>` actually take effect. main() only sets the
+    // resume env vars (RIVET_RESUME / RIVET_RESUME_ID) before this point; minting a fresh
+    // UUID here bypassed them entirely — every headless run started a brand-new session
+    // and the requested history was never loaded (no error, no hint).
+    const sessionId = getOrCreateSessionId()
 
     // --budget N (default 100) is the hard turn cap for goal mode; it doubles as
     // the GoalTracker iteration budget so the two limits coincide. Non-goal -p
@@ -574,6 +579,14 @@ async function main() {
           auth: undefined,
         }))
         const session = new SessionContext()
+        // Resume: rehydrate the persisted transcript into this fresh context. Mirrors the
+        // TUI startup path (persist.loadOai() + replaceMessages()) and serve's
+        // restoreHistoryMessages(); without it a resumed headless run lists the history in
+        // the session index but hands the model an empty conversation.
+        if (wasSessionResumed()) {
+          const priorMessages = new SessionPersist(sessionId, process.cwd()).loadOai()
+          if (priorMessages.length > 0) session.replaceMessages(priorMessages)
+        }
         // one-shot 显式不启用 zen：无人值守会话没有 /fast 通道，读面收窄对脚本化
         // 任务也无意义。此处钉住 zen 而不是依赖 createAgentConfig「恰好」不透传——
         // 后者一旦把 zen 并入返回白名单，one-shot 就会静默 arm（且无用户可解锁）。
