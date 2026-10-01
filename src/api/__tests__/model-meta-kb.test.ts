@@ -22,11 +22,34 @@ describe('MODEL_META_KB', () => {
   })
 
   it('all entries have reasoningSplit capability set', () => {
+    // 例外是「本就不走推理分叉通道」的型号，而不是「漏了」：
+    //   - glm-4-long / glm-4-flashx-250414：老型号无思考输出通道；
+    //   - MiMo v2.6：预设未声明 reasoningSplit，带上会让 openai-client 往请求体
+    //     注入 reasoning_split（src/api/openai-client.ts:603），MiMo 不吃这个参数。
+    const exempt = new Set([
+      'glm-4-long',
+      'glm-4-flashx-250414',
+      'mimo-v2.6-pro',
+      'mimo-v2.6-flash',
+    ])
     for (const entry of MODEL_META_KB) {
       const hasReasoning = entry.metadata?.capabilities?.reasoningSplit === true
-      if (!['glm-4-long', 'glm-4-flashx-250414'].includes(entry.canonicalId)) {
+      if (!exempt.has(entry.canonicalId)) {
         assert.ok(hasReasoning, `${entry.canonicalId} should have reasoningSplit`)
       }
+    }
+  })
+
+  it('contains MiMo v2.6 entries with official specs (1M context / 128K output / vision)', () => {
+    // 官方 mimo.mi.com 模型页：输入模态 Text/Image/Video/Audio，上下文 1M，最大输出 128K。
+    // 回归态：两条均缺席 → 向导「从接口拉取列表」后视觉不勾（isVisionCapableId 读不到
+    // supportsVision）、上下文落默认值（实测 flash 显示 128K）。
+    for (const id of ['mimo-v2.6-pro', 'mimo-v2.6-flash']) {
+      const entry = MODEL_META_KB.find(e => e.canonicalId === id)
+      assert.ok(entry, `${id} must be in KB`)
+      assert.equal(entry!.metadata.contextWindow, 1_000_000, `${id} 上下文`)
+      assert.equal(entry!.metadata.maxTokens, 128_000, `${id} 最大输出`)
+      assert.equal(entry!.metadata.supportsVision, true, `${id} 必须标为多模态`)
     }
   })
 
