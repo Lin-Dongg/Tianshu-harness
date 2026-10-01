@@ -32,9 +32,21 @@ export const VISION_PROBE_GROUND_TRUTH = '一张 16×16 像素的纯红色正方
 const VISION_PROBE_PROMPT = '请用一句简短的话描述这张图片的内容。'
 const VISION_PROBE_MAX_TOKENS = 100
 
-/** 别名表认定为识图/多模态的型号才走视觉真测（metadata.supportsVision）。 */
+/**
+ * 别名表**认定**为识图/多模态的型号才走视觉真测（metadata.supportsVision）。
+ *
+ * L3 模糊命中（needsReview=true）不算「认定」——那是按 token 相似度猜的，会跨厂商串味：
+ * 实测 `step-3.5-flash`（阶跃星辰，官方为纯语言模型）以 Jaccard 0.600 命中智谱
+ * `glm-5.3-flash`，于是继承了它的 supportsVision 与 1M/131072，在向导里被标成
+ * 「识图/多模态」并预填 1M/131K；而 `step-3.7-flash`（官方反而支持图片+视频）因为
+ * 查不到落了默认值。契约见 model-id-matcher.ts:21 / :35——L1/L2 静默回填，
+ * **L3 回填必须标注「推断值，请确认」**：推断值可以进可编辑的预填表单，但不能拿来做
+ * 能力断言。
+ */
 export function isVisionCapableId(rawId: string, table: readonly ModelAliasEntry[] = ENRICHED_ALIAS_TABLE): boolean {
-  return matchModelId(rawId, table).entry?.metadata.supportsVision === true
+  const match = matchModelId(rawId, table)
+  if (match.needsReview) return false
+  return match.entry?.metadata.supportsVision === true
 }
 
 export interface ProbeOptions {

@@ -825,3 +825,35 @@ describe('aliasTableWithProbeInfos', () => {
     assert.equal(kimi.entry?.metadata.maxTokens, undefined)
   })
 })
+
+describe('isVisionCapableId — L3 推断值不得当作能力依据', () => {
+  it('精确命中的多模态型号仍为 true（加闸不误伤）', async () => {
+    const { isVisionCapableId } = await import('../provider-probe.js')
+    assert.equal(isVisionCapableId('glm-4v-flash'), true)
+    assert.equal(isVisionCapableId('MiniMax-M3'), true)
+  })
+
+  it('L3 模糊命中（needsReview=true）→ false，即便命中的条目自称 supportsVision', async () => {
+    const { isVisionCapableId } = await import('../provider-probe.js')
+    const { matchModelId } = await import('../model-id-matcher.js')
+    const { ENRICHED_ALIAS_TABLE } = await import('../model-meta-kb.js')
+
+    // 前提三条都先钉住，否则这条用例会在「串味源变了」时静默变成假绿。
+    const m = matchModelId('step-3.5-flash', ENRICHED_ALIAS_TABLE)
+    assert.equal(m.tier, 'fuzzy', '前提：该 id 走 L3 推断')
+    assert.equal(m.needsReview, true, '前提：L3 必须带 needsReview 标记')
+    assert.equal(m.entry?.metadata.supportsVision, true, '前提：它命中的条目确实自称多模态——这正是串味来源')
+
+    // 实测背景：step-3.5-flash（阶跃星辰，官方为纯语言模型）以 Jaccard 0.600 命中智谱
+    // glm-5.3-flash，于是继承了 GLM 的 supportsVision 与 1M/131072 —— 向导里它被标成
+    // 「识图/多模态」、上下文预填 1M/131K；而 step-3.7-flash（官方反而支持图片+视频）
+    // 因为查不到落了默认值。契约见 model-id-matcher.ts:21 / :35：L1/L2 静默回填，
+    // L3 回填**必须标注**「推断值，请确认」——推断值不能拿来做能力断言。
+    assert.equal(isVisionCapableId('step-3.5-flash'), false, '推断出来的「多模态」不能当真')
+  })
+
+  it('完全未收录 → false', async () => {
+    const { isVisionCapableId } = await import('../provider-probe.js')
+    assert.equal(isVisionCapableId('step-3.7-flash'), false)
+  })
+})
