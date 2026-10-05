@@ -390,3 +390,4 @@ contributions for this graph`；`including commit co-authors` 仅 GHES 版本成
 
 - #354 fix(mcp): headless loads project MCP config; stdio connect timeout reclassified as protocol（CLOSED）
 - #353 fix: 解决会话草稿技能加载、打包子进程回退、事件环内存保护及相关高危缺陷 (#338, #342, #315)（CLOSED）
+- #345 fix(server): project-templates 路由补存活目录守卫——防止已删工作区触发 ENOENT 崩溃（CLOSED）
