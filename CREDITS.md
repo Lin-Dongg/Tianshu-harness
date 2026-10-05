@@ -383,3 +383,9 @@ contributions for this graph`；`including commit co-authors` 仅 GHES 版本成
 - #348 fix(fs): 原子编辑保留项目文件的执行权限（CLOSED）
 - #347 fix(tools): 收口目录 grep 与断链写入的文件访问边界（CLOSED）
 - #346 fix(agent): 保留 Bash 验证事实并按文件计算覆盖率（CLOSED）
+
+## @y521188
+
+署名：y521188 <185880799+y521188@users.noreply.github.com>
+
+- #354 fix(mcp): headless loads project MCP config; stdio connect timeout reclassified as protocol（CLOSED）
