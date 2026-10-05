@@ -378,3 +378,4 @@ contributions for this graph`；`including commit co-authors` 仅 GHES 版本成
 - #335 修复 CLI 会话交互并恢复终端原生回滚（MERGED）
 - #352 fix(repo): 让 Physarum 节点冻结按指定轮次到期（CLOSED）
 - #351 perf(repo): 将 Physarum 图缩放复杂度降为线性（CLOSED）
+- #350 fix(server): 将路由和请求读取异常限制在单次请求内（CLOSED）
