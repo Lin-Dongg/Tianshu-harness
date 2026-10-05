@@ -376,3 +376,4 @@ contributions for this graph`；`including commit co-authors` 仅 GHES 版本成
 - #343 feat(tui): 常驻余额角标——输入区状态行复用官方快照 (#98)（CLOSED）
 - #336 补齐 CLI 修复的贡献记录，修复主线对账失败（MERGED）
 - #335 修复 CLI 会话交互并恢复终端原生回滚（MERGED）
+- #352 fix(repo): 让 Physarum 节点冻结按指定轮次到期（CLOSED）
