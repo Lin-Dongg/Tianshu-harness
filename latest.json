@@ -1,15 +1,15 @@
 {
   "version": "3.28.0",
   "notes": "v3.28.0——压缩包附件直拖（不占上下文）；Git 工作台（变更/历史/分支/PR + AI 审查）；模型异常与截断可见性（截断续写提醒/429 倒计时/错误引导）；上下文预算死锁修复；Gemini 原生协议；MCP rug-pull 防线；默认推理档 high；CLI 状态行符号化单行 + 余额角标；审批持久可恢复；P0 工具读取内存热修。完整清单见 docs/releases/v3.28.0.md。",
-  "pub_date": "2026-10-05T14:59:43.845Z",
+  "pub_date": "2026-10-05T17:11:49.862Z",
   "platforms": {
     "darwin-aarch64": {
       "url": "https://github.com/huiliyi37/Tianshu-harness/releases/download/v3.28.0/Tianshu_3.28.0_aarch64.app.tar.gz",
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR1FkQmprUDg0Z0hEbmp3UTVTMHQwNkVsU2hNTmUxZ3lDRDI4VDBwcnNibDQySTNna05lRFJvWEJMOXlnT05aNmt4Tnd3cXRhVUh6WVJDZ2c2Qm5uZWc4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxMjA5MTM3CWZpbGU6VGlhbnNodS5hcHAudGFyLmd6CkRhOXFMQzlSUGFZa0V1dGpoS1F3Q0tiRlFuR2s4VktwaFppcDhwWmtOcHNyN0NEL0V1azd1d291YXk5UGdKWGlPaFlWcWxUdFAwZWJZWkQvenErUkFRPT0K"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR2NkQmNNeVlYTENoNTB4SHNsSGtZdW1GTlhES0pDeFprdC9aeHQ5OFVTK2ZWQTVreEFWUTUrUjA3M0thWndwRkpsOEtGc01qQ1ZuaGhzbW5JRGR6ZGdvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxMjE5OTYyCWZpbGU6VGlhbnNodS5hcHAudGFyLmd6Ci9Kako4ZWl3Y3VOTE0zWVRPMGhkWFhxSGErNkdsTE9HeUU5Rkwwb1BoZVZkNHBUL1ZXZE9McmlXM0xFMXVZVzlJUHhLcnBmZ1VvdHIzN0lEOGRIUEJRPT0K"
     },
     "darwin-x86_64": {
       "url": "https://github.com/huiliyi37/Tianshu-harness/releases/download/v3.28.0/Tianshu_3.28.0_x64.app.tar.gz",
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR1hlbjlibDhVS2RrcUhlU1dINzB3aHJZcjJxZmVVU0F1dk16c2thRnNpWHdrSUpLeHpITzZBb216UHV2bHZqY3F2MjdFQVkzRmVTZGdGdHNzNGlzS1FvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxMjA5NDY1CWZpbGU6VGlhbnNodS5hcHAudGFyLmd6Cm1uWkpvcW1Rc0xmRWF3eHZrNks2MS9EWWRlOEo0WElqZTFaMWhnaVVyNGU4ZW5sWDhpUEU4Y0ZqWldrTGt1VVlYWTlKL0d1YWYvbVl4Ulg0NmJySUFRPT0K"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR1VIQXplREU2bm1PZmkzU1owOUw2bGVOajFRaHA5YWJvcDhCODY5eGZJdXd0NC9CLzgyRTZWYW9laGVCVXFCTVBxMUxZMHZOSzRaNm9ma2UyRFRDalFNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxMjIwMzA1CWZpbGU6VGlhbnNodS5hcHAudGFyLmd6CkpxUmhaZHozRG8vTWFyS3dDR2p5MHZyOUlMSkxHVTFyeUwwWjZlZGpab05pUmo4UGtib2dYTEVxK2NtVnlScW00Ky8rUmh1OEhHYUVrTkpGSCtaNUJBPT0K"
     },
     "windows-x86_64": {
       "url": "https://github.com/huiliyi37/Tianshu-harness/releases/download/v3.28.0/Tianshu_3.28.0_x64-setup.exe",
