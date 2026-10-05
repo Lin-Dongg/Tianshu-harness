@@ -43,7 +43,7 @@ export function historyText(text: string): string {
 
 function parseHistoryRow(line: string): UIRecord {
   const record = JSON.parse(line) as UIRecord
-  if (!record || !Number.isSafeInteger(record.id) || typeof record.text !== 'string' || !['user', 'assistant', 'thinking', 'tool', 'approval', 'error', 'boundary', 'notice'].includes(record.kind)) throw new Error('历史记录格式无效')
+  if (!record || !Number.isSafeInteger(record.id) || record.id <= 0 || typeof record.text !== 'string' || !['user', 'assistant', 'thinking', 'tool', 'approval', 'error', 'boundary', 'notice'].includes(record.kind)) throw new Error('历史记录格式无效')
   return { ...record, text: historyText(record.text), ...(record.input ? { input: sanitizeHistoryValue(record.input) as Record<string, unknown> } : {}) }
 }
 
@@ -89,6 +89,7 @@ export class UIHistory {
       h.bytes = offset
       h.persistedSize = h.size
     } catch (error) { h.saveFailed = true; h.failure = `历史读取失败，本轮最近 ${PAGE * 2} 条仍可回看：${error instanceof Error ? error.message : String(error)}` }
+    h.sequence = Math.max(h.sequence, h.size)
     return h
   }
 
@@ -177,6 +178,8 @@ export class UIHistory {
     const known = this.cache.get(block)
     if (known) { this.cache.delete(block); this.cache.set(block, known); return known }
     const start = block * PAGE
+    // The reader and its validation must refer to the same history snapshot.
+    const size = this.size, persistedSize = this.persistedSize
     let records: UIRecord[] = []
     if (this.path && start < this.persistedSize && this.offsets[block] !== undefined) {
       try {
@@ -184,15 +187,15 @@ export class UIHistory {
         const lines = createInterface({ input: stream, crlfDelay: Infinity })
         for await (const line of lines) {
           try { records.push(parseHistoryRow(line)) }
-          catch { this.failure = '部分历史记录损坏或不完整，已保留不可用占位'; records.push({ id: start + records.length + 1, kind: 'error', text: '此历史记录损坏，内容不可用', time: 0 }) }
+          catch { this.failure = '部分历史记录损坏或不完整，已保留不可用占位'; records.push({ id: -(start + records.length + 1), kind: 'error', name: 'history-corrupt', text: '此历史记录损坏，内容不可用', time: 0 }) }
           if (records.length >= PAGE) { lines.close(); stream.destroy(); break }
         }
       } catch (error) { this.saveFailed = true; this.failure = `历史读取失败，已暂停保存；本轮最近 ${PAGE * 2} 条仍可回看；重启后可能缺失：${error instanceof Error ? error.message : String(error)}` }
     }
     const from = this.size - this.memory.length
-    const length = Math.min(PAGE, this.size - start)
+    const length = Math.min(PAGE, size - start)
     for (let i = 0; i < length; i++) {
-      if (!records[i] && start + i < this.persistedSize) {
+      if (!records[i] && start + i < persistedSize) {
         this.saveFailed = true
         if (!this.failure) this.failure = '历史记录缺失或读取不完整，已暂停保存；重启后新增记录可能缺失'
       }
@@ -200,10 +203,10 @@ export class UIHistory {
       if (live) records[i] = live
       else if (!records[i]) {
         if (!this.failure) this.failure = this.path ? '历史记录缺失或读取不完整，已保留不可用占位' : `暂无持久历史来源，本轮最近 ${PAGE * 2} 条仍可回看`
-        records[i] = { id: start + i + 1, kind: 'error', text: '此历史记录不可用；未保存或读取失败', time: 0 }
+        records[i] = { id: -(start + i + 1), kind: 'error', name: 'history-unavailable', text: '此历史记录不可用；未保存或读取失败', time: 0 }
       }
     }
-    this.cache.set(block, records)
+    if (length === PAGE || size === this.size) this.cache.set(block, records)
     while (this.cache.size > 3) this.cache.delete(this.cache.keys().next().value!)
     return records
   }

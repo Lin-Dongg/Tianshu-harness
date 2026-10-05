@@ -18,7 +18,7 @@ import type { Config, ModelConfig, ProviderConfig } from './schema.js'
  * reaches anyone who already has that provider on disk (the same problem
  * `migrateDeepseekMaxTokens` fixed for exactly one field, one provider).
  */
-export const BACKFILLED_MODEL_FIELDS = ['supportsVision', 'supportsVideo', 'tier', 'pricing', 'reasoningEffort', 'description'] as const
+export const BACKFILLED_MODEL_FIELDS = ['supportsVision', 'supportsVideo', 'supportsImageGen', 'tier', 'pricing', 'reasoningEffort', 'description'] as const
 
 /**
  * Refill absent capability fields on one stored model from its preset entry.
@@ -121,6 +121,7 @@ export function migratePresetModelBackfill(raw: Record<string, unknown>): boolea
         contextWindow: pm.contextWindow,
         maxTokens: pm.maxTokens,
         ...(pm.supportsVision ? { supportsVision: true } : {}),
+        ...(pm.supportsImageGen ? { supportsImageGen: true } : {}),
         pricing: { ...pm.pricing },
       })
       changed = true

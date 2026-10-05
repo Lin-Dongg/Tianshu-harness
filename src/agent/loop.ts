@@ -1,3 +1,5 @@
+import { buildSessionVitals } from './session-vitals-builder.js'
+import { currentWorkspaceRoots } from '../tools/workspace-context.js'
 import { observePal } from './pal-observation.js'
 import { palMode } from './hooks/problem-attack-hook.js'
 import { sessionStateAdvice } from './runtime-advice-facts.js'
@@ -38,6 +40,7 @@ import type { StructureFlowSnapshot } from './structure-flow-controller.js'
 import { assembleCognitiveFrame, projectStructureFlowInputs } from './cognitive-frame.js'
 import type { CognitiveFrame } from './cognitive-frame.js'
 import { buildCognitiveFrameRecord, buildCognitiveFrameLiteRecord } from './cognitive-frame-replay.js'
+import { planConvergenceEmit } from './convergence-emit-gate.js'
 import { createFrameRecorder } from './frame-telemetry.js'
 import type { FrameRecorder } from './frame-telemetry.js'
 import { emitStopReason, stopReasonAbortTag, type StopReason } from './stop-reason.js'
@@ -46,7 +49,7 @@ import { buildGateConvergenceHint } from './delivery-gate-v2.js'
 import { RoutingMetricsCollector } from '../model/routing-metrics.js'
 import type { ImportGraph } from './import-graph.js'
 import type { PlanModeState } from './plan-mode.js'
-import { createActivePlanDraftPath } from './plan-mode.js'
+import { createActivePlanDraftPath, isTransientPlanDraftPath } from './plan-mode.js'
 import type { AskModeState } from './ask-mode.js'
 import { RepairPipeline } from './repair-pipeline.js'
 import { fourHorsemenPass, semanticRepairPass } from './repair-passes.js'
@@ -118,6 +121,7 @@ import { ResourceSensor, type ResourceSensorSnapshot } from './resource-sensor.j
 import { type PlanMethodology, type TaskContract, type TaskDepthLayer } from '../context/task-contract.js'
 import { StigmergyStore } from '../context/stigmergy.js'
 import { dispatchUserImages } from './user-image-dispatch.js'
+import { drainSidePathUsage } from './side-path-usage-recorder.js'
 import { ImageRegistry } from './image-registry.js'
 import { createStanceTally } from './stance-tally.js'
 import { createVirtuePendingLedger, type VirtuePendingLedger, computeVirtueCredit } from './virtue-signals.js'
@@ -287,6 +291,7 @@ export class AgentLoop {
   private memoriesWarmed = false
   streamedText = ''
   thinkingOnlyRetries = 0
+  reasoningRecoveryPending = false
   lastThinkingContent = ''
   consecutiveNoToolTurns = 0
   /** 连续全只读轮计数（B1 只读螺旋提醒）。显式初始化——历史遗漏导致
@@ -388,6 +393,13 @@ export class AgentLoop {
    *  type changes. Mirrors the cooldown discipline in kick-hook.ts. */
   private readonly convergenceEmitBaseCooldownTurns = 3
   private convergenceEmitCooldownTurns = 3
+  /** Layer 2（2026-10-05）：面向人的告警墙钟下限。冷却以 turn 计数，而只读
+   *  诊断轮的墙钟极短——"3 轮冷却"可能只值几秒（会话 74f350c9：5 次告警，
+   *  前 4 次落在 50 秒内）。level 升级是真实信号跃迁，不受此门约束。
+   *  测试直接赋值驱动（0 = 关闭），避免真实等待 45s。 */
+  convergenceEmitMinIntervalMs = 45_000
+  /** 上次发射的墙钟时刻（ms）——配合 convergenceEmitMinIntervalMs 使用。 */
+  private lastConvergenceEmitAtMs = -Infinity
   /** Consecutive emit count for the current message variant — drives both the
    *  backoff multiplier and the "第 N 次提醒" prefix in the injected message. */
   private convergenceEmitRepeatCount = 0
@@ -1110,7 +1122,7 @@ export class AgentLoop {
       // R1: record cwd (cross-cwd resume gate) and reset cleanExit — the session
       // is now live, so a subsequent crash should be recoverable and a later
       // clean exit must re-mark it. Runs for both fresh and resumed sessions.
-      this.persist.updateMetadata({ cwd: this.cwd, cleanExit: false })
+      this.persist.updateMetadata({ cwd: this.cwd, workspaceRoots: [...currentWorkspaceRoots(this.cwd)], cleanExit: false })
 
       // P0-1: Mirror every in-memory message change to disk so non-/exit
       // shutdowns (Ctrl+C, crash, network drop) don't lose the session.
@@ -1253,6 +1265,15 @@ export class AgentLoop {
       if (PRODUCTIVE_TOOLS.has(name)) {
         this.convergenceEmitRepeatCount = 0
         this.convergenceEmitCooldownTurns = this.convergenceEmitBaseCooldownTurns
+        // 墙钟凭证同步清空（697bd138f 送审查 LOW）：另两处清账点（B1c 产出清账 /
+        // 用户介入）都清了 lastConvergenceEmitAtMs，此处原先漏掉 → "产出后按新方向
+        // 结算"仍会被墙钟静音最长 convergenceEmitMinIntervalMs。
+        this.lastConvergenceEmitAtMs = -Infinity
+        // 方向凭证同步清空（审查 09389b78e 指出）：原先只清 repeat/cooldown，
+        // lastConvergenceMsgKey 仍留旧值 → 下次同变体发射 changedDirection 为
+        // false，按 backoff 递增结算，「第 N 次同类提醒」的 N 与"产出后重新
+        // 开始"的语义不符。清空后下一次发射按新方向结算。
+        this.lastConvergenceMsgKey = ''
         // B1c：turn 级产出标志,由 runConvergenceCheck 在下个 turn 边界结算
         this.turnHadProductiveTool = true
       }
@@ -2173,7 +2194,7 @@ export class AgentLoop {
   private releasePlanModeArtifacts(): void {
     const draft = this.activePlanFilePath
     this.activePlanFilePath = null
-    if (draft && /\/draft-\d+\.md$/.test(draft.replace(/\\/g, '/'))) {
+    if (draft && isTransientPlanDraftPath(draft, this.cwd)) {
       try {
         const abs = join(this.cwd, draft)
         if (existsSync(abs) && readFileSync(abs, 'utf-8').trim() === '') rmSync(abs)
@@ -2182,6 +2203,10 @@ export class AgentLoop {
       // file at delivery/commit time. The draft is a transient planning artifact;
       // the canonical plan lives in .rivet/plans/<slug>.md once submitted.
       this.config.taskLedger?.removeEventsByPath(draft)
+      // Ownership is a separate set from the ledger events. Dropping only the
+      // events leaves the draft in owned-file lists and delivery scope with no
+      // write event backing it — the symmetric cleanup keeps both in step.
+      this.config.ownershipLedger?.unregisterOwned(draft)
     }
   }
 
@@ -2338,72 +2363,7 @@ export class AgentLoop {
 
   /** W5（incident 20b9714e）：session_vitals 工具的数据源。全部为运行时
    *  内存态实测，零磁盘 IO；拿不到的维度返回 null，工具层显式标注"无数据"。 */
-  getSessionVitals(): import('../tools/session-vitals.js').SessionVitalsData {
-    const estimatedTokens = this.session.getEstimatedTokens()
-    const contextWindow = this.config.contextWindow
-    const statsMap = this.advisoryReadback.getStats()
-    const top = [...statsMap.entries()]
-      .map(([key, s]) => ({
-        key,
-        delivered: s.delivered,
-        adopted: s.adopted,
-        ignored: s.ignored,
-        silenced: this.advisoryBus.isEfficacySilenced(key),
-      }))
-      .sort((a, b) => b.delivered - a.delivered)
-      .slice(0, 5)
-    const s = this.sensorium
-    let runtime: import('./runtime-self-model.js').RuntimeSelfModel | null = null
-    try {
-      const coordinator = this.config.coordinatorRef?.()
-      if (coordinator) {
-        const verification = this.evidence.getVerificationSummary()
-        runtime = buildRuntimeSelfModel({
-          phase: this.planModeState,
-          turn: this.session.getTurnCount(),
-          contextRatio: contextWindow > 0 ? estimatedTokens / contextWindow : 1,
-          sensorium: s ? {
-            pressure: s.pressure,
-            confidence: s.confidence,
-            stability: s.stability,
-          } : null,
-          verificationDebt: verification.total > 0
-            ? verification.pending / verification.total
-            : (this.evidence.hasVerificationDebt() ? 1 : 0),
-          coordinator: coordinator.getRuntimeSnapshot(),
-        })
-      }
-    } catch {
-      // session_vitals is diagnostic; a missing coordinator must never break it.
-      runtime = null
-    }
-    return {
-      ctx: {
-        estimatedTokens,
-        contextWindow,
-        ratio: contextWindow > 0 ? estimatedTokens / contextWindow : 1,
-      },
-      cache: this.session.getCacheHistory().slice(-5),
-      sensorium: s ? {
-        momentum: s.momentum, pressure: s.pressure, confidence: s.confidence,
-        complexity: s.complexity, freshness: s.freshness, stability: s.stability,
-      } : null,
-      cvm: {
-        overheadRatio: this.pressureMonitor.getCvmOverheadRatio(),
-        throttled: this.pressureMonitor.isCvmThrottling(),
-        ceiling: this.pressureMonitor.isCvmThrottlingCeiling(),
-      },
-      advisories: {
-        rendered: this.guardianActivity.advisoriesRendered,
-        dropped: this.guardianActivity.advisoriesDropped,
-        adopted: this.guardianActivity.advisoriesAdopted,
-        ignored: this.guardianActivity.advisoriesIgnored,
-        top,
-      },
-      runtime,
-      turn: this.session.getTurnCount(),
-    }
-  }
+  getSessionVitals(): import('../tools/session-vitals.js').SessionVitalsData { return buildSessionVitals(this) }
 
   /** 获取持久化的任务列表（从 Assistant 回复中提取），用于 TUI 固定显示和多轮回溯 */
   getTaskList() { return this.sessionStateManager?.getTaskList() ?? [] }
@@ -2449,6 +2409,7 @@ export class AgentLoop {
    *  (moving session files while a queued append is in flight would recreate
    *  a dangling jsonl at the old path). */
   async drainPersistWrites(): Promise<void> {
+    await drainSidePathUsage(this)
     await this._persistDrain?.()
     await this.persist?.drainFrozenSnapshots()
   }
@@ -2479,8 +2440,7 @@ export class AgentLoop {
 
   private async runPostSessionWith(ctx: RuntimeHookContext): Promise<void> {
     // P0-1: drain pending async persist writes so tool results survive abort/Ctrl+C.
-    await this._persistDrain?.()
-    await this.persist?.drainFrozenSnapshots()
+    await this.drainPersistWrites()
     await this.runtimeHooks.runPostSession(ctx)
     if (this.config.sessionRegistry) {
       try { this.config.sessionRegistry.cleanupOldEvents(2 * 60 * 60 * 1000) } catch { /* ignore */ }
@@ -2518,6 +2478,8 @@ export class AgentLoop {
       if (sp && shouldAutoWriteHandoff(handoffMtime, this.createdAtMs)) {
         const handoffText = this.compaction.buildSessionHandoff()
         sp.writeHandoff(handoffText)
+      } else if (sp) {
+        sp.writeHandoffTail(this.compaction.buildSessionHandoff())
       }
       if (sp) {
         const domainId = this.sessionDomain?.id
@@ -2598,8 +2560,10 @@ export class AgentLoop {
     return this._running
   }
 
-  async run(userInput: string, callbacks: AgentCallbacks, images?: string[]): Promise<AgentRunOutcome> {
+  activeInputOrigin: import('./input-origin.js').InputOrigin = 'human'
+  async run(userInput: string, callbacks: AgentCallbacks, images?: string[], options?: import('./input-origin.js').InputOptions): Promise<AgentRunOutcome> {
     if (this._running) return 'skipped-already-running'
+    this.activeInputOrigin = options?.origin ?? this.config.inputOrigin ?? 'human'
     return observeRun(this.config.sessionId ?? 'default', () => this.runObserved(userInput, callbacks, images))
   }
 
@@ -2663,6 +2627,8 @@ export class AgentLoop {
       const dispatched = await dispatchUserImages(userInput, images, {
         supportsVision: this.config.supportsVision,
         visionClient: this.config.visionClient,
+        visionModel: this.config.visionBridge?.detail,
+        recordUsage: usage => this.recordSidePathUsage('vision-description', usage, this.config.visionBridge?.detail ?? 'unknown'),
         visionModelPrompt: this.config.visionModelPrompt,
         visionModelMaxTokens: this.config.visionModelMaxTokens,
         registeredIds,
@@ -2932,6 +2898,7 @@ export class AgentLoop {
       this.lastConvergenceEmitLevel = 0
       this.lastConvergenceMsgKey = ''
       this.lastConvergenceEmitVerifyFailStreak = 0
+      this.lastConvergenceEmitAtMs = -Infinity
     }
 
     // Grace-turn precondition for the score abort: a convergence warning at L2+
@@ -3013,9 +2980,37 @@ export class AgentLoop {
     // 默认落会话目录 frames.jsonl（独立通道，RIVET_FRAME_TELEMETRY=0 可关）；
     // lite 摘要（<200B）继续走 sensorium.jsonl。recorder 关闭时连记录构建
     // 也跳过。写失败绝不阻断 loop。
+    // Layer 2 遥测（后续 A）：判定先于落盘——frames.jsonl 在此写入、发射副作用
+    // 在其后；planConvergenceEmit 为纯计算，判定与副作用由此分离。
+    const convergenceEmitPlan = planConvergenceEmit({
+      shouldKick: convergenceCheck.shouldKick,
+      injectedMessage: convergenceCheck.injectedMessage,
+      messageVariant: convergenceCheck.messageVariant,
+      level: convergenceCheck.level,
+      score: convergenceCheck.score,
+      turn,
+      userMessageConsumed,
+      verifyFailStreak: computeVerifyFailStreak(this.recentToolHistory),
+      nowMs: Date.now(),
+      state: {
+        lastEmitTurn: this.lastConvergenceEmitTurn,
+        lastEmitLevel: this.lastConvergenceEmitLevel,
+        lastMsgKey: this.lastConvergenceMsgKey,
+        lastEmitScore: this.lastConvergenceEmitScore,
+        lastEmitVerifyFailStreak: this.lastConvergenceEmitVerifyFailStreak,
+        lastEmitAtMs: this.lastConvergenceEmitAtMs,
+        cooldownTurns: this.convergenceEmitCooldownTurns,
+        minIntervalMs: this.convergenceEmitMinIntervalMs,
+      },
+    })
     try {
       if (this.frameRecorder.enabled) {
-        this.frameRecorder.write(buildCognitiveFrameRecord(this.latestCognitiveFrame, this.latestStructureFlow, convergenceCheck))
+        this.frameRecorder.write(buildCognitiveFrameRecord(
+          this.latestCognitiveFrame,
+          this.latestStructureFlow,
+          convergenceCheck,
+          convergenceEmitPlan ? { emitted: convergenceEmitPlan.emit, suppressedBy: convergenceEmitPlan.suppressedBy } : null,
+        ))
       }
       this.telemetryWriter.write(buildCognitiveFrameLiteRecord(this.latestCognitiveFrame, this.latestStructureFlow, convergenceCheck))
     } catch { /* telemetry is diagnostics-only */ }
@@ -3036,27 +3031,13 @@ export class AgentLoop {
         this.lastConvergenceEmitLevel = 0
         this.lastConvergenceMsgKey = ''
         this.lastConvergenceEmitVerifyFailStreak = 0
+        this.lastConvergenceEmitAtMs = -Infinity
       } else {
-        // Fix 1 — cooldown + dedup gate on the visible side-effects. The message
-        // type is keyed by its header line, so same-type nudges with only changed
-        // diagnostic numbers do not count as a new "direction". Skip the
-        // "（第 N 次同类提醒…）" progressive prefix: it varies per emission and
-        // must not make a repeat look like a direction change (that would reset
-        // the cooldown and re-emit every turn — the exact spam this gate exists
-        // to stop).
-        const msgKey = convergenceCheck.injectedMessage.split('\n')
-          .find(l => l.length > 0 && !l.startsWith('（第')) ?? ''
-        const cooldownElapsed = turn - this.lastConvergenceEmitTurn >= this.convergenceEmitCooldownTurns
-        const scoreDropped = this.lastConvergenceEmitScore - convergenceCheck.score > 0.15
-        const cooledDown = cooldownElapsed || scoreDropped
-        const escalated = convergenceCheck.level > this.lastConvergenceEmitLevel
-        const changedDirection = msgKey !== this.lastConvergenceMsgKey
-        // 第四突破条件（2026-07-04 触发面修复）：验证失败流水加深 = 排查轮次
-        // 正在膨胀，是最尖锐的"需要改道"信号——不等冷却到期，提前发射。
-        // 与 CCR P7 同信号源（computeVerifyFailStreak），语义失败才计入。
-        const verifyFailStreak = computeVerifyFailStreak(this.recentToolHistory)
-        const verifyFailEscalated = verifyFailStreak >= 2 && verifyFailStreak > this.lastConvergenceEmitVerifyFailStreak
-        if (cooledDown || escalated || changedDirection || verifyFailEscalated) {
+        // 判定已上移到 planConvergenceEmit（落盘点先于副作用，需要它的结果）；
+        // 此处只应用副作用。非空由外层 shouldKick / injectedMessage 与
+        // planConvergenceEmit 的同一前置条件保证。
+        const { msgKey, changedDirection, escalated, verifyFailStreak } = convergenceEmitPlan!
+        if (convergenceEmitPlan!.emit) {
           // Backoff: if the same message variant fires again, double the cooldown
           // (3→6→12→24…). Reset to base when direction changes or level escalates.
           if (changedDirection || escalated) {
@@ -3071,6 +3052,7 @@ export class AgentLoop {
           this.lastConvergenceMsgKey = msgKey
           this.lastConvergenceEmitVerifyFailStreak = verifyFailStreak
           this.lastConvergenceEmitScore = convergenceCheck.score
+          this.lastConvergenceEmitAtMs = Date.now()
           // B1c：新警告要求 N 轮全新产出才可清账——发射即重置计数
           this.productiveTurnStreak = 0
           this.turnHadProductiveTool = false

@@ -341,6 +341,28 @@ export const WELL_KNOWN_DEFAULTS: Record<string, ProviderCapabilities> = {
     // 刻意不设 preservedThinkingProtocol：StepFun 不是 DeepSeek 系线协议，套用
     // reasoning_content 回显与中文思考后缀是错配（该字段的语义见上方类型注释）。
   },
+  // Agnes AI（apihub.agnes-ai.com）——免费多模态端点（文本 + 生图）。
+  // 声明面与预设（provider-presets-agnes.ts）一致；这里是自定义同名 provider 与
+  // 存量配置快照的兜底层。三条依据：
+  //   · 缓存：官方定价页列「输入缓存命中」计费项（单价为普通输入的 10%）——服务端
+  //     隐式 exact-prefix（与 GLM/LongCat/硅基流动同型）→ deepseek-native +
+  //     mapUsage 读 cached_tokens（字段形状未实测，无 Key；缺席时读 0 无损）。
+  //   · 思考：官方 OpenAI 面走 chat_template_kwargs.enable_thinking（本仓未建该
+  //     通道）→ thinkingBlock/effortFormat 保持 'none'：不发上游不认识的参数，
+  //     档位控件由 resolveEffortSupported 诚实禁用，而非静默丢弃后报设置成功。
+  //   · 剥离清单与主流 OpenAI 兼容预设同款；response_format 未在官方请求字段表
+  //     出现 → 保守 false（worker repair 走纯文本重问，LongCat 同款处置）。
+  agnes: {
+    supportsThinking: false,
+    thinkingBlockType: 'none',
+    supportsCacheControl: false,
+    stripParams: ['top_k', 'metadata', 'service_tier', 'cache_control'],
+    hasToolJsonInContentBug: false,
+    effortFormat: 'none',
+    prefixCacheStrategy: 'deepseek-native',
+    supportsResponseFormat: false,
+    mapUsage: mapDeepSeekUsage,
+  },
 }
 
 /**

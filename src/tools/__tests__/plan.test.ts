@@ -305,7 +305,7 @@ describe('plan tool submit', () => {
       title: 'Options Plan',
       plan,
       options: [
-        { label: 'Redis cache (Recommended)', description: 'Fast, eventual consistency' },
+        { label: 'Redis cache (Recommended)', description: 'Fast, eventual consistency', recommended: true, recommendation_reason: '满足并发缓存需求' },
         { label: 'In-memory LRU', description: 'Simple, single process only' },
       ],
     })
@@ -315,6 +315,9 @@ describe('plan tool submit', () => {
     const options = parsePlanOptions(written)
     assert.equal(options?.length, 2)
     assert.equal(options?.[0]?.label, 'Redis cache (Recommended)')
+    assert.equal(options?.[0]?.recommended, true)
+    assert.equal(options?.[0]?.recommendationReason, '满足并发缓存需求')
+    assert.equal(options?.[1]?.recommended, false)
   })
 
   // 2026-07-04 缺陷复盘: 一份计划提出"新增 Ink 组件"于一个不存在的目录——scout 读了

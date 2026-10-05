@@ -54,3 +54,16 @@ test('blocks retry when failure class is not configured as retryable', () => {
   assert.equal(result.retry, false)
   assert.match(result.reason, /not retryable/)
 })
+
+test('blocks auto-retry for deliver_task even when failure class is transient (issue #356)', () => {
+  const result = shouldRetryToolFailure({
+    toolName: 'deliver_task',
+    failureClass: 'timeout', // 模拟被文本正则误判的结果——policy 层必须独立拦截
+    isConcurrencySafe: true,
+    retryableClasses: ['timeout', 'flaky'],
+    retriesRemaining: 2,
+  })
+
+  assert.equal(result.retry, false)
+  assert.match(result.reason, /non-idempotent/)
+})

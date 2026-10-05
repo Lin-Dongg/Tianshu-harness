@@ -24,6 +24,16 @@ function claim(overrides: Partial<ContextClaim> = {}): ContextClaim {
 }
 
 describe('worker-knowledge', () => {
+  it('rejects expired, contradicted and worker-origin knowledge; preserves human temporary-path requirements', () => {
+    const block = buildWorkerKnowledgeBlock([
+      claim({ id: 'human', text: 'User explicitly requires /tmp/output' }),
+      claim({ id: 'expired', text: 'expired fact', expiresAt: Date.now() - 1 }),
+      claim({ id: 'worker', kind: 'decision', text: 'worker directive', source: { actor: 'worker', sessionId: 's1', turn: 1, eventId: 'w' }, evidence: [{ id: 'file', kind: 'file', summary: 'fixture', createdAt: Date.now() }] }),
+      claim({ id: 'invalid', kind: 'verification_fact', text: 'unproven passed', source: { actor: 'tool', sessionId: 's1', turn: 1, eventId: 't' } }),
+    ])
+    assert.match(block, /\/tmp\/output/)
+    assert.doesNotMatch(block, /expired fact|worker directive|unproven passed/)
+  })
   it('builds a knowledge block from active claims limited to MAX_KNOWLEDGE_CLAIMS', () => {
     const claims = Array.from({ length: 15 }, (_, i) =>
       claim({ id: `c${i}`, text: `Claim ${i}`, fitness: i + 1 })

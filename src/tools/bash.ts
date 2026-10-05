@@ -787,6 +787,8 @@ async function executeBashOnce(params: ToolCallParams): Promise<BashExecResult> 
           return {
             content: prefix ? prefix + baseContent : baseContent,
             uiContent: buildUiOutput(filtered, meta),
+            displayOutput: persistedRaw,
+            displayOutputTruncated: rawSpool.capped,
             rawPath,
             isError,
             errorClass,
@@ -823,6 +825,8 @@ async function executeBashOnce(params: ToolCallParams): Promise<BashExecResult> 
         return {
           content: prefix ? prefix + baseContent : baseContent,
           uiContent: buildUiOutput(filtered, meta),
+          displayOutput: persistedRaw,
+          displayOutputTruncated: rawSpool.capped,
           rawPath: artifact?.rawPath,
           isError,
           errorClass,
@@ -842,6 +846,8 @@ async function executeBashOnce(params: ToolCallParams): Promise<BashExecResult> 
       return {
         content: prefix ? prefix + baseContent : baseContent,
         uiContent: buildUiOutput(filtered, meta),
+        displayOutput: persistedRaw,
+        displayOutputTruncated: rawSpool.capped,
         rawPath,
         isError,
         errorClass,

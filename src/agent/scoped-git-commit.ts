@@ -1,3 +1,4 @@
+import { captureCommitVersion, type CommitVersion } from './commit-version.js'
 import { spawnGitSync } from '../tools/spawn-git.js'
 import { existsSync } from 'node:fs'
 import { isAbsolute, join, relative, resolve } from 'node:path'
@@ -6,6 +7,7 @@ export interface ScopedCommitInput {
   cwd: string
   files: string[]
   message: string
+  expectedVersion?: CommitVersion
 }
 
 export interface ScopedCommitResult {
@@ -76,6 +78,15 @@ export function commitScopedFiles(input: ScopedCommitInput): ScopedCommitResult 
     ? `⚠ Skipped ${stale.length} stale path(s) already committed externally: ${stale.join(', ')}\n`
     : ''
 
+  const expected = input.expectedVersion ?? captureCommitVersion(input.cwd, addable)
+  const current = captureCommitVersion(input.cwd, addable)
+  if (!expected || !current || JSON.stringify(expected) !== JSON.stringify(current)) return { ok: false, output: 'Selected files, HEAD or index changed; refresh the commit preview.' }
+  const staged = runGit(input.cwd, ['diff', '--cached', '--name-only', '-z', '--', ...addable])
+  const unstaged = runGit(input.cwd, ['diff', '--name-only', '-z', '--', ...addable])
+  if (!staged.ok || !unstaged.ok) return { ok: false, output: 'Cannot verify selected index contents.' }
+  const unstagedPaths = new Set(unstaged.output.split('\0').filter(Boolean))
+  if (staged.output.split('\0').some(file => unstagedPaths.has(file))) return { ok: false, output: 'Selected file is partially staged. Separate its hunks or explicitly commit the reviewed index in Git; no files were staged.' }
+
   for (let attempt = 0; ; attempt++) {
     // add is idempotent — safe to re-run when the commit step hit a lock.
     const add = runGit(input.cwd, ['add', '--', ...addable])
@@ -88,6 +99,8 @@ export function commitScopedFiles(input: ScopedCommitInput): ScopedCommitResult 
       return add
     }
 
+    const ready = captureCommitVersion(input.cwd, addable)
+    if (!ready || ready.head !== expected.head || ready.files !== expected.files) return { ok: false, output: 'Selected snapshot changed during staging; changes remain available for review.' }
     const commit = runGit(input.cwd, ['commit', '-m', input.message, '--only', '--', ...addable])
     if (!commit.ok) {
       const delay = LOCK_RETRY_DELAYS_MS[attempt]

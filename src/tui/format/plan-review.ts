@@ -75,7 +75,7 @@ export function buildPlanReviewActions(info: PlanSubmittedInfo): PlanReviewActio
   const options = info.options ?? []
   if (options.length > 1) {
     for (const [i, o] of options.entries()) {
-      const recommended = /recommended/i.test(o.label)
+      const recommended = o.recommended === true || (o.recommended === undefined && /recommended/i.test(o.label))
       const cleanLabel = o.label.replace(/\s*[(（]?\s*recommended\s*[)）]?/i, '').trim()
       actions.push({
         id: `approve:${i}`,

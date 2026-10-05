@@ -80,7 +80,9 @@ export class DiffDecorationController {
   async show(edit: PendingEdit): Promise<void> {
     this.pending.set(edit.uri.fsPath, edit)
     const doc = await vscode.workspace.openTextDocument(edit.uri)
+    if (this.pending.get(edit.uri.fsPath) !== edit) return
     const editor = await vscode.window.showTextDocument(doc, { preview: true, preserveFocus: false })
+    if (this.pending.get(edit.uri.fsPath) !== edit) return
     editor.setDecorations(addedType, edit.added)
     // Removed lines no longer exist in the new doc — show as overview only via added contrast.
     editor.setDecorations(removedType, [])

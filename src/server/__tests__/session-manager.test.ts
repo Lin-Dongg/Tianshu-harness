@@ -117,7 +117,7 @@ function makeArtifact(id: string, over: Partial<Artifact> = {}): Artifact {
   }
 }
 
-function makeManager(opts: { watchdogContinueDelayMs?: number } = {}) {
+function makeManager(opts: { watchdogContinueDelayMs?: number; maxEvents?: number; maxEventBytes?: number } = {}) {
   const agents: FakeAgent[] = []
   const manager = new RuntimeSessionManager({
     createAgent: () => {
@@ -129,6 +129,10 @@ function makeManager(opts: { watchdogContinueDelayMs?: number } = {}) {
     // C2 倒计时默认 5s——测试里压到 0（setImmediate+setTimeout(0) 仍被 settle 覆盖），
     // 倒计时行为本身由专门用例以小延迟验证。
     watchdogContinueDelayMs: opts.watchdogContinueDelayMs ?? 0,
+    // issue #315 环限额旋钮——仅显式传入时覆盖默认值（默认 maxEvents 5000 /
+    // maxEventBytes 64MiB 对既有用例是 no-op）。
+    ...(opts.maxEvents !== undefined ? { maxEvents: opts.maxEvents } : {}),
+    ...(opts.maxEventBytes !== undefined ? { maxEventBytes: opts.maxEventBytes } : {}),
   })
   return { manager, agents }
 }
@@ -1455,6 +1459,54 @@ test('PlusMenu（多 key）：三段式记录只标对应 key；两段式记录�
   assert.equal(two.filter((m) => m.current).length, 1, '两段式记录只标一条（否则两条都点不动）')
 })
 
+// 桌面 ContextRing 切会话空环（2026-10-05）：contextWindow 此前只在 agent 存活时
+// 由 enrichRecord 现算（getContextWindow?.()），协议里又没有任何事件携带它——切到
+// agent 未建/idle 释放/重启装填的会话后分母丢失，进度环空转（tooltip 的 token 数
+// 走事件回放所以还在）。修复：窗口缺失时按 record.model 从模型清单回落，判据与
+// listModels 的 current 判定同源。
+test('enrichRecord: agent 缺失时 contextWindow 从模型清单回落（含三段式 keyed 匹配）', async () => {
+  const models: ModelOption[] = [
+    { id: 'glm-5.2', alias: 'm28', provider: 'glm', keyId: 'default', contextWindow: 128000 },
+    { id: 'glm-5.2', alias: 'm28', provider: 'glm', keyId: 'backup', contextWindow: 200000 },
+  ]
+  const manager = new RuntimeSessionManager({
+    createAgent: () => new PlusFakeAgent(),
+    defaultCwd: '/tmp/work',
+    listModels: () => models,
+    defaultModelId: 'glm-5.2',
+  })
+
+  // agent 从未建成（懒创建）——裸 id 记录首个命中胜出
+  const s1 = manager.createSession({ model: 'glm-5.2' })
+  assert.equal(manager.getSession(s1.id)!.contextWindow, 128000, 'agent 缺失时应从模型清单回落')
+
+  // 三段式记录精确到 key——取 backup 条的窗口而非首个命中
+  const s2 = manager.createSession({ model: 'glm:backup:glm-5.2' })
+  assert.equal(manager.getSession(s2.id)!.contextWindow, 200000, '三段式记录应精确命中对应 key 的窗口')
+
+  // 清单里没有的模型：保持 undefined，不捏造分母
+  const s3 = manager.createSession({ model: 'no-such-model' })
+  assert.equal(manager.getSession(s3.id)!.contextWindow, undefined)
+})
+
+test('enrichRecord: agent 存活且提供窗口时不被清单回落覆盖', async () => {
+  class WindowedAgent extends PlusFakeAgent {
+    getContextWindow(): number { return 999000 }
+  }
+  const models: ModelOption[] = [
+    { id: 'model-a', alias: 'Model A', provider: 'p', contextWindow: 128000 },
+  ]
+  const manager = new RuntimeSessionManager({
+    createAgent: () => new WindowedAgent(),
+    defaultCwd: '/tmp/work',
+    listModels: () => models,
+    defaultModelId: 'model-a',
+  })
+  const s = manager.createSession({ model: 'model-a' })
+  manager.run(s.id, 'hi') // 建成 agent
+  assert.equal(manager.getSession(s.id)!.contextWindow, 999000, 'agent 现算值优先，回落不得覆盖')
+})
+
 // a976167f 新建会话模型优先级：显式 input.model > 项目配置默认 provider 首模型
 // > 注入的 defaultModelId。该特性此前无测试覆盖——上方 listModels 测试正因
 // 优先级改动在本机真实配置下静默失效。
@@ -2383,4 +2435,160 @@ test('onModelRetry → retry 会话事件（按尝试替换信号）', () => {
   assert.equal(retry?.data.attempt, 1)
   assert.equal(retry?.data.maxAttempts, 2)
   assert.equal(retry?.data.replaceAttempt, true)
+})
+
+test('onModelRetry 带分类信息 → retry 事件携带 category/message/nextDelayMs（2026-10-05 additive）', () => {
+  const { manager, agents } = makeManager()
+  const s = manager.createSession({ prompt: 'go' })
+  const a = agents[0]!
+  a.callbacks!.onModelRetry?.({ attempt: 1, maxAttempts: 2, category: 'overloaded', message: 'Server overloaded (503)', nextDelayMs: 500 })
+  const retry = manager.getEvents(s.id, 0)!.events.find((e) => e.type === 'retry')
+  assert.equal(retry?.data.category, 'overloaded', '类别必须透传——重试块文案据它说「为什么断」')
+  assert.equal(retry?.data.message, 'Server overloaded (503)')
+  assert.equal(retry?.data.nextDelayMs, 500, '等待时长必须透传——文案据它说「等多久」')
+  // 旧版载荷（无分类字段）不得凭空捏造
+  a.callbacks!.onModelRetry?.({ attempt: 2, maxAttempts: 2 })
+  const legacy = manager.getEvents(s.id, 0)!.events.filter((e) => e.type === 'retry').at(-1)
+  assert.equal(legacy?.data.category, undefined)
+  assert.equal(legacy?.data.nextDelayMs, undefined)
+})
+
+test('turn_complete 携带 stopReason=max_tokens（截断提醒 additive 字段）', () => {
+  const { manager, agents } = makeManager()
+  const s = manager.createSession({ prompt: 'go' })
+  const a = agents[0]!
+  a.callbacks!.onTurnComplete({ input_tokens: 10 }, 1, true, undefined, undefined, 'max_tokens')
+  const ev = manager.getEvents(s.id, 0)!.events.filter((e) => e.type === 'turn_complete').at(-1)
+  assert.equal(ev?.data.stopReason, 'max_tokens', '截断收尾必须随事件流携带 stopReason')
+  // 正常收尾不携带（wire 保持干净）
+  a.callbacks!.onTurnComplete({ input_tokens: 10 }, 2, true)
+  const normal = manager.getEvents(s.id, 0)!.events.filter((e) => e.type === 'turn_complete').at(-1)
+  assert.equal(normal?.data.stopReason, undefined)
+})
+
+test('error 事件携带 guidance（errorRecoveryGuidance 的「下一步」）；AbortError 不携带', () => {
+  const { manager, agents } = makeManager()
+  const s = manager.createSession({ prompt: 'go' })
+  const a = agents[0]!
+  a.callbacks!.onError(Object.assign(new Error('Rate limit exceeded'), { status: 429 }))
+  const ev = manager.getEvents(s.id, 0)!.events.filter((e) => e.type === 'error').at(-1)
+  assert.ok(typeof ev?.data.guidance === 'string' && ev.data.guidance.includes('限流'),
+    `429 的 error 事件必须带恢复指引（此前只有 TUI 渲染），实得 guidance=${String(ev?.data.guidance)}`)
+  // AbortError 是用户动作不是故障——不给「检查端点」式错误指引
+  a.callbacks!.onError(Object.assign(new Error('The operation was aborted'), { name: 'AbortError' }))
+  const aborted = manager.getEvents(s.id, 0)!.events.filter((e) => e.type === 'error').at(-1)
+  assert.equal(aborted?.data.guidance, undefined, 'AbortError 不得携带指引')
+})
+
+
+test('tool display evidence persists full redacted output and sends only image references', () => {
+  const agent = new FakeAgent()
+  const outputs = new Map<string, string>()
+  const images: string[] = []
+  const persistence: SessionPersistenceAdapter = {
+    saveRecord: () => {}, appendEvent: () => {}, loadAll: () => [],
+    saveToolOutput: (sessionId, id, text) => outputs.set(`${sessionId}:${id}`, text),
+    readToolOutput: (sessionId, id) => outputs.get(`${sessionId}:${id}`),
+    saveImage: (_session, id) => { images.push(id) },
+  }
+  const manager = new RuntimeSessionManager({ createAgent: () => agent, defaultCwd: '/tmp/work', persistence })
+  const session = manager.createSession({ prompt: 'go' })
+  const display = 'safe line\n'.repeat(1000) + 'api_key=fake-sensitive-value'
+  agent.callbacks!.onToolResult('call', 'bash', 'model text', false, undefined, 'short UI preview', { outputText: display, exitCode: 7, images: ['data:image/png;base64,aGVsbG8='] })
+  const event = manager.getEvents(session.id, 0)!.events.find(event => event.type === 'tool_result')!
+  assert.equal(event.data.exitCode, 7)
+  assert.equal(event.data.isError, false, 'exit code cannot override the existing terminal status')
+  assert.deepEqual(event.data.imageIds, images)
+  assert.equal(images.length, 1)
+  assert.ok(!JSON.stringify(event.data).includes('aGVsbG8='))
+  const text = manager.readToolOutput(session.id, event.data.outputId as string)!
+  assert.ok(text.length > 10000)
+  assert.ok(text.endsWith('api_key=[REDACTED]'))
+  assert.ok(!text.includes('fake-sensitive-value'))
+  assert.equal(manager.readToolOutput('other-session', event.data.outputId as string), undefined)
+  assert.equal(event.data.outputTruncated, false)
+  agent.callbacks!.onToolResult('partial', 'bash', 'stream chunk')
+  assert.equal(outputs.size, 1, 'stream chunks do not create full-output files')
+  agent.finish()
+})
+
+test('failed full-output persistence retains preview with explicit truncation', () => {
+  const agent = new FakeAgent()
+  const persistence: SessionPersistenceAdapter = { saveRecord: () => {}, appendEvent: () => {}, loadAll: () => [], saveToolOutput: () => { throw new Error('disk unavailable') } }
+  const manager = new RuntimeSessionManager({ createAgent: () => agent, defaultCwd: '/tmp/work', persistence })
+  const session = manager.createSession({ prompt: 'go' })
+  agent.callbacks!.onToolResult('call', 'bash', 'x'.repeat(8000), true)
+  const event = manager.getEvents(session.id, 0)!.events.find(event => event.type === 'tool_result')!
+  assert.equal(event.data.outputId, undefined)
+  assert.equal(event.data.outputTruncated, true)
+  assert.equal((event.data.result as string).length, 2000)
+  agent.finish()
+})
+
+// ── issue #315: 长会话内存膨胀（内存环泄漏点 A/B）──────────────────────────
+
+test('#315 A: 环被 delegation 事件淹没时仍按 maxEvents 有界', () => {
+  const { manager, agents } = makeManager({ maxEvents: 10 })
+  const s = manager.createSession({ prompt: 'go' })
+  const cb = agents[0]!.callbacks!
+  // worker activity 流高频产 delegation（每 tool_use / 每 turn / 每 ~120ms 合并的
+  // text 各一条）。50 条远超声明的 maxEvents——旧实现「溢出只由非 delegation 承担」，
+  // 环会线性无界增长。
+  for (let i = 0; i < 50; i++) {
+    cb.onDelegationActivity!({
+      workOrderId: `wo:${i}`,
+      parentToolId: 'tool-1',
+      status: 'completed',
+      progressLine: `step ${i}`,
+    })
+  }
+  const evs = manager.getEvents(s.id, 0)!.events
+  assert.ok(evs.length <= 10, `内存环必须回落到 maxEvents=10，实际 ${evs.length}`)
+  // 保留语义：尾部（最新）delegation 仍在，最旧的先被丢弃；非 delegation 优先淘汰。
+  const delegations = evs.filter((e) => e.type === 'delegation')
+  assert.ok(delegations.length > 0, '不能把 delegation 全部丢光')
+  assert.equal(delegations[delegations.length - 1]!.data.workerId, 'wo:49')
+  assert.ok(evs.every((e) => e.type === 'delegation'), '环满时非 delegation 事件应优先被淘汰')
+})
+
+test('#315 A: count eviction retains a contiguous suffix across event types', () => {
+  const { manager, agents } = makeManager({ maxEvents: 8 })
+  const s = manager.createSession({ prompt: 'go' })
+  const cb = agents[0]!.callbacks!
+  for (let i = 0; i < 12; i++) {
+    cb.onModelRetry?.({ attempt: i, maxAttempts: 3 }) // → 'retry'（非 delegation）
+    cb.onDelegationActivity!({ workOrderId: `wo:${i}`, parentToolId: 'tool-1', status: 'completed' })
+  }
+  const evs = manager.getEvents(s.id, 0)!.events
+  assert.ok(evs.length <= 8, `内存环必须回落到 maxEvents=8，实际 ${evs.length}`)
+  assert.ok(evs.some(e => e.type === 'retry'), 'ordinary events remain visible in the complete suffix')
+  assert.ok(evs.every((e, i) => i === 0 || e.seq === evs[i - 1]!.seq + 1))
+  assert.ok(evs.filter((e) => e.type === 'delegation').length > 0, 'delegation 尽量保留')
+})
+
+test('#315 B: byte eviction retains complete suffix events and exposes the disk gap', () => {
+  const big = 'x'.repeat(4000)
+  const budget = 12_000
+  const { manager, agents } = makeManager({ maxEvents: 1000, maxEventBytes: budget })
+  const s = manager.createSession({ prompt: 'go' })
+  const cb = agents[0]!.callbacks!
+  // 终态 tool_result / delegation 单条可接近 1MB；count 上限（5000）挡不住累计。
+  for (let i = 0; i < 10; i++) {
+    cb.onDelegationActivity!({
+      workOrderId: `wo:${i}`,
+      parentToolId: 'tool-1',
+      status: 'completed',
+      progressLine: `${i}:${big}`,
+    })
+  }
+  const evs = manager.getEvents(s.id, 0)!.events
+  const bytes = evs.reduce((n, e) => n + JSON.stringify(e).length, 0)
+  assert.ok(bytes <= budget, `环内字节必须收敛到预算内，实际 ${bytes} > ${budget}`)
+  const delegations = evs.filter((e) => e.type === 'delegation')
+  assert.ok(delegations.length > 0 && delegations.length < 10)
+  assert.ok(evs.every(e => Object.keys(e.data).length > 0), 'no empty-data projections')
+  const window = manager.getReplayWindow(s.id)!
+  assert.ok(window.floorSeq > window.diskFirstSeq)
+  // 最新 → 完整保留
+  assert.ok(String(delegations[delegations.length - 1]!.data.progressLine).length > 4000)
 })

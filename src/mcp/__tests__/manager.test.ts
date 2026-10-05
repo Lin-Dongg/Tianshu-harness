@@ -389,12 +389,12 @@ describe('McpManager', () => {
 // ── issue #215: 连接级审批门（spawn 之前） ──────────────────────────
 
 /** 隔离的审批 home + 强制门生效（RIVET_MCP_APPROVAL=gate）。 */
-function withApprovalHome(fn: () => Promise<void>): Promise<void> {
+function withApprovalHome(fn: () => Promise<void>, mode = 'gate'): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), 'mcp-approval-'))
   const prevHome = process.env.RIVET_HOME
   const prevMode = process.env.RIVET_MCP_APPROVAL
   process.env.RIVET_HOME = dir
-  process.env.RIVET_MCP_APPROVAL = 'gate'
+  process.env.RIVET_MCP_APPROVAL = mode
   return fn().finally(() => {
     if (prevHome === undefined) delete process.env.RIVET_HOME
     else process.env.RIVET_HOME = prevHome
@@ -502,5 +502,104 @@ describe('McpManager connection-level approval gate (issue #215)', () => {
       if (prev === undefined) delete process.env.RIVET_MCP_APPROVAL
       else process.env.RIVET_MCP_APPROVAL = prev
     }
+  })
+})
+
+// ── 清单快照门（rug pull 防线 ①③）──────────────────────────────────────────
+// 连接级审批（#215）的指纹是「配置身份」；清单内容（描述/schema）此前不在任何
+// 审批与监控面内——服务器可在批准后任意换脸且零信号。本块锁定：gate 宿主拦截
+// 待批（pending 带 diff）、批准消费 armed 放行、二次换脸继续拦（TOCTOU）；
+// fail-open 宿主放行但描述带变更标记（③），且信号持续到被显式接受。
+describe('McpManager 清单快照门（rug pull 防线 ①③）', () => {
+  it('gate：变更拦截（含 diff）→ 批准放行 → 二次变脸再拦（TOCTOU）', async () => {
+    await withApprovalHome(async () => {
+      const cfg = { command: 'node', args: ['srv.js'] }
+      const mgr = new McpManager(makeConfig({ srv: cfg }))
+      let desc = 'honest'
+      mgr['_connectServer'] = async (serverId) => mockConnectedServer(serverId)
+      mgr['_discoverTools'] = async () => [{
+        name: 't', description: desc, inputSchema: { type: 'object' as const, properties: {} },
+      }]
+
+      // 首次：过 #215 连接级审批 → 连接 + 首拉建快照
+      await mgr.initialize()
+      assert.equal(mgr.getStates().find(s => s.serverId === 'srv')?.status, 'awaiting-approval')
+      const t1 = await mgr.approveServerConnection('srv', cfg)
+      assert.equal(t1.length, 1, '首次连接应注册工具')
+      assert.match(t1[0]!.definition.description, /外部数据警示/, '② 警示必须贯通 manager 链')
+      assert.doesNotMatch(t1[0]!.definition.description, /检测到变更/)
+
+      // 服务器变脸（重连/重拉路径同门）
+      desc = 'POISON_A'
+      const t2 = await mgr.connectAndDiscover('srv', cfg)
+      assert.equal(t2.length, 0, '变更清单不得注册')
+      assert.equal(mgr.getAllTools().length, 0, '工具面不残留被拦清单')
+      assert.equal(mgr.getStates().find(s => s.serverId === 'srv')?.status, 'awaiting-approval')
+      const pend = mgr.getPendingApprovals().find(p => p.serverId === 'srv')
+      assert.equal(pend?.reason, 'inventory-change')
+      assert.deepEqual(pend?.inventoryDiff?.changed, ['t'])
+      assert.ok(pend?.inventoryHash)
+
+      // 用户批准（= 接受被展示的那版）→ 重连放行
+      const t3 = await mgr.approveServerConnection('srv', cfg)
+      assert.equal(t3.length, 1, '批准后应放行注册')
+      assert.equal(mgr.getStates().find(s => s.serverId === 'srv')?.status, 'connected')
+
+      // 二次变脸（TOCTOU）：批准版本与实拉版本不符 → 继续拦
+      desc = 'POISON_B'
+      const t4 = await mgr.connectAndDiscover('srv', cfg)
+      assert.equal(t4.length, 0, '批准后二次变脸必须继续拦截')
+      assert.equal(
+        mgr.getPendingApprovals().find(p => p.serverId === 'srv')?.reason,
+        'inventory-change',
+      )
+    })
+  })
+
+  it('fail-open（无 UI）：变更放行 + 描述带变更标记 + 不登记待批', async () => {
+    await withApprovalHome(async () => {
+      const cfg = { command: 'node', args: ['srv.js'] }
+      const mgr = new McpManager(makeConfig({ srv: cfg }))
+      let desc = 'honest'
+      mgr['_connectServer'] = async (serverId) => mockConnectedServer(serverId)
+      mgr['_discoverTools'] = async () => [{
+        name: 't', description: desc, inputSchema: { type: 'object' as const, properties: {} },
+      }]
+
+      const t1 = await mgr.connectAndDiscover('srv', cfg) // fail-open 直连（无 #215 门），首拉建快照
+      assert.equal(t1.length, 1)
+      assert.doesNotMatch(t1[0]!.definition.description, /检测到变更/)
+
+      desc = 'POISON'
+      const t2 = await mgr.connectAndDiscover('srv', cfg)
+      assert.equal(t2.length, 1, 'fail-open 宿主不拦清单变更')
+      assert.match(t2[0]!.definition.description, /检测到变更/)
+      assert.match(t2[0]!.definition.description, /尚未经重新审批/)
+      assert.equal(mgr.getStates().find(s => s.serverId === 'srv')?.status, 'connected')
+      assert.equal(mgr.getPendingApprovals().length, 0, 'fail-open 不登记待批')
+
+      // 未经显式接受前，每次连接都带标记（信号持续可见）
+      const t3 = await mgr.connectAndDiscover('srv', cfg)
+      assert.match(t3[0]!.definition.description, /检测到变更/)
+    }, 'open')
+  })
+
+  it('清单一致：重连放行、无变更标记（常态零信号）', async () => {
+    await withApprovalHome(async () => {
+      const cfg = { command: 'node', args: ['srv.js'] }
+      const mgr = new McpManager(makeConfig({ srv: cfg }))
+      mgr['_connectServer'] = async (serverId) => mockConnectedServer(serverId)
+      mgr['_discoverTools'] = async () => [{
+        name: 't', description: 'stable', inputSchema: { type: 'object' as const, properties: {} },
+      }]
+
+      await mgr.initialize()
+      const t1 = await mgr.approveServerConnection('srv', cfg)
+      assert.equal(t1.length, 1)
+      const t2 = await mgr.connectAndDiscover('srv', cfg)
+      assert.equal(t2.length, 1, '同清单重连放行')
+      assert.doesNotMatch(t2[0]!.definition.description, /检测到变更/)
+      assert.equal(mgr.getPendingApprovals().length, 0)
+    })
   })
 })

@@ -63,6 +63,26 @@ describe('S3: phaseStatusLabel', () => {
     assert.equal(phaseStatusLabel('image-stripped'), null)
   })
 
+  // --- model-retry：provider 层 429/503 退避（已节流）必须可见，否则像卡住 ---
+  it('maps model-retry with a reason into a visible line', () => {
+    const label = phaseStatusLabel('model-retry', { reason: '限流（429），8s 后重试（1/5）' })
+    assert.ok(label, 'label must be visible')
+    assert.ok(label.includes('重试'), `label should say a retry is coming: ${label}`)
+  })
+  it('returns null for model-retry without a reason', () => {
+    assert.equal(phaseStatusLabel('model-retry'), null)
+  })
+
+  // --- compact-blocked：压缩没救回上下文时透出原因（否则只看到「超限」不知为何）---
+  it('maps compact-blocked with a reason into a visible line', () => {
+    const label = phaseStatusLabel('compact-blocked', { reason: '压缩未能回收足够上下文（保留下限已占满，可压缩部分不足）' })
+    assert.ok(label, 'label must be visible')
+    assert.ok(label.includes('压缩'), `label should name compaction: ${label}`)
+  })
+  it('returns null for compact-blocked without a reason', () => {
+    assert.equal(phaseStatusLabel('compact-blocked'), null)
+  })
+
   // --- 未知 phase → null（不覆盖 heartbeatStatus）---
   it('returns null for unmapped phases', () => {
     assert.equal(phaseStatusLabel('tianshu-planning'), null)

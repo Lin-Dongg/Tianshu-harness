@@ -84,8 +84,12 @@ function abortedRun(order: WorkOrder) {
     result: {
       ...buildBlockedWorkerResult(order, 'Worker aborted (budget timeout). Partial output: …', 'timeout'),
     },
+    // session.getMessages 是本轮执行历史的唯一出口：coordinator 从它取
+    // sessionMessages 交给 persistWorkerDispatch；审计在没有完整执行历史时会
+    // 摘掉 Resumable 并记 risk（do not claim resumable）。给一份最小历史，让本
+    // 用例落在「历史齐备 → 允许声称可续跑」的正常路径上，否则断言的是拒绝分支。
     transcript: { text: '', thinking: '', toolUses: [...CHECKPOINT.completedTools], toolResults: [], errors: [], repairAttempts: 0 },
-    session: { getTurnCount: () => 1 } as never,
+    session: { getTurnCount: () => 1, getMessages: () => [{ role: 'user', content: 'Trace the agent loop entry chain' }] } as never,
     usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
     checkpoint: CHECKPOINT,
   }
@@ -127,7 +131,7 @@ describe('W3 abort checkpoint → resume re-dispatch entry', () => {
     assert.equal(firstResult.status, 'blocked')
     assert.equal(firstResult.failureReason, 'timeout')
     const resumeHint = firstResult.nextActions.find(a => a.includes('Resumable'))
-    assert.ok(resumeHint, `blocked result must advertise the resume entry. Got: ${JSON.stringify(firstResult.nextActions)}`)
+    assert.ok(resumeHint, `blocked result must advertise the resume entry. Got: ${JSON.stringify(firstResult.nextActions)} · risks: ${JSON.stringify(firstResult.risks)}`)
     assert.ok(resumeHint.includes(`resume:'${firstResult.workOrderId}'`), 'hint must name the exact resume id')
     assert.equal(seenCheckpoints[0], undefined, 'first dispatch starts without a checkpoint')
 
@@ -162,7 +166,9 @@ describe('W3 abort checkpoint → resume re-dispatch entry', () => {
           evidenceStatus: 'verified' as const,
         },
         transcript: { text: '', thinking: '', toolUses: [], toolResults: [], errors: [], repairAttempts: 0 },
-        session: { getTurnCount: () => 1 } as never,
+        // 同 abortedRun：本轮也要有可持久化的执行历史，否则 resume 派发不算
+        // 「成功落地」，coordinator.ts:1897 的 checkpoint 消费不会发生。
+        session: { getTurnCount: () => 1, getMessages: () => [{ role: 'user', content: 'resume the objective' }] } as never,
         usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
       }
     })

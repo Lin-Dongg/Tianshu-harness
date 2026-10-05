@@ -413,6 +413,24 @@ describe('delivery_gate（T3：交付门禁失败的结构化分类）', () => {
     assert.match(f.suggestion, /阻塞项/)
   })
 
+  it('issue #356：含 timeout 命令回显的门禁拒绝走结构化分类；同一文本无标签时确会误判', () => {
+    // 文本与 deliver-task.ts:537 的 verify 命令回显同形——报告者现场即 timeout 300 dotnet build
+    const content = [
+      'Delivery Gate: RED',
+      '  Latest: 0 pass 0 fail 0 skip — timeout 300 dotnet build',
+      '❌ Git index is locked (another session mid-commit, lock age 2s).',
+    ].join('\n')
+
+    const withTag = classifyToolFailure({ errorKind: 'delivery_gate' }, content)
+    assert.equal(withTag.class, 'delivery_gate')
+    assert.equal(withTag.retryable, false)
+
+    // 反证（缺陷本体）：无结构标签时规则 6 命中回显里的 timeout → 被误判为可重试
+    const withoutTag = classifyToolFailure(undefined, content)
+    assert.equal(withoutTag.class, 'timeout')
+    assert.equal(withoutTag.retryable, true)
+  })
+
   it('豁免表核对：门禁失败是全惩罚的工作信号，不进任何豁免/瞬时表', () => {
     assert.equal(isTransient('delivery_gate'), false)
     assert.equal(isImmunityNeutralized(undefined, 'delivery_gate'), false)

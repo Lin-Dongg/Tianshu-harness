@@ -17,6 +17,12 @@ import { APPLY_EDIT_AUTO_ACCEPT_MS } from './pending-policy.js'
 const HEARTBEAT_MS = 25_000
 const PROTOCOL_MIN = 1
 
+interface DelegationOrigin {
+  client: SidecarClient
+  sessionId: string
+  generation: number
+}
+
 export class DelegationExecutor implements vscode.Disposable {
   private readonly clientId = `ext-${randomBytes(8).toString('hex')}`
   private readonly decorations = new DiffDecorationController()
@@ -29,6 +35,7 @@ export class DelegationExecutor implements vscode.Disposable {
   private terminal: vscode.Terminal | undefined
   private hasShellIntegration = false
   private disposed = false
+  private sessionGeneration = 0
   /** Resolvers waiting on CodeLens accept/reject (requestId → settle). */
   private readonly pendingDecisions = new Map<
     string,
@@ -55,10 +62,15 @@ export class DelegationExecutor implements vscode.Disposable {
   async attachSession(sessionId: string): Promise<void> {
     if (this.disposed) return
     this.detach()
+    const generation = this.sessionGeneration
     this.sessionId = sessionId
-    this.client = await this.getClient()
+    const client = await this.getClient()
+    if (generation !== this.sessionGeneration) return
+    this.client = client
+    const origin = { client, sessionId, generation }
 
-    const proto = await this.client.probeProtocolVersion()
+    const proto = await client.probeProtocolVersion()
+    if (!this.isCurrent(origin)) return
     if (proto > 0 && proto < PROTOCOL_MIN) {
       void vscode.window.showWarningMessage(
         `天枢内核协议版本 ${proto} 过旧（需要 ≥${PROTOCOL_MIN}），客户端工具委托已禁用。请升级 rivet CLI。`,
@@ -66,28 +78,33 @@ export class DelegationExecutor implements vscode.Disposable {
       return
     }
 
-    this.hasShellIntegration = await this.detectShellIntegration()
+    const hasShellIntegration = await this.detectShellIntegration()
+    if (!this.isCurrent(origin)) return
+    this.hasShellIntegration = hasShellIntegration
     const kinds: Array<'apply_edit' | 'terminal_exec'> = ['apply_edit']
     if (this.hasShellIntegration) kinds.push('terminal_exec')
 
-    await this.client.registerDelegateCapabilities(sessionId, this.clientId, kinds)
+    await client.registerDelegateCapabilities(sessionId, this.clientId, kinds)
+    if (!this.isCurrent(origin)) return
     this.heartbeat = setInterval(() => {
-      if (!this.sessionId || !this.client) return
-      void this.client.registerDelegateCapabilities(this.sessionId, this.clientId, kinds).catch(() => {})
+      if (!this.isCurrent(origin)) return
+      void client.registerDelegateCapabilities(sessionId, this.clientId, kinds).catch(() => {})
     }, HEARTBEAT_MS)
 
-    const rec = await this.client.getSession(sessionId)
+    const rec = await client.getSession(sessionId)
+    if (!this.isCurrent(origin)) return
     const since = rec.lastSeq ?? 0
-    this.unsub = this.client.subscribe(
+    this.unsub = client.subscribe(
       sessionId,
       since,
-      (ev) => void this.onEvent(ev),
+      (ev) => { if (this.isCurrent(origin)) void this.onEvent(ev, origin) },
       undefined,
       { clientId: this.clientId },
     )
   }
 
   detach(): void {
+    this.sessionGeneration++
     this.unsub?.()
     this.unsub = undefined
     if (this.heartbeat) clearInterval(this.heartbeat)
@@ -100,22 +117,30 @@ export class DelegationExecutor implements vscode.Disposable {
     this.decorations.clear()
     this.codeLenses.refresh()
     this.sessionId = undefined
+    this.client = undefined
   }
 
-  private async onEvent(ev: SessionEvent): Promise<void> {
+  private isCurrent(origin: DelegationOrigin): boolean {
+    return !this.disposed && origin.generation === this.sessionGeneration &&
+      origin.client === this.client && origin.sessionId === this.sessionId
+  }
+
+  private async onEvent(ev: SessionEvent, boundOrigin?: DelegationOrigin): Promise<void> {
     if (ev.type !== 'tool_delegate' || !this.client || !this.sessionId) return
+    const origin = boundOrigin ?? { client: this.client, sessionId: this.sessionId, generation: this.sessionGeneration }
+    if (!this.isCurrent(origin)) return
     const requestId = String(ev.data.requestId ?? '')
     const kind = ev.data.kind
     const payload = (ev.data.payload ?? {}) as Record<string, unknown>
     if (!requestId) return
     try {
       if (kind === 'apply_edit') {
-        await this.handleApplyEdit(requestId, payload)
+        await this.handleApplyEdit(requestId, payload, origin)
       } else if (kind === 'terminal_exec') {
-        await this.handleTerminalExec(requestId, payload)
+        await this.handleTerminalExec(requestId, payload, origin)
       }
     } catch (err) {
-      await this.client.answerDelegation(this.sessionId, requestId, {
+      await origin.client.answerDelegation(origin.sessionId, requestId, {
         content: `Client landing failed: ${(err as Error).message}`,
         isError: true,
         status: 'ok',
@@ -123,12 +148,13 @@ export class DelegationExecutor implements vscode.Disposable {
     }
   }
 
-  private async handleApplyEdit(requestId: string, payload: Record<string, unknown>): Promise<void> {
+  private async handleApplyEdit(requestId: string, payload: Record<string, unknown>, origin: DelegationOrigin): Promise<void> {
+    const { client, sessionId } = origin
     const relPath = String(payload.path ?? '')
     const oldContent = String(payload.oldContent ?? '')
     const newContent = String(payload.newContent ?? '')
-    if (!relPath || relPath.includes('..') || !this.client || !this.sessionId) {
-      await this.client?.answerDelegation(this.sessionId!, requestId, {
+    if (!relPath || relPath.includes('..')) {
+      await client.answerDelegation(sessionId, requestId, {
         content: 'Invalid path',
         isError: true,
       })
@@ -142,28 +168,36 @@ export class DelegationExecutor implements vscode.Disposable {
     } catch {
       edit.createFile(uri, { ignoreIfExists: true })
     }
+    if (!this.isCurrent(origin)) throw new Error('Delegation session changed before edit')
     let doc: vscode.TextDocument
     try {
       doc = await vscode.workspace.openTextDocument(uri)
     } catch {
+      if (!this.isCurrent(origin)) throw new Error('Delegation session changed before edit')
       await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(''))
+      if (!this.isCurrent(origin)) throw new Error('Delegation session changed before edit')
       doc = await vscode.workspace.openTextDocument(uri)
     }
+    if (!this.isCurrent(origin)) throw new Error('Delegation session changed before edit')
     const full = new vscode.Range(doc.positionAt(0), doc.positionAt(doc.getText().length))
     edit.replace(uri, full, newContent)
     const ok = await vscode.workspace.applyEdit(edit)
     if (!ok) {
-      await this.client.answerDelegation(this.sessionId, requestId, {
+      await client.answerDelegation(sessionId, requestId, {
         content: `WorkspaceEdit failed for ${relPath}`,
         isError: true,
       })
+      return
+    }
+    if (!this.isCurrent(origin)) {
+      await client.answerDelegation(sessionId, requestId, { content: `Applied edit to ${relPath}`, isError: false, status: 'ok' })
       return
     }
 
     const ranges = computeLineRanges(oldContent, newContent)
     const pending: PendingEdit = {
       requestId,
-      sessionId: this.sessionId,
+      sessionId,
       relPath,
       uri,
       oldContent,
@@ -172,6 +206,10 @@ export class DelegationExecutor implements vscode.Disposable {
       removed: ranges.removed,
     }
     await this.decorations.show(pending)
+    if (!this.isCurrent(origin)) {
+      await client.answerDelegation(sessionId, requestId, { content: `Applied edit to ${relPath}`, isError: false, status: 'ok' })
+      return
+    }
     this.codeLenses.refresh()
     void vscode.window.showInformationMessage(`天枢改了 ${relPath}，请在编辑器 CodeLens 接受或拒绝。`)
 
@@ -192,9 +230,11 @@ export class DelegationExecutor implements vscode.Disposable {
       const span = new vscode.Range(fresh.positionAt(0), fresh.positionAt(fresh.getText().length))
       revert.replace(uri, span, oldContent)
       await vscode.workspace.applyEdit(revert)
-      this.decorations.clear(uri)
-      this.codeLenses.refresh()
-      await this.client.answerDelegation(this.sessionId, requestId, {
+      if (this.isCurrent(origin)) {
+        this.decorations.clear(uri)
+        this.codeLenses.refresh()
+      }
+      await client.answerDelegation(sessionId, requestId, {
         content: `User rejected edit to ${relPath}`,
         isError: false,
         status: 'rejected',
@@ -202,9 +242,11 @@ export class DelegationExecutor implements vscode.Disposable {
       return
     }
 
-    this.decorations.clear(uri)
-    this.codeLenses.refresh()
-    await this.client.answerDelegation(this.sessionId, requestId, {
+    if (this.isCurrent(origin)) {
+      this.decorations.clear(uri)
+      this.codeLenses.refresh()
+    }
+    await client.answerDelegation(sessionId, requestId, {
       content: `Applied edit to ${relPath}`,
       isError: false,
       status: 'ok',
@@ -221,15 +263,16 @@ export class DelegationExecutor implements vscode.Disposable {
     waiter.resolve(status)
   }
 
-  private async handleTerminalExec(requestId: string, payload: Record<string, unknown>): Promise<void> {
+  private async handleTerminalExec(requestId: string, payload: Record<string, unknown>, origin: DelegationOrigin): Promise<void> {
+    const { client, sessionId } = origin
     const command = String(payload.command ?? '')
     const cwd = String(payload.cwd ?? this.workspaceCwd)
-    if (!command || !this.client || !this.sessionId) return
+    if (!command) return
 
     if (!this.hasShellIntegration) {
       // Should not be registered — fail-back by not answering? Server waits → timeout → null.
       // Answer with error so agent gets a clear signal rather than waiting 5min.
-      await this.client.answerDelegation(this.sessionId, requestId, {
+      await client.answerDelegation(sessionId, requestId, {
         content: 'Shell Integration unavailable; kernel should fail-back.',
         isError: true,
       })
@@ -240,28 +283,39 @@ export class DelegationExecutor implements vscode.Disposable {
     term.show(true)
 
     const si = await this.waitShellIntegration(term, 8_000)
+    if (!this.isCurrent(origin)) throw new Error('Delegation session changed before execution')
     if (!si?.executeCommand) {
-      await this.client.answerDelegation(this.sessionId, requestId, {
+      await client.answerDelegation(sessionId, requestId, {
         content: 'Shell Integration not ready',
         isError: true,
       })
       return
     }
 
-    const execution = si.executeCommand!(command) as {
-      exitCode?: Thenable<number | undefined>
-      read?: () => AsyncIterable<string>
-    }
-    const exitPromise = execution.exitCode ?? Promise.resolve(undefined)
-    const output = await this.readExecutionOutput(execution)
-    const exitCode = await exitPromise
-    const code = typeof exitCode === 'number' ? exitCode : 0
-    const content = output || `(no output, exit ${code})`
-    await this.client.answerDelegation(this.sessionId, requestId, {
-      content: code === 0 ? content : `${content}\n\n[exit ${code}]`,
-      isError: code !== 0,
-      status: 'ok',
+    let execution: vscode.TerminalShellExecution | undefined
+    let settle!: (code: number | undefined) => void
+    const exitPromise = new Promise<number | undefined>((resolve) => { settle = resolve })
+    const endSub = vscode.window.onDidEndTerminalShellExecution((e) => {
+      if (e.execution === execution) settle(e.exitCode)
     })
+    const closeSub = vscode.window.onDidCloseTerminal((closed) => {
+      if (closed === term) settle(undefined)
+    })
+    try {
+      execution = si.executeCommand(command)
+      const output = await this.readExecutionOutput(execution)
+      const exitCode = await exitPromise
+      const code = exitCode ?? 'unknown'
+      const content = output || `(no output, exit ${code})`
+      await client.answerDelegation(sessionId, requestId, {
+        content: exitCode === 0 ? content : `${content}\n\n[exit ${code}]`,
+        isError: exitCode !== 0,
+        status: 'ok',
+      })
+    } finally {
+      endSub.dispose()
+      closeSub.dispose()
+    }
   }
 
   private ensureTerminal(cwd: string): vscode.Terminal {
@@ -277,7 +331,7 @@ export class DelegationExecutor implements vscode.Disposable {
       const t = vscode.window.createTerminal({ name: '天枢-probe', hideFromUser: true })
       const si = await this.waitShellIntegration(t, 8_000)
       t.dispose()
-      return !!si?.executeCommand
+      return !!si?.executeCommand && !!vscode.window.onDidEndTerminalShellExecution
     } catch {
       return false
     }

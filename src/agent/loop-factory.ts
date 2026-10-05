@@ -1,3 +1,5 @@
+import { createSidePathUsageRecorder } from './side-path-usage-recorder.js'
+export { createSidePathUsageRecorder } from './side-path-usage-recorder.js'
 import { sessionStateAdvice } from './runtime-advice-facts.js'
 import { cacheDiagnosticClass } from '../cache/cache-diagnostic-class.js'
 import type { AgentLoop } from './loop.js'
@@ -66,51 +68,6 @@ export { runGateCompletion, type GateCompletionClient } from './gate-completion.
  *     main-turn entries so turn-sequence analysis stays clean
  * Never consumes the engine/wire divergence probes — those belong to main turns.
  */
-export function createSidePathUsageRecorder(self: AgentLoop): (kind: string, usage: Partial<Usage>, model?: string, provider?: string) => void {
-  return (kind, usage, model, provider) => {
-    try {
-      // Keep "all usage fields unknown" observations: an aborted attempt with
-      // provider usage missing must still leave an identity-stamped cache-log
-      // row. Only truly empty calls (no observation and no numeric field) are
-      // dropped so they don't pollute totals/rate denominators.
-      const hasNumericUsage = (usage.input_tokens ?? 0) > 0
-        || (usage.output_tokens ?? 0) > 0
-        || (usage.cache_read_input_tokens ?? 0) > 0
-        || (usage.cache_creation_input_tokens ?? 0) > 0
-        || (usage.reasoning_tokens ?? 0) > 0
-      if (!hasNumericUsage && !usage.observation) return
-      self.session.addSidePathUsage(usage)
-      const input = usage.input_tokens ?? 0
-      const hitRate = input > 0
-        ? ((usage.cache_read_input_tokens ?? 0) / input * 100).toFixed(1)
-        : '0.0'
-      const line = JSON.stringify({
-        event: 'side_path',
-        ...usage.observation,
-        usageFields: usage.observation?.fields,
-          buildId: process.env.RIVET_BUILD_ID ?? 'unknown',
-        kind,
-        t: Date.now(),
-        model: model ?? self.config.promptEngine.getModel(),
-        // provider 维度（T3）：spark 与官方 deepseek 的 wire 模型 id 相同，
-        // 无此字段两者在日志里无法区分。默认主会话 provider；专用 compact
-        // client 等跨 provider 侧路由调用方显式传入。
-        provider: provider ?? self.config.providerName,
-        input,
-        cacheRead: usage.cache_read_input_tokens ?? 0,
-        cacheCreate: usage.cache_creation_input_tokens ?? 0,
-        output: usage.output_tokens ?? 0,
-        hitRate: `${hitRate}%`,
-      })
-      const sid = self.config.sessionId ?? 'anon'
-      import('node:fs/promises').then(fs => {
-        const dir = join(getSessionDir(self.cwd), sid)
-        return fs.mkdir(dir, { recursive: true })
-          .then(() => fs.appendFile(join(dir, 'cache-log.jsonl'), line + '\n'))
-      }).catch(() => {})
-    } catch { /* accounting is best-effort — never break the side path */ }
-  }
-}
 
 /**
  * Reclaim-decision telemetry sink (plan task 7). Every deterministic candidate
@@ -181,18 +138,20 @@ export function createTurnStreamController(self: AgentLoop): TurnStreamControlle
         // （recordTurnCache）消费——abort 后面包屑滞留内存，被下一次成功请求
         // 的日志行误领。此处即消费即附，归因到真正产生它的这次失败尝试。
         const entry: Record<string, unknown> = {
+          ...info.usage?.observation,
           event: 'stream_attempt_aborted',
           requestId: info.requestId, attemptId: info.attemptId,
           usageFields: info.usage?.observation?.fields,
           prefix: info.usage?.observation?.prefix,
+          wire: info.usage?.observation?.wire,
           status: 'aborted',
             buildId: process.env.RIVET_BUILD_ID ?? 'unknown',
           input: info.usage?.input_tokens, output: info.usage?.output_tokens,
           estimated: info.usage?.estimated,
           cacheRead: info.usage?.cache_read_input_tokens, cacheCreate: info.usage?.cache_creation_input_tokens,
           t: Date.now(),
-          model: self.config.promptEngine.getModel(),
-          provider: info.provider,
+          model: info.usage?.observation?.wire?.model ?? self.config.promptEngine.getModel(),
+          provider: info.usage?.observation?.wire?.provider ?? info.provider,
           receivedChars: info.receivedChars,
           elapsedMs: info.elapsedMs,
           errorName: info.errorName,
@@ -427,13 +386,14 @@ export function createToolExecutionController(self: AgentLoop): ToolExecutionCon
       // the active model. Injection is tail-append via addUserMessage (multimodal
       // parts) — the same append-only boundary the steer path uses.
       getSupportsVision: () => self.config.supportsVision ?? false,
-      addUserMessageWithImages: (text, images) => { self.session.addUserMessage(text, images) },
+      addUserMessageWithImages: (text, images) => { self.session.addUserMessage(text, images, 'hook') },
       // Bridge for text-only primaries: the same vision model that describes
       // user-attached images also describes screenshots the agent took itself,
       // so `browser_debug screenshot` is worth calling on any model.
       describeToolImages: self.config.visionClient
         ? (images, signal) => describeImages(self.config.visionClient!, images, {
             prompt: self.config.visionModelPrompt,
+            recordUsage: usage => self.recordSidePathUsage('vision-description', usage, self.config.visionBridge?.detail ?? 'unknown'),
             maxTokens: self.config.visionModelMaxTokens,
             signal,
           })
@@ -456,17 +416,21 @@ export function createToolExecutionController(self: AgentLoop): ToolExecutionCon
         if (!self.config.visionClient) {
           return { error: '未配置识图模型，无法就图片问答' }
         }
-        const key = visionCacheKey(question)
+        const key = `${self.config.visionBridge?.detail ?? 'unknown'}:${visionCacheKey(question)}`
         const cached = self.imageRegistry.getCachedDescription(img.id, key)
         if (cached !== undefined) return { answer: cached, cached: true }
         try {
+          let complete = false
           const answer = await describeImages(self.config.visionClient, [img.dataUrl], {
+            purpose: 'vision_question',
+            recordUsage: usage => self.recordSidePathUsage('vision-question', usage, self.config.visionBridge?.detail ?? 'unknown'),
             prompt: question, // 定向问题作为 prompt，得到针对性回答
             maxTokens: self.config.visionModelMaxTokens,
             signal,
+            onOutcome: outcome => { complete = outcome.complete },
           })
           if (!answer) return { error: '视觉模型返回空' }
-          self.imageRegistry.cacheDescription(img.id, key, answer)
+          if (complete) self.imageRegistry.cacheDescription(img.id, key, answer)
           return { answer }
         } catch (err) {
           return { error: (err as Error)?.message ?? String(err) }
@@ -734,7 +698,7 @@ export function createRuntimeHooksPipeline(self: AgentLoop): RuntimeHookPipeline
     getFileObservations: () => self.config.contextClaimStore?.listClaims({ kind: ['file_observation'] }) ?? [],
     antiAnchoring: normalizeAntiAnchoringConfig(self.config.antiAnchoring),
     getInitialUserMessage: () => self.initialUserMessage,
-    callAntiAnchoringSeedModel: prompt => self.antiAnchoring.callSeedModel(prompt),
+    callAntiAnchoringSeedModel: (prompt, signal) => self.antiAnchoring.callSeedModel(prompt, signal),
     songlineEnabled: self.config.songlineEnabled,
     securityGuidance: self.config.securityGuidance,
     getTaskSummary: self.config.taskLedger ? () => self.config.taskLedger!.getSummary() : undefined,
@@ -1488,6 +1452,9 @@ export function createTurnOrchestrator(self: AgentLoop): TurnOrchestrator {
       // GLM independent reasoning: thinking-only turns are legitimate output,
       // not failed utterances. Skip retry to avoid wasting time on fresh reasoning.
       skipThinkingRetry: self.config.providerName === 'glm',
+      maxTurns: self.config.maxTurns,
+      reserveReasoningRecovery: () => self.config.retryBudgetHolder?.current?.take() ?? true,
+      markReasoningRecovery: () => { self.reasoningRecoveryPending = true },
     }),
   })
 }

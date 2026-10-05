@@ -1,5 +1,53 @@
 import type { Tool, ToolCallParams, ToolResult } from './types.js'
 
+// ── 决策选项（结构卡）纯函数── 原 decision-options.ts，2026-10-05 并入本叶：
+// 本文件是桌面共享叶子（boundary 门禁：叶子只允许 import type），拆出独立模块
+// 会让叶子产生 value import、拖垮检查。plan.ts 与 types.ts 从这里取。
+
+export interface DecisionOptionDetail {
+  description?: string
+  recommended?: boolean
+  recommendationReason?: string
+}
+
+export function normalizeDecisionOptions(raw: unknown): { options: string[]; optionDetails?: DecisionOptionDetail[] } {
+  if (!Array.isArray(raw)) return { options: [] }
+  const options: string[] = [], details: DecisionOptionDetail[] = []
+  let structured = false
+  for (const item of raw) {
+    const object = item && typeof item === 'object' ? item as Record<string, unknown> : undefined
+    const label = typeof item === 'string' ? item.trim() : typeof object?.label === 'string' ? object.label.trim() : ''
+    if (!label) continue
+    options.push(label)
+    structured ||= !!object
+    details.push(object ? {
+      ...(typeof object.description === 'string' ? { description: object.description.trim() } : {}),
+      ...(typeof object.recommended === 'boolean' ? { recommended: object.recommended } : {}),
+      ...(typeof object.recommendation_reason === 'string' ? { recommendationReason: object.recommendation_reason.trim() } : {}),
+    } : {})
+  }
+  return { options, ...(structured ? { optionDetails: details } : {}) }
+}
+
+export function recommendationError(details: readonly DecisionOptionDetail[] | undefined, count: number): string | undefined {
+  if (count < 2) return undefined
+  const recommended = details?.filter(d => d.recommended === true) ?? []
+  if (recommended.length !== 1 || !recommended[0]!.recommendationReason?.trim()) {
+    return '有多个选项时必须恰好标记一个 recommended: true，并填写非空 recommendation_reason，说明为何最符合用户目标及主要取舍。'
+  }
+  return undefined
+}
+
+export const decisionOptionSchema = {
+  anyOf: [
+    { type: 'string' },
+    { type: 'object', properties: {
+      label: { type: 'string' }, description: { type: 'string' }, recommended: { type: 'boolean' },
+      recommendation_reason: { type: 'string' },
+    }, required: ['label'] },
+  ],
+}
+
 /**
  * AskUserQuestion tool — allows the model to ask the user a question.
  *
@@ -17,8 +65,7 @@ import type { Tool, ToolCallParams, ToolResult } from './types.js'
  *
  * The desktop client additionally renders a structured question card (the
  * server forwards the parsed questions over a `user_question` SSE event);
- * answers still return through the normal user-message channel, so the TUI
- * (plain text) and the desktop (card) share the same reply path.
+ * CLI and desktop cards return answers through the normal user-message channel.
  */
 
 /** Structured question shape shared by the tool, server SSE and desktop card. */
@@ -27,6 +74,7 @@ export interface AskUserQuestionItem {
   id: string
   prompt: string
   options: string[]
+  optionDetails?: DecisionOptionDetail[]
   allowMultiple: boolean
 }
 
@@ -37,35 +85,6 @@ export interface AskUserQuestionItem {
  * Returns [] when no valid question is present.
  */
 export function parseAskUserQuestions(input: Record<string, unknown>): AskUserQuestionItem[] {
-  /**
-   * 把一项 LLM 输入规整成 string[] 形式。
-   * LLM 在生产 schema 下可能给三类形态：
-   * - string[]：标准格式（string trim 后非空保留）
-   * - { label, description }[]：Anthropic 原生 ask_user_question schema；只取 label
-   * - 混入 null / 无 label 对象 / 纯字符串：跳过无效项
-   * 任何「整条 options 都是无效」的情况由调用方负责判断（panel 已有的
-   * options.length === 0 过滤会兜底），parser 这里只做规整。
-   */
-  const cleanOptions = (raw: unknown): string[] => {
-    if (!Array.isArray(raw)) return []
-    const out: string[] = []
-    for (const item of raw) {
-      if (typeof item === 'string') {
-        const t = item.trim()
-        if (t.length > 0) out.push(t)
-      } else if (item !== null && typeof item === 'object') {
-        const label = (item as Record<string, unknown>).label
-        if (typeof label === 'string') {
-          const t = label.trim()
-          if (t.length > 0) out.push(t)
-        }
-        // 缺 label 的对象跳过，不抛错——保持静默降级（panel 有兜底）
-      }
-      // null / 非对象非字符串：跳过
-    }
-    return out
-  }
-
   if (Array.isArray(input.questions) && input.questions.length > 0) {
     const items: AskUserQuestionItem[] = []
     for (const raw of input.questions) {
@@ -86,7 +105,7 @@ export function parseAskUserQuestions(input: Record<string, unknown>): AskUserQu
       items.push({
         id: typeof q.id === 'string' && q.id.trim() ? q.id.trim() : `q${items.length + 1}`,
         prompt,
-        options: cleanOptions(rawOptions),
+        ...normalizeDecisionOptions(rawOptions),
         allowMultiple,
       })
     }
@@ -102,7 +121,7 @@ export function parseAskUserQuestions(input: Record<string, unknown>): AskUserQu
     return [{
       id: 'q1',
       prompt: input.question.trim(),
-      options: cleanOptions(rawOptions),
+      ...normalizeDecisionOptions(rawOptions),
       allowMultiple: input.allow_multiple === true || input.multiSelect === true,
     }]
   }
@@ -166,14 +185,25 @@ export function composeAnswers(
   return lines.join('\n')
 }
 
+export function validateAskUserQuestions(questions: AskUserQuestionItem[]): string | undefined {
+  if (!questions.length) return 'question（或 questions[]）必填'
+  for (const q of questions) {
+    const error = recommendationError(q.optionDetails, q.options.length)
+    if (error) return error
+  }
+  return undefined
+}
+
 export const ASK_USER_QUESTION_TOOL: Tool = {
   definition: {
     name: 'ask_user_question',
     description: `向用户提出一个或多个问题，并等待其输入回答。当你需要澄清信息、了解偏好，或需要一个无法从上下文推断的决定时使用。
 
-单个问题：传 \`question\`（+ 可选 \`options\`）。多个相关问题（最多 4 个）：传 \`questions\`——桌面端会把它们渲染成一张结构化卡片，用户逐页作答。
+单个问题：传 \`question\`（+ 可选 \`options\`）。多个相关问题（最多 4 个）：传 \`questions\`——CLI 与桌面端会把它们渲染成一张结构化卡片，用户逐页作答。
 
-为一小组互斥选项提供 \`options\`（UI 渲染为编号列表，用户可直接按编号回答；桌面端卡片还提供自由输入的 "Other" 项）。开放式问题省略 \`options\`。
+为一小组互斥选项提供 \`options\`（UI 渲染为编号列表，用户可直接按编号回答；卡片还提供自定义回答项）。开放式问题省略 \`options\`。
+
+有选项时必须结构化调用本工具，不得只在普通回复列菜单；恰好一个选项标记 recommended: true，并用 recommendation_reason 解释为何更符合用户目标及主要取舍。推荐不代表替用户选择。
 
 当用户要的是你的分析、建议或观点时，禁止用这个工具把决定推回给用户——那种情况直接回答。优先只问一个问题；先处理你能确定的部分。`,
     input_schema: {
@@ -182,7 +212,7 @@ export const ASK_USER_QUESTION_TOOL: Tool = {
         question: { type: 'string', description: '要问用户的问题。清晰、具体。' },
         options: {
           type: 'array',
-          items: { type: 'string' },
+          items: decisionOptionSchema,
           description: '可选的 2-4 个简短互斥选项。开放式问题、或用户要的是你的分析而不是菜单时省略。',
         },
         allow_multiple: { type: 'boolean', description: '允许选择多个选项（默认：false）。' },
@@ -193,7 +223,7 @@ export const ASK_USER_QUESTION_TOOL: Tool = {
             properties: {
               id: { type: 'string', description: '该问题的可选稳定 id（省略时自动分配）。' },
               prompt: { type: 'string', description: '问题文本。' },
-              options: { type: 'array', items: { type: 'string' }, description: '可选的 2-4 个简短互斥选项。' },
+              options: { type: 'array', items: decisionOptionSchema, description: '可选的 2-4 个简短互斥选项。' },
               allow_multiple: { type: 'boolean', description: '允许选择多个选项（默认：false）。' },
             },
             required: ['prompt'],
@@ -206,25 +236,17 @@ export const ASK_USER_QUESTION_TOOL: Tool = {
 
   async execute(params: ToolCallParams): Promise<ToolResult> {
     const questions = parseAskUserQuestions(params.input)
-    if (questions.length === 0) {
-      return { content: '错误：question（或 questions[]）必填', isError: true }
-    }
-
+    const invalid = validateAskUserQuestions(questions)
+    if (invalid) return { content: `错误：${invalid}`, isError: true }
     // content: what the LLM sees. When options exist it MUST include the same
     // numbered rendering the user sees — the numbering lives only in uiContent
     // otherwise, so a bare "1" reply forces the model to guess the mapping
     // (session 91840816: user answered 1 = plan mode, model read it as
     // option 2 = execute directly).
-    // uiContent: what the user sees (plain-text rendering; the desktop client
-    //            additionally receives a structured user_question SSE for the card).
+    // Both clients receive structured cards; uiContent remains a readable transcript.
     const rendered = renderAskUserQuestionText(questions)
     const hasOptions = questions.some(q => q.options.length > 0)
-    // Surface selectable questions to the TUI so it can open an arrow-key picker
-    // (including multi-select and multi-question forms).
-    const hasSelectable = questions.some(q => q.options.length > 0)
-    if (hasSelectable) {
-      params.onAskUserQuestion?.({ questions })
-    }
+    params.onAskUserQuestion?.({ requestId: params.toolUseId, questions })
     const content = hasOptions
       ? `[等待你的回复…]\n\n已向用户展示以下编号选项：\n${rendered}\n\n回复中的裸数字对应这里的编号。`
       : '[等待你的回复…]'

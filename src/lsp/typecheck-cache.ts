@@ -100,11 +100,18 @@ export const TYPECHECK_CALLER_BUDGET_MS = STALE_LOCK_MS + 3 * 60_000
  *
  * `RIVET_TYPECHECK_SHARE=0`（与共享锁同一逃生口）下闸门不生效，原样返回。
  */
+/** 测试运行的专用闸门预算。全量约 52s，5 分钟足以吸收冷启动与 CPU 竞争。
+ *  **有界是刻意的**：不给它 `TYPECHECK_CALLER_BUDGET_MS` 那 13 分钟——后者长是因为
+ *  要等跨进程共享锁排队，测试不参与那把锁。 */
+export const TEST_RUNNER_CALLER_BUDGET_MS = 5 * 60_000
+
 export function resolveCallerTimeoutBudget(command: string, requestedMs: number, defaultMs: number): number {
   const requested = requestedMs > 0 ? requestedMs : defaultMs
   if (process.env.RIVET_TYPECHECK_SHARE === '0') return requested
-  if (!isTypecheckCommand(command)) return requested
-  return Math.max(requested, TYPECHECK_CALLER_BUDGET_MS)
+  const gate = isTypecheckCommand(command) ? TYPECHECK_CALLER_BUDGET_MS
+    : isTestRunnerCommand(command) ? TEST_RUNNER_CALLER_BUDGET_MS
+    : 0
+  return gate > 0 ? Math.max(requested, gate) : requested
 }
 
 /**
@@ -140,7 +147,7 @@ export const TYPECHECK_WATCHDOG_MARGIN_MS = 30_000
  * 非 typecheck 形态原样返回 `defaultMs`（不参与抬升，与修复前一致）。
  */
 export function resolveWatchdogTimeout(command: string, requestedMs: number, defaultMs: number): number {
-  if (!isTypecheckCommand(command)) return defaultMs
+  if (!isGateBudgetCommand(command)) return defaultMs
   return resolveCallerTimeoutBudget(command, requestedMs, defaultMs) + TYPECHECK_WATCHDOG_MARGIN_MS
 }
 
@@ -444,6 +451,43 @@ export function isTypecheckCommand(command: string): boolean {
   // 等派生 script 不匹配。
   if (/(?:^|[;&|])\s*(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?typecheck(?:\s|$|[;&|)])/i.test(command)) return true
   return false
+}
+
+/**
+ * 判断一条 shell 命令是否是「测试运行」形态。
+ *
+ * 与 `bash-verification.ts::inferBashVerificationScope` 的对齐口径：**full 形态
+ * （`npm test` / `node|tsx --test` / 裸 `vitest run` 等）两链一致**——只抬预算
+ * 却换不来 passed 记录的空转必须避免。派生形态（`npm run test:unit` 等）两链
+ * 刻意不同：预算链多认（子集也可能跑得久），验证链记 unknown（子集不该满足
+ * full-scope 覆盖义务）——这不是漂移，是语义差异。`cargo test`/`go test`/`bun
+ * test` 的覆盖差异同理（本仓 TS 为主，失效方向安全：预算宽松、记录严格）。
+ *
+ * 动机（2026-10-05 取证）：`npm test` 全量约 52s，但非 typecheck 形态只拿工具
+ * 默认 120s；多会话共享工作区的 CPU 竞争下必然撞超时被杀，结果被超时占位替换 →
+ * 无 exitCode、无输出计数 → verification 恒 `blocked` → 交付门禁的
+ * full-scope 覆盖义务永远无法满足（**核心改动结构性无法提交**）。实测锚点：
+ * `npm test` 记录 `scope:full, kind:test` 但无 `exitCode` 字段、`passed:0`，
+ * 而同一条 `npm run typecheck`（13.7s 跑得完）带 `exitCode:2`。
+ *
+ * typecheck 形态早已有闸门预算（见 resolveCallerTimeoutBudget 的注释）；测试运行
+ * 同属「跑得完但可能慢」的闸门命令，故一并纳入。`--watch` 类长跑形态不在此列
+ * （进程永不退出，走后台 job 通道）。
+ */
+export function isTestRunnerCommand(command: string): boolean {
+  if (/--watch\b/i.test(command)) return false
+  // 包管理器的 test script（含 test:unit / test:desktop 等派生 script）。
+  if (/(?:^|[;&|])\s*(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test(?::[\w-]+)?(?:\s|$|[;&|)])/i.test(command)) return true
+  // node/tsx 内置 test runner（允许 npx 等前缀；带 filter/文件参数同样算）。
+  if (/(?:^|[;&|(/])\s*(?:(?:npx|pnpm|yarn|bun|bunx)\s+)?(?:node|tsx)\s+--test\b/i.test(command)) return true
+  // 独立测试框架。
+  if (/(?:^|[;&|(/])\s*(?:(?:npx|pnpm|yarn|bun|bunx)\s+)?(?:vitest|jest|pytest)\b/i.test(command)) return true
+  return false
+}
+
+/** 走闸门超时预算的命令形态：全量类型检查 + 测试运行。 */
+export function isGateBudgetCommand(command: string): boolean {
+  return isTypecheckCommand(command) || isTestRunnerCommand(command)
 }
 
 /**

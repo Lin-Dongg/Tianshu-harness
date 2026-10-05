@@ -62,6 +62,11 @@ export interface SessionState {
 
 const MAX_DECISIONS = 20
 const MAX_VERIFICATIONS = 30
+/** 陈旧失败不入模型上下文：只呈现最近 STALE_VERIFICATION_MS 内的 failed。
+ *  renderForVolatile 无参、recordVerification 不收 turn，故用 verifiedAt 时间窗（改动最小）。
+ *  注意：`Modified:` 行**故意不**做同样处理——它是「本会话改过哪些文件」的中性事实清单，
+ *  跨 run 常驻对回滚/总结/交付自查有用（有意设计）。 */
+const STALE_VERIFICATION_MS = 5 * 60_000
 const MAX_FACTS = 15
 const MAX_TASK_ITEMS = 30
 const VOLATILE_MAX_CHARS = 500
@@ -289,7 +294,10 @@ export class SessionStateManager {
       }
     }
 
-    const failedTests = s.verification.filter(v => v.status === 'failed')
+    // 陈旧失败不入模型上下文：只呈现 STALE_VERIFICATION_MS 内的失败（entry 带 verifiedAt）。
+    const failedTests = s.verification.filter(
+      v => v.status === 'failed' && Date.now() - v.verifiedAt < STALE_VERIFICATION_MS,
+    )
     if (failedTests.length > 0) {
       lines.push(`Failed: ${failedTests.map(v => v.target).join(', ')}`)
     }

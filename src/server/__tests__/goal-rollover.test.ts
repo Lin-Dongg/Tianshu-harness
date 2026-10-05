@@ -303,7 +303,7 @@ test('archiving the source keeps a worktree already referenced by a staged succe
   let release!: () => void
   const gate = new Promise<void>(r => { release = r })
   const f = fixture(t, () => gate)
-  const git = (...args: string[]) => execFileSync('rtk', ['git', '-C', f.cwd, ...args], { stdio: 'pipe' })
+  const git = (...args: string[]) => execFileSync('git', ['-C', f.cwd, ...args], { stdio: 'pipe', windowsHide: true })
   git('init', '--initial-branch=main')
   git('config', 'user.name', 'Goal test'); git('config', 'user.email', 'goal@example.invalid')
   git('config', 'commit.gpgsign', 'false'); git('config', 'core.hooksPath', '/dev/null')

@@ -8,7 +8,7 @@
  * 凭据落盘约定：key 的密钥进 secrets.json，keyRef 命名 `providerName:keyId`
  * （与顶层遗留 keyRef 的 `providerName` 隔离，互不覆盖）。
  */
-import { loadConfig, saveConfig } from './manager.js'
+import { loadConfig, saveConfig, mergeModelUpdate } from './manager.js'
 import { deleteSecret, readSecret, writeSecret } from './secrets-store.js'
 import { keyRefFor, keyRefReferrers } from './provider-keys.js'
 import type { Config, ModelConfig, ProviderConfig, ProviderKeyConfig } from './schema.js'
@@ -300,13 +300,16 @@ export function addProviderKeyModels(providerName: string, keyId: string, models
   saveConfig(cfg)
 }
 
-/** 覆盖该 key 名下的同 id 模型（UI 编辑 ctx/max/视觉标记用）；不存在则新增。 */
+/** 覆盖该 key 名下的同 id 模型（UI 编辑 ctx/max/视觉标记用）；不存在则新增。
+ *  已存在分支走 mergeModelUpdate（与 provider 级 upsertProviderModel 同一份语义）：
+ *  表单只发 {id, contextWindow, maxTokens}，整对象替换会静默抹掉 supportsImageGen
+ *  / pricing / tier——生图模型从选择器消失、成本归零、tier 回退猜测。 */
 export function upsertProviderKeyModel(providerName: string, keyId: string, model: ModelConfig): void {
   const cfg = loadConfig()
   const provider = requireProvider(cfg, providerName)
   const key = requireKey(provider, keyId)
   key.models = key.models.some(m => m.id === model.id)
-    ? key.models.map(m => (m.id === model.id ? model : m))
+    ? key.models.map(m => (m.id === model.id ? mergeModelUpdate(m, model) : m))
     : [...key.models, model]
   provider.userSaved = true
   saveConfig(cfg)

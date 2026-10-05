@@ -69,7 +69,7 @@ test('默认折叠状态下宽屏不触发 side panel，主区保留 task 列表
   // 快捷键提示仅出现在 side panel 中
   assert.ok(!plain.includes('] toggle · ctrl+x r open'), `no side-panel chrome when folded: ${plain}`)
   assert.ok(!plain.includes('default fold task'), 'default workspace keeps the full checklist folded')
-  assert.ok(plain.includes('步骤 1') && plain.includes('Ctrl+X T'), 'the checklist has its actual expansion entry')
+  assert.ok(plain.includes('≡0/1'), 'the checklist remains discoverable via the chrome badge')
 })
 
 test('窄屏（<120）不触发 side panel，主区布局不变', () => {
@@ -78,7 +78,7 @@ test('窄屏（<120）不触发 side panel，主区布局不变', () => {
 
   const plain = lastFramePlain(out)
   assert.ok(!plain.includes('main task'), `narrow workspace keeps the full checklist folded: ${plain}`)
-  assert.ok(plain.includes('步骤 1'), 'unfinished checklist remains discoverable')
+  assert.ok(plain.includes('≡0/1'), 'unfinished checklist remains discoverable')
   assert.ok(!plain.includes('] toggle · ctrl+x r open'), `no side-panel chrome when narrow: ${plain}`)
 })
 

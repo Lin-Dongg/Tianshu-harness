@@ -27,8 +27,8 @@ describe('model supportsVision', () => {
     // 样本必须是一个现存的无视觉模型：写已退役的 id 会让 find 返回 undefined，
     // 而 `?.supportsVision` 依旧是 undefined——断言会退化成永不失败的空壳。
     // 故先钉住样本存在（2026-09-11 v4pro 退役时踩到过这个坑）。
-    const deepseek = parsed.provider.providers.deepseek?.models.find(m => m.id === 'deepseek-v4-flash')
-    assert.ok(deepseek, 'deepseek-v4-flash 必须存在于预设，否则本断言失去意义')
+    const deepseek = parsed.provider.providers.deepseek?.models.find(m => m.id === 'deepseek-v4-pro')
+    assert.ok(deepseek, 'deepseek-v4-pro 必须存在于预设，否则本断言失去意义')
     assert.equal(deepseek.supportsVision, undefined, 'text-only models stay undeclared')
   })
 })
@@ -331,7 +331,7 @@ describe('config permissions schema', () => {
 
     assert.equal(parsed.workers.routing.repo_summarization, 'cheap-flash')
     assert.equal(parsed.workers.profiles['cheap-flash']?.provider, 'deepseek')
-    assert.equal(parsed.workers.profiles['cheap-flash']?.model, 'deepseek-v4-flash')
+    assert.equal(parsed.workers.profiles['cheap-flash']?.model, 'deepseek-flash')
   })
 
   it('fills missing worker routing defaults with cheap-flash for repo summarization', () => {

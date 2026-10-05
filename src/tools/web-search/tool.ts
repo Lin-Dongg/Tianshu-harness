@@ -6,6 +6,7 @@ import { runBackendChain } from './chain.js'
 import { OFF_TOPIC_ERROR } from './relevance.js'
 import { createProxyAwareFetch } from './proxy-fetch.js'
 import { lenientPositiveNumber, lenientString } from '../lenient.js'
+import { combineSearchFailures } from './errors.js'
 
 const MAX_RESULTS = 20
 const DEFAULT_TIMEOUT_MS = 15_000
@@ -96,7 +97,7 @@ export function createWebSearchTool(deps: WebSearchDeps = {}): Tool {
     async execute(params: ToolCallParams): Promise<ToolResult> {
       const queryCandidate = lenientString(params.input.query)
       if (queryCandidate === undefined || queryCandidate.trim().length === 0) {
-        return { content: '错误：query 必须是非空字符串。', isError: true }
+        return { content: '错误：query 必须是非空字符串。', isError: true, errorKind: 'format_error' }
       }
       const query = queryCandidate.trim()
       const count = Math.min(
@@ -110,11 +111,13 @@ export function createWebSearchTool(deps: WebSearchDeps = {}): Tool {
         // All backends failed → surface why. All backends empty, or only
         // returned off-topic content → benign no-hit: reporting a hard error
         // would be misleading, the user-visible outcome is the same.
-        const hardErrors = errors.filter(e => e.message !== 'no results' && e.message !== OFF_TOPIC_ERROR)
+        const hardErrors = errors.filter(e => e.errorKind !== undefined || (e.message !== 'no results' && e.message !== OFF_TOPIC_ERROR))
         if (hardErrors.length > 0) {
           const detail = hardErrors.map(e => `${e.backend}: ${e.message}`).join('; ')
-          // detail 转发后端原文（可能含 HTTP 503 等）——中文前缀+变量，可不打标。
-          return { content: `搜索失败（${detail}）`, isError: true }
+          return {
+            content: `搜索失败（${detail}）`, isError: true,
+            errorKind: combineSearchFailures(hardErrors.map(e => e.errorKind ?? 'unknown')),
+          }
         }
         // 判跑题的批次降级返回而非静默丢弃：单后端配置下，「后端降级返回泛结果」
         // 若变成「未找到结果」，用户丢掉的是唯一可得的信息。标注低相关把采信

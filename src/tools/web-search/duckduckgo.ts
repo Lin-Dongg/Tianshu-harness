@@ -1,4 +1,5 @@
 import type { SearchBackend, SearchFetch, SearchResult } from './types.js'
+import { SearchHttpError } from './errors.js'
 
 /**
  * Parse DuckDuckGo HTML search results from the lite endpoint.
@@ -110,7 +111,7 @@ export class DuckDuckGoBackend implements SearchBackend {
       redirect: 'manual',
     })
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`)
+      throw new SearchHttpError(response.status)
     }
     const html = await response.text()
     return parseDuckDuckGoResults(html, count)

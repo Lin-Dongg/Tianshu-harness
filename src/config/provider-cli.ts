@@ -91,6 +91,7 @@ export function toModelDescriptors(results: ModelMatchResult[]): {
       ...(metadata.reasoningEffort ? { reasoningEffort: metadata.reasoningEffort } : {}),
       ...(metadata.supportsVision !== undefined ? { supportsVision: metadata.supportsVision } : {}),
       ...(metadata.supportsVideo !== undefined ? { supportsVideo: metadata.supportsVideo } : {}),
+      ...(metadata.supportsImageGen !== undefined ? { supportsImageGen: metadata.supportsImageGen } : {}),
       ...(metadata.tier ? { tier: metadata.tier } : {}),
       ...(metadata.pricing ? { pricing: metadata.pricing } : {}),
       ...(metadata.capabilities && Object.keys(metadata.capabilities).length > 0 ? { capabilities: metadata.capabilities } : {}),

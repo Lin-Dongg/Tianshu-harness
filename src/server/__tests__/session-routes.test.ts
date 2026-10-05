@@ -8,7 +8,7 @@ import type { Artifact } from '../../artifact/types.js'
 import type { OaiMessage } from '../../api/oai-types.js'
 import type { SessionRecord } from '../protocol.js'
 import type { Config } from '../../config/schema.js'
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs'
+import { rmSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { skillRegistry } from '../../skills/skill-loader.js'
@@ -1542,4 +1542,55 @@ test('traversal team-resume groupId is rejected with 400', async () => {
   const id = (created.body as { id: string }).id
   const res = await router('POST', `/sessions/${id}/team-resume`, { groupId: '../../pwn' }, AUTH)
   assert.equal(res.status, 400)
+})
+
+
+test('full tool output endpoint requires auth and keeps sessions isolated', async () => {
+  const agent = new FakeAgent(), outputs = new Map<string, string>()
+  const manager = new RuntimeSessionManager({ createAgent: () => agent, defaultCwd: '/tmp/work', persistence: {
+    saveRecord: () => {}, appendEvent: () => {}, loadAll: () => [],
+    saveToolOutput: (sessionId, id, text) => outputs.set(`${sessionId}:${id}`, text),
+    readToolOutput: (sessionId, id) => outputs.get(`${sessionId}:${id}`),
+  } })
+  const session = manager.createSession({ prompt: 'go' })
+  agent.callbacks!.onToolResult('call', 'bash', 'safe line\n'.repeat(1000), false)
+  const id = manager.getEvents(session.id, 0)!.events.find(event => event.type === 'tool_result')!.data.outputId
+  const router = createRouter(buildSessionRoutes(manager, TOKEN))
+  const path = `/sessions/${session.id}/tool-outputs/${id}`
+  assert.equal((await router('GET', path, {}, {})).status, 401)
+  const success = await router('GET', path, {}, AUTH)
+  assert.equal(success.status, 200)
+  assert.equal((success.body as {text:string}).text.length, 10000)
+  assert.equal((await router('GET', `/sessions/other/tool-outputs/${id}`, {}, AUTH)).status, 404)
+  agent.finish()
+})
+
+
+test('content documents and plans expose versions and refuse stale saves at the routed boundary', async () => {
+  const { manager, router } = setup()
+  const dir = mkdtempSync(join(tmpdir(), 'content-route-'))
+  try {
+    mkdirSync(join(dir, '.rivet', 'plans'), {recursive:true})
+    writeFileSync(join(dir,'note.md'),'# Before')
+    writeFileSync(join(dir,'.rivet','plans','p.md'),'# Plan')
+    const s = manager.createSession({cwd:dir})
+    const read = await router('GET',`/sessions/${s.id}/file-document?path=note.md`,{},AUTH)
+    assert.equal(read.status,200)
+    const version = (read.body as {version:string}).version
+    writeFileSync(join(dir,'note.md'),'# External')
+    const conflict = await router('PUT',`/sessions/${s.id}/file-document`,{path:'note.md',content:'# Draft',version},AUTH)
+    assert.equal(conflict.status,409)
+    assert.equal(readFileSync(join(dir,'note.md'),'utf8'),'# External')
+    const plan = await router('GET',`/sessions/${s.id}/plans/p`,{},AUTH)
+    const planVersion = (plan.body as {version:string}).version
+    const edit = await router('PUT',`/sessions/${s.id}/plans/p`,{content:'# Updated',version:planVersion},AUTH)
+    assert.equal(edit.status,200)
+    const stale = await router('PUT',`/sessions/${s.id}/plans/p`,{content:'# Stale',version:planVersion},AUTH)
+    assert.equal(stale.status,409)
+    assert.match(readFileSync(join(dir,'.rivet','plans','p.md'),'utf8'),/Updated/)
+    const changeStatus = await router('PUT',`/sessions/${s.id}/plans/p`,{content:'> **Status: APPROVED**\n\n# Override'},AUTH)
+    assert.equal(changeStatus.status,409)
+    assert.match(readFileSync(join(dir,'.rivet','plans','p.md'),'utf8'),/Updated/)
+    assert.equal((await router('GET',`/sessions/${s.id}/file-document?path=note.md`,{},{})).status,401)
+  } finally { rmSync(dir,{recursive:true,force:true}) }
 })

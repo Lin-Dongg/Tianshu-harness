@@ -1,4 +1,5 @@
 import type { SearchBackend, SearchFetch, SearchResult } from './types.js'
+import { SearchHttpError } from './errors.js'
 
 const SERPLY_ENDPOINT = 'https://api.serply.io/v1/search'
 /** Serply returns at most 10 organic results per request. */
@@ -38,7 +39,7 @@ export class SerplyBackend implements SearchBackend {
       },
     })
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`)
+      throw new SearchHttpError(response.status)
     }
     const data = (await response.json()) as SerplyResponse
     const raw = data.results ?? []

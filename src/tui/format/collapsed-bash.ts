@@ -22,6 +22,7 @@ export interface CollapsedBashEntry {
   /** 原始命令 */
   command: string
   /** 输出内容（终态） */
+  rawPath?: string
   content?: string
   /** 是否执行失败 */
   isError?: boolean
@@ -144,12 +145,13 @@ export function formatCollapsedBashGroup(input: FormatCollapsedBashGroupInput): 
   for (const entry of shown) {
     const allLines = (entry.content ?? '').replace(/\n+$/, '').split('\n')
     const card = formatToolCard({
-      toolName: 'bash', toolInput: { command: entry.command }, content: entry.content ?? '', isError: entry.isError,
+      toolName: 'bash', toolInput: { command: entry.command }, content: entry.content ?? '', rawPath: entry.rawPath, isError: entry.isError,
       columns: input.columns, maxLines: 3, expanded, expandHint: input.expandHint,
     }, theme)
     if (expanded) lines.push(...card)
     else {
       lines.push(card[0]!)
+      if (entry.rawPath) lines.push(fit(color(`  全文来源: ${entry.rawPath}`, theme.muted)))
       if (entry.isError || completed.length === 1) {
         const preview = entry.isError ? allLines.slice(-3) : allLines.slice(0, 2)
         lines.push(...preview.filter(Boolean).map(row => fit(`  ${color(row, entry.isError ? theme.error : theme.muted)}`)))
@@ -205,10 +207,11 @@ export class CollapsedBashBuffer {
     this.group.entries.push({ id, command, completed: false, startMs })
   }
 
-  attachResult(id: string, content: string, isError?: boolean): CollapsedBashEntry | null {
+  attachResult(id: string, content: string, isError?: boolean, rawPath?: string): CollapsedBashEntry | null {
     if (!this.group) return null
     const entry = this.group.entries.find(e => e.id === id)
     if (!entry) return null
+    entry.rawPath = rawPath
     entry.content = content
     entry.isError = isError ?? false
     entry.completed = true

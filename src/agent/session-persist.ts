@@ -1,3 +1,4 @@
+import { readHandoffWithCoverage, writeHandoffCoverage, writeHandoffTail } from './handoff-coverage.js'
 import { readFile } from 'node:fs/promises'
 import { setImmediate as yieldToLoop } from 'node:timers/promises'
 import { existsSync, mkdirSync, readFileSync, unlinkSync, rmSync, readdirSync, statSync } from 'fs'
@@ -797,7 +798,10 @@ export class SessionPersist {
   /** Write structured handoff text for this session. */
   writeHandoff(text: string): void {
     writeFileAtomicSync(this.getHandoffPath(), text)
+    writeHandoffCoverage(this.getHandoffPath(), this.sessionId, text, this.loadMetadata()?.turnCount ?? 0)
   }
+
+  writeHandoffTail(text: string): void { writeHandoffTail(this.getHandoffPath(), this.sessionId, text, this.loadMetadata()?.turnCount ?? 0) }
 
   /** 会话归档交接文档路径（`<id>.handoff.md`）——loadPrevHandoff 注入管线认的位置。 */
   getHandoffPath(): string {
@@ -828,7 +832,7 @@ export class SessionPersist {
     const handoffPath = join(getSessionDir(cwd), `${prev.id}.handoff.md`)
     if (!existsSync(handoffPath)) return null
     try {
-      return readFileSync(handoffPath, 'utf-8')
+      return readHandoffWithCoverage(handoffPath, prev.id, prev.turnCount ?? 0)
     } catch {
       return null
     }
@@ -991,15 +995,7 @@ export function formatExitSummary(
   return `✦ 后会有期 — 星轨已存档\n${head}\n恢复: rivet --continue（最近会话）或 rivet --resume ${short}\n缓存成本：尽快回连 ≈ 继承冻结锚点（只读缓存价）；间隔过久缓存过期 → 全量重建一次前缀（长会话数元级）。`
 }
 
-/**
- * shutdown 自动交接（buildSessionHandoff 结构化摘要）是否该写：
- * 会话内 /handoff（或人工编辑）已产出更新的交接文档时（mtime 晚于 agent 创建时间）
- * 不覆盖——自动摘要只是「会话内没做手动交接」的兜底。
- */
-export function shouldAutoWriteHandoff(existingMtimeMs: number | null, sessionStartMs: number): boolean {
-  if (existingMtimeMs === null) return true
-  return existingMtimeMs <= sessionStartMs
-}
+export { shouldAutoWriteHandoff } from './handoff-coverage.js'
 
 /** Compact relative time for session lists, e.g. "刚刚" / "5分钟前" / "3天前". */
 function formatRelativeTime(ts: number): string {

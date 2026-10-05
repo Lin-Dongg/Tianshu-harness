@@ -357,3 +357,13 @@ describe('event-tap — 可选回调不被凭空具现', () => {
     assert.equal(tap.onSteerDrain!(), 'guidance')
   })
 })
+
+
+test('event tap forwards display evidence unchanged without logging image payloads', () => {
+  const evidence = { images: ['data:image/png;base64,aGVsbG8='], exitCode: 2 }
+  let received: unknown
+  const { tap, rec } = harness({ onToolResult: (_id, _name, _result, _error, _path, _ui, value) => { received = value } })
+  tap.onToolResult('call', 'read_file', 'display', false, undefined, undefined, evidence)
+  assert.equal(received, evidence)
+  assert.ok(!JSON.stringify(rec.events).includes('aGVsbG8='))
+})

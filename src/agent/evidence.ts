@@ -1,5 +1,7 @@
 import type { VerificationMetadata } from '../tools/types.js'
 import { buildDeliveryGate } from './delivery-gate.js'
+import { inferBashVerificationScope } from './bash-verification.js'
+import { getEffectiveVerifications } from './verification-attribution.js'
 
 // wire 侧类型已抽至 evidence-types.ts（叶子，桌面端经 server/ui-shared 共享）；
 // 此处 re-export 保持内核调用方不变。
@@ -135,6 +137,7 @@ export class EvidenceTracker implements EvidenceTrackerPublic {
     // behavior-verification scripts, not deliverable edits — counting them
     // would let the RED gate punish the probe discipline it should encourage.
     if (isCodeFile(path) && !isScratchPath(path)) {
+      for (const verification of this.state.verifications) verification.stale = true
       this.#editsSinceLastTest++
       this.#hasCodeEdits = true
     }
@@ -185,26 +188,23 @@ export class EvidenceTracker implements EvidenceTrackerPublic {
     return this.state.deliveryStatus === 'failed' || this.#editsSinceLastTest >= 3
   }
 
-  /**
-   * 交付就绪判据（2026-07-25，YOLO 证据门专用）：最近一条验证 passed 且绿后
-   * 没再动过代码。与 deliveryStatus 的全窗口口径刻意不同——那个口径对「先红
-   * 后绿」的正常 TDD 节奏是粘滞的（近两天 12 会话回放：80 个绿灯时刻 91% 被
-   * 窗口内历史 failed 挡住），反向又在绿后编辑期（均值 6.2 次编辑）虚开。
-   * 本判据两个粘滞都治：红→绿即就绪；绿后首次代码编辑即失效。
-   * deliveryStatus 语义不动——它还有 hasVerificationDebt / delivery gate
-   * 等消费者，粘滞 failed 在那些场景是刻意的保守。
-   */
+  /** All readiness consumers share the current, non-superseded evidence projection. */
+  private effectiveVerifications(): VerificationMetadata[] {
+    return getEffectiveVerifications(this.state.verifications.map(v => ({ type: 'verification', timestamp: v.timestamp ?? 0, command: v.command, status: v.status, meta: { ...v } }))).effective
+  }
+
   deliveryReady(): boolean {
-    return this.state.verifications.at(-1)?.status === 'passed' && this.#editsSinceLastTest === 0
+    const effective = this.effectiveVerifications()
+    return effective.length > 0 && effective.every(v => v.status === 'passed') && this.#editsSinceLastTest === 0
   }
 
   /** Gate state for the TDD gate — pure-values snapshot, no Set refs. */
   getGateState(): TddGateState {
     return {
       filesModified: this.state.filesModified.size,
-      verifications: this.state.verifications.length,
+      verifications: this.effectiveVerifications().length,
       editsSinceLastTest: this.#editsSinceLastTest,
-      hasFailedTests: this.state.verifications.some(v => v.status === 'failed'),
+      hasFailedTests: this.effectiveVerifications().some(v => v.status === 'failed'),
       hasCodeEdits: this.#hasCodeEdits,
       hasReadTestFiles: [...this.state.filesRead].some(p => /\.test\.|\.spec\.|__tests__|_test\.|test_/.test(p)),
     }
@@ -213,7 +213,7 @@ export class EvidenceTracker implements EvidenceTrackerPublic {
   private applyVerificationLevels(result: VerificationMetadata): void {
     if (result.status !== 'passed') return
     const level = this.inferVerificationLevel(result.command)
-    const targets = this.inferVerifiedFiles(result.command, level)
+    const targets = this.inferVerifiedFiles(result, level)
     for (const file of targets) {
       if (this.state.filesModified.has(file)) {
         this.state.fileVerificationLevels?.set(file, level)
@@ -222,38 +222,36 @@ export class EvidenceTracker implements EvidenceTrackerPublic {
   }
 
   private inferVerificationLevel(command: string): VerificationLevel {
-    if (/\\btsc\\b|typecheck|--noEmit/.test(command)) return 'typed'
-    if (/\\blint\\b|eslint/.test(command)) return 'linted'
+    if (/\btsc\b|typecheck|--noEmit/.test(command)) return 'typed'
+    if (/\blint\b|eslint/.test(command)) return 'linted'
     return 'tested'
   }
 
-  private inferVerifiedFiles(command: string, level: VerificationLevel): string[] {
+  private inferVerifiedFiles(result: VerificationMetadata, level: VerificationLevel): string[] {
     const modified = [...this.state.filesModified]
-    if (level === 'typed') return modified.filter(f => /\.tsx?$/.test(f))
-    if (level === 'linted') return modified
-    if (command.includes('src/**/__tests__') || command.includes('npm test') || command.includes('run_tests')) return modified
-    // 归一化分隔符：'\\' 是单反斜杠字面量——此处曾误写为 '\\\\'（双反斜杠，
-    // 对单反斜杠路径零效果），Windows 上 normalizedFile 不归一 → base/stem 退化
-    // 为整条路径 → 匹配失败、level 恒 pending（与全仓 evidence-obligation /
-    // obligation-tracker 等的 '\\' 惯例不一致）。回归：evidence.test.ts
-    // 「反斜杠路径归一化」describe。
-    const normalizedCommand = command.replaceAll('\\', '/')
+    if (result.scope === 'full') return level === 'typed' ? modified.filter(f => /\.tsx?$/.test(f)) : modified
+    const targets = result.targetFiles ?? inferBashVerificationScope(result.command).targetFiles ?? []
+    const normalize = (path: string) => path.replaceAll('\\', '/').replace(/^\.\//, '')
+    const normalizedTargets = targets.flatMap(target => {
+      const normalized = normalize(target)
+      const source = normalized.replace(/\/(?:__tests__|tests)\//g, '/').replace(/\.(?:test|spec)(?=\.[^/]+$)/, '')
+      return [normalized, source]
+    })
     return modified.filter(file => {
-      const normalizedFile = file.replaceAll('\\', '/')
-      const base = normalizedFile.split('/').pop() ?? normalizedFile
-      const stem = base.replace(/\.[^.]+$/, '')
-      return normalizedCommand.includes(normalizedFile) || normalizedCommand.includes(base) || normalizedCommand.includes(stem)
+      const normalizedFile = normalize(file)
+      return normalizedTargets.some(target => target === normalizedFile || target.endsWith('/' + normalizedFile))
     })
   }
 
   private refreshDeliveryStatus(): void {
-    if (this.state.verifications.some(r => r.status === 'failed')) {
+    const effective = this.effectiveVerifications()
+    if (effective.some(r => r.status === 'failed')) {
       this.state.deliveryStatus = 'failed'
-    } else if (this.state.verifications.some(r => r.status === 'blocked')) {
+    } else if (effective.some(r => r.status === 'blocked')) {
       this.state.deliveryStatus = 'blocked'
     } else if (this.state.filesModified.size > 0 && this.state.verifications.length === 0) {
       this.state.deliveryStatus = 'unverified'
-    } else if (this.state.verifications.some(r => r.status === 'passed')) {
+    } else if (effective.some(r => r.status === 'passed')) {
       this.state.deliveryStatus = 'verified'
     } else {
       this.state.deliveryStatus = 'unverified'
@@ -277,7 +275,7 @@ export class EvidenceTracker implements EvidenceTrackerPublic {
       gateBlockingReason = gateV2.blockingReason
       gateNextAction = gateV2.shortestNextStep
     } else {
-      const gate = buildDeliveryGate(this.state)
+      const gate = buildDeliveryGate({ ...this.state, verifications: this.effectiveVerifications() })
       gateState = gate.severity
       gateLabel = gate.message
       gateBlockingReason = gate.blockingReason

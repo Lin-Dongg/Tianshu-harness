@@ -9,7 +9,7 @@
  *   so the sidecar loads them at runtime via `import()` / `createRequire()`.
  *   Without a shipped `node_modules` those lookups fail once the .app is
  *   installed outside the repo. We stage the dependency *closure* of each
- *   root package (flat layout) next to the bundle.
+ *   root package (preserving Node's installed layout) next to the bundle.
  *
  * Platform note: esbuild / @ast-grep list every platform binary as an
  *   optionalDependency. We copy only packages matching the *target* arch
@@ -30,7 +30,7 @@
  * pack-native.js.
  */
 import { existsSync, mkdirSync, cpSync, readFileSync, writeFileSync, rmSync, statSync, readdirSync, openSync, readSync, closeSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { dirname, join, relative, isAbsolute } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
 import { isForeignPlatformPackage } from './runtime-platform-filter.js'
@@ -52,10 +52,14 @@ const destModules = join(repoRoot, 'dist', 'node_modules')
 // 单一数据源：scripts/external-deps.js RUNTIME_BUNDLED（含每包注释）。
 const ROOTS = [...RUNTIME_BUNDLED]
 
-function pkgDir(name) {
-  // Flat (hoisted) layout: node_modules/<name>. Scoped names keep the slash.
-  const dir = join(srcModules, name)
-  return existsSync(join(dir, 'package.json')) ? dir : null
+function pkgDir(name, from = repoRoot) {
+  const require = createRequire(join(from, 'package.json'))
+  for (const modules of require.resolve.paths(name) || []) {
+    const dir = join(modules, name)
+    const rel = relative(srcModules, dir)
+    if (!rel.startsWith('..') && !isAbsolute(rel) && existsSync(join(dir, 'package.json'))) return dir
+  }
+  return null
 }
 
 // ── 跨架构支持（与 pack-native.js 同口径）─────────────────────────────────
@@ -113,15 +117,16 @@ mkdirSync(destModules, { recursive: true })
 // dist/ 脱离仓库独立分发时（桌面端 Resources/rivet-runtime）没有上级 package.json，
 // Node 会按 CommonJS 解析 .js —— ESM bundle 启动即 SyntaxError: Cannot use import
 // statement outside a module（2026-09-11 Windows 现场）。随 dist 落一份最小
-// package.json 声明 ESM，与仓库根 package.json 的 "type":"module" 同语义。
-writeFileSync(join(repoRoot, 'dist', 'package.json'), JSON.stringify({ type: 'module' }, null, 2) + '\n')
+// package.json 声明 ESM，并携带产品身份/版本供独立 --version 解析。
+const { name, version } = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8'))
+writeFileSync(join(repoRoot, 'dist', 'package.json'), JSON.stringify({ name, version, type: 'module' }, null, 2) + '\n')
 // Every exit path below except the final success leaves this marker behind, so
 // an interrupted run can never be mistaken for a complete one (2026-08-03: a
 // dead run left 65 dirs / 0 files and shipped silently for two days).
 writeStagingMarker(join(repoRoot, 'dist'), 'copying root package closure')
 
 const visited = new Set()
-const queue = [...ROOTS]
+const queue = ROOTS.map(name => ({ name, from: repoRoot }))
 const missing = []
 let copied = 0
 let skippedForeign = 0
@@ -131,9 +136,7 @@ const keepArchRaw = resolveTargetArch()
 const keepArch = keepArchRaw === 'arm64' ? 'arm64' : 'x64'
 
 while (queue.length > 0) {
-  const name = queue.shift()
-  if (visited.has(name)) continue
-  visited.add(name)
+  const { name, from } = queue.shift()
 
   if (isForeignPlatformPackage(name, keepArch)) {
     skippedForeign++
@@ -146,21 +149,24 @@ while (queue.length > 0) {
     continue
   }
 
-  const src = pkgDir(name)
+  const src = pkgDir(name, from)
   if (!src) {
     // Optional/platform packages for other hosts are not installed — skip quietly
     // unless it's a declared root (then surface it).
-    if (ROOTS.includes(name)) missing.push(name)
+    if (from === repoRoot) missing.push(name)
     continue
   }
+  if (visited.has(src)) continue
+  visited.add(src)
 
-  const dest = join(destModules, name)
+  // Keep nested versions at the same Node resolution position as the source.
+  const dest = join(destModules, relative(srcModules, src))
   mkdirSync(dirname(dest), { recursive: true })
   // dereference symlinks so the staged tree is self-contained.
   cpSync(src, dest, { recursive: true, dereference: true })
   copied++
 
-  for (const dep of readDeps(src)) queue.push(dep)
+  for (const dep of readDeps(src)) queue.push({ name: dep, from: src })
 }
 
 // sourcemap 是调试产物，运行时闭包不需要——exceljs 单包就带 14MB .map。
@@ -196,7 +202,8 @@ function dirSizeMb(dir) {
 }
 
 if (missing.length > 0) {
-  console.error('⚠ stage-runtime-deps: missing root packages (features will degrade): %s', missing.join(', '))
+  console.error('✗ stage-runtime-deps: missing required root packages — refusing to stage an incomplete runtime: %s', missing.join(', '))
+  process.exit(1)
 }
 
 // Wave B: ship only grammars meridian-parser actually loads (TS/Python/Go).

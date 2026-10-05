@@ -16,7 +16,9 @@
  */
 import {
   appendFileSync,
+  chmodSync,
   closeSync,
+  copyFileSync,
   existsSync,
   mkdirSync,
   openSync,
@@ -136,7 +138,7 @@ export class FileSessionPersistence implements SessionPersistenceAdapter {
     'approval_required', 'approval_resolved', 'unattended_halt',
     // Domain record snapshots are saved synchronously with these events. Flush
     // both immediately so a crash cannot restore metadata without its timeline.
-    'domain_resolved', 'domain_changed',
+    'domain_resolved', 'domain_changed', 'domain_usage',
     // Plan Mode draft invalidation — desktop "起草中" should not wait on the
     // 100ms debounce timer after a successful write_file/edit_file.
     'plan_draft',
@@ -666,6 +668,18 @@ export class FileSessionPersistence implements SessionPersistenceAdapter {
     }
   }
 
+  saveToolOutput(sessionId: string, outputId: string, text: string): void {
+    const dir = join(this.ensureDir(sessionId), 'tool-outputs')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, `${sanitize(outputId)}.txt`), text, 'utf8')
+  }
+
+  readToolOutput(sessionId: string, outputId: string): string | undefined {
+    if (!/^[a-zA-Z0-9_-]+$/.test(outputId)) return undefined
+    try { return readFileSync(join(this.dir(sessionId), 'tool-outputs', `${outputId}.txt`), 'utf8') }
+    catch { return undefined }
+  }
+
   saveImage(sessionId: string, imgId: string, base64: string, mime: string): void {
     const d = join(this.ensureDir(sessionId), 'images')
     if (!existsSync(d)) mkdirSync(d, { recursive: true })
@@ -699,6 +713,37 @@ export class FileSessionPersistence implements SessionPersistenceAdapter {
     const kind = contextFileKind(fileName)
     const safeExt = kind === 'text' || kind === 'candidate' ? 'txt' : DOC_EXT_MIME.has(ext) ? ext : 'bin'
     writeFileSync(join(d, `${sanitize(docId)}.${safeExt}`), Buffer.from(base64, 'base64'))
+  }
+
+  /** 压缩包附件原样落盘（句柄式，2026-10-05）：<id>/documents/<docId>.<ext>，
+   *  ext 保留原始压缩包扩展名（zip/tar/tgz/gz/bz2/xz，readDocument 同表回读）。
+   *  docId 即内容 sha256（content-addressed，dsh 同款）——已存在即同内容已
+   *  发布，直接跳过：requestId 重试 / 同内容重发因此幂等，句柄文本字节一致，
+   *  run-ledger 指纹去重成立。srcPath 形态 copyFile（绝不动用户原文件）；
+   *  写入走 tmp+rename 原子发布（崩溃只留 tmp 残件，绝不发布半截文件）；
+   *  副本 chmod 0o444 只读——agent 要改先自己拷贝（句柄文本的契约）。
+   *  返回落盘绝对路径（进句柄文本）。
+   *  与 saveDocument 分立：saveDocument 的 safeExt 归一（txt/bin）面向抽取集，
+   *  压缩包必须保扩展名才回读得出正确 mime。 */
+  saveArchive(sessionId: string, docId: string, source: { base64: string } | { srcPath: string }, fileName: string): string {
+    const d = join(this.ensureDir(sessionId), 'documents')
+    if (!existsSync(d)) mkdirSync(d, { recursive: true })
+    const ext = extname(fileName).toLowerCase().replace(/^\./, '')
+    const safeExt = ARCHIVE_EXTS.has(ext) ? ext : 'bin'
+    const dest = join(d, `${sanitize(docId)}.${safeExt}`)
+    if (!existsSync(dest)) {
+      const tmp = `${dest}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 10)}`
+      try {
+        if ('srcPath' in source) copyFileSync(source.srcPath, tmp)
+        else writeFileSync(tmp, Buffer.from(source.base64, 'base64'))
+        try { chmodSync(tmp, 0o444) } catch { /* best-effort（Windows ACL 语义不同，失败不阻断） */ }
+        renameSync(tmp, dest)
+      } catch (err) {
+        try { rmSync(tmp, { force: true }) } catch { /* best-effort */ }
+        throw err
+      }
+    }
+    return dest
   }
 
   readDocument(sessionId: string, docId: string): { bytes: Buffer; mime: string; ext: string } | undefined {
@@ -909,7 +954,7 @@ export class FileSessionPersistence implements SessionPersistenceAdapter {
    * worker 自行分块读文件，主线程只传路径，不克隆整本日志；不可用时
    * 复用同一流式扫描器（每块让出事件循环），避免兜底重新放大全量内存。
    */
-  async loadEventsTailAsync(id: string, maxEvents: number): Promise<EventsTail> {
+  async loadEventsTailAsync(id: string, maxEvents: number, maxEventBytes?: number): Promise<EventsTail> {
     await this.flushSessionAsync(id)
     const file = join(this.dir(id), 'events.jsonl')
     const debug = process.env.RIVET_DEBUG_RENDER === '1'
@@ -920,14 +965,14 @@ export class FileSessionPersistence implements SessionPersistenceAdapter {
     let bytes = 0
     try { bytes = (await stat(file)).size } catch { /* scanner handles missing files */ }
     if (bytes < FileSessionPersistence.INLINE_PARSE_MAX_BYTES || !cpuPool.available) {
-      try { indexed = await readEventsTailIndexed(file, maxEvents) }
-      catch { tail = await readEventsTailRaw(file, maxEvents) as EventsTail }
+      try { indexed = await readEventsTailIndexed(file, maxEvents, { maxEventBytes }) }
+      catch { tail = await readEventsTailRaw(file, maxEvents, maxEventBytes) as EventsTail }
     } else {
       try {
-        indexed = await cpuPool.run('readEventsTailIndexed', [file, maxEvents]) as IndexedEventsTail
+        indexed = await cpuPool.run('readEventsTailIndexed', [file, maxEvents, { maxEventBytes }]) as IndexedEventsTail
         mode = 'worker'
       } catch {
-        tail = await readEventsTailRaw(file, maxEvents) as EventsTail
+        tail = await readEventsTailRaw(file, maxEvents, maxEventBytes) as EventsTail
       }
     }
     if (indexed) tail = indexed.tail as EventsTail
@@ -1418,7 +1463,14 @@ function extForMime(mime: string): string {
   return hit ? hit[0] : 'png'
 }
 
-/** 可抽取文档的扩展名 ↔ MIME（与 doc-extract 的 EXTRACTABLE 对齐 + bin 兜底）。 */
+/** 可抽取文档的扩展名 ↔ MIME（与 doc-extract 的 EXTRACTABLE 对齐 + bin 兜底
+ *  + 压缩包原样回读：saveArchive 落盘的扩展名必须在本表，GET 路由才回读得出）。 */
 const DOC_EXT_MIME: ReadonlyMap<string, string> = new Map(Object.entries({
   ...CONTEXT_DOCUMENT_MIME, txt: 'text/plain; charset=utf-8', bin: 'application/octet-stream',
+  zip: 'application/zip', tar: 'application/octet-stream', tgz: 'application/octet-stream',
+  gz: 'application/octet-stream', bz2: 'application/octet-stream', xz: 'application/octet-stream',
 }))
+
+/** saveArchive 原样保留的压缩包扩展名（与 file-context-policy 的支持集对应；
+ *  单文件 gz/bz2/xz 在策略层拒收，这里见到的一定是 .tar.* 的尾段）。 */
+const ARCHIVE_EXTS: ReadonlySet<string> = new Set(['zip', 'tar', 'tgz', 'gz', 'bz2', 'xz'])

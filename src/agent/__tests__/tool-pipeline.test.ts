@@ -102,6 +102,33 @@ describe('executeToolUse', () => {
     }
   }
 
+  it('bounds a thrown 306KB failure before callback and history delivery', async () => {
+    const deps = makeDeps()
+    let shown = ''
+    deps.config.toolRegistry.execute = async () => { throw new Error('failure '.repeat(39_000)) }
+    const result = await executeToolUse({ id: 'huge-error', name: 'test_tool', input: {} }, deps, { ...noopCallbacks, onToolResult: (_id: string, _name: string, content: string) => { shown = content } } as any, 1, false)
+    assert.ok(shown.length < 40_000)
+    assert.equal((result.toolResult as any).content, shown)
+    assert.equal((result.toolResult as any).is_error, true)
+  })
+
+  it('keeps a landed commit fact after bounding a thrown 306KB delivery error', async () => {
+    const cwd = mkdtempSync(join(testTmp(), 'delivery-tail-'))
+    const git = (...args: string[]) => execFileSync('git', args, { cwd, stdio: 'pipe' }).toString()
+    try {
+      git('init'); git('config', 'user.email', 'fixture@example.invalid'); git('config', 'user.name', 'fixture')
+      writeFileSync(join(cwd, 'fixture.txt'), 'before'); git('add', 'fixture.txt'); git('commit', '-m', 'before')
+      const deps = makeDeps({ cwd, artifactStore: new ArtifactStore(cwd, 'delivery-failure') })
+      deps.config.toolRegistry.execute = async () => { writeFileSync(join(cwd, 'fixture.txt'), 'after'); git('add', 'fixture.txt'); git('commit', '-m', 'landed'); throw new Error('failure '.repeat(39_000)) }
+      const result = await executeToolUse({ id: 'delivery-tail', name: 'deliver_task', input: { commit: true } }, deps, noopCallbacks as any, 1, false)
+      const view = (result.toolResult as any).content as string
+      assert.ok(view.length < 40_000)
+      assert.match(view, /commit already landed/)
+      assert.match(view, /Do NOT re-commit or retry/)
+      assert.match(view, /landed/)
+    } finally { rmSync(cwd, { recursive: true, force: true }) }
+  })
+
   it('does not call the tool when the durable intent barrier fails', async () => {
     let executed = false
     const deps = makeDeps()
@@ -721,7 +748,7 @@ describe('executeToolUse', () => {
     assert.ok(!callbackChunks.some(chunk => chunk.includes('Sensitive-area preflight required')))
   })
 
-  it('records run_tests as verification in task ledger', async () => {
+  it('records run_tests without structured evidence as blocked rather than manufacturing success', async () => {
     const events: any[] = []
     const deps = makeDeps({
       taskLedger: {
@@ -737,8 +764,9 @@ describe('executeToolUse', () => {
     const event = events.at(-1)
     assert.equal(event.type, 'verification')
     assert.equal(event.command, 'run_tests src/foo.test.ts')
-    assert.equal(event.status, 'passed')
+    assert.equal(event.status, 'blocked')
     assert.equal(event.meta.scope, 'targeted')
+    assert.equal(event.meta.kind, undefined)
   })
 
   it('marks git dirty after successful deliver_task commit', async () => {
@@ -803,6 +831,7 @@ describe('executeToolUse', () => {
             isError: true,
             verification: {
               command: 'tsx --test src/foo.test.ts',
+              kind: 'test',
               status: 'failed',
               scope: 'targeted',
               exitCode: 1,
@@ -830,6 +859,7 @@ describe('executeToolUse', () => {
     assert.equal(event.status, 'failed')
     assert.deepEqual(event.meta, {
       scope: 'targeted',
+      kind: 'test',
       exitCode: 1,
       passed: 0,
       failed: 0,
@@ -939,7 +969,7 @@ describe('executeToolUse', () => {
       config: {
         ...makeDeps().config,
         toolRegistry: {
-          execute: async () => ({ content: 'type error', isError: true }),
+          execute: async () => ({ content: 'type error', isError: true, exitCode: 2 }),
           get: () => ({ definition: { input_schema: {} }, isConcurrencySafe: () => false }),
           needsApproval: () => false,
           resolveName: (n: string) => n,
@@ -956,11 +986,13 @@ describe('executeToolUse', () => {
     // 是「没有计数」而非「没跑」，此前下游据此把真实编译错误报成「不是代码问题」。
     // exitCode 是这里能拿到的最小原始事实（本用例的 harness 桩不做 failure 分类，
     // 故无 errorClass；真实 TurnHarness 会补上）。
+    // 2026-10-05：97a25a4 让 bash-verification 按命令赋 kind（`npx tsc --noEmit`
+    // → typecheck），使「一次 typecheck」不再能清空运行时测试的覆盖缺口。
     assert.deepEqual(events.at(-1), {
       type: 'verification',
       command: 'npx tsc --noEmit',
       status: 'failed',
-      meta: { scope: 'full', passed: 0, failed: 0, skipped: 0, exitCode: 1 },
+      meta: { scope: 'full', kind: 'typecheck', passed: 0, failed: 0, skipped: 0, exitCode: 2, countsReliable: false },
     })
   })
 
@@ -1001,7 +1033,7 @@ describe('executeToolUse', () => {
     assert.equal(last.type, 'verification')
     assert.equal(last.meta.errorClass, 'timeout', 'timeout must reach the ledger as a raw fact')
     assert.equal(last.meta.timedOut, true)
-    assert.equal(last.meta.exitCode, 1)
+    assert.equal(last.meta.exitCode, undefined, 'timeout must not fabricate an exit code')
     assert.equal(last.meta.passed, 0)
     // 若无 errorClass（旧 harness / 仅文案可辨），仍须由文案兜底识别为超时
     assert.match('Tool bash timed out after 120s', /timed out after \d+s/)
@@ -1429,6 +1461,16 @@ describe('executeToolUse', () => {
     assert.match(trace, /afterHook=\["context_lines","path","pattern"\]/)
     assert.match(trace, /afterRepair=\["context_lines","path"\]/)
     rmSync(traceDir, { recursive: true, force: true })
+  })
+
+  it('tool pipeline forwards structured display evidence at the final callback', async () => {
+    const deps = makeDeps()
+    const images = ['data:image/png;base64,aGVsbG8=']
+    ;(deps.config.toolRegistry as any).execute = async () => ({ content: 'image result', isError: false, images, exitCode: 2, lossiness: 'truncated' })
+    let evidence: unknown
+    const cb = { ...noopCallbacks, onToolResult: (...args: unknown[]) => { evidence = args[6] } }
+    await executeToolUse({ id: 'display-call', name: 'read_file', input: { file_path: 'image.png' } }, deps, cb as any, 1, false)
+    assert.deepEqual(evidence, { command: undefined, outputText: 'image result', outputTruncated: undefined, images, exitCode: 2, lossiness: 'truncated' })
   })
 
   it('calls onToolResult callback', async () => {
@@ -3565,7 +3607,7 @@ describe('deliver_task abort — post-abort commit attribution', () => {
   })
 
   it('touches tool:start and tool:end around execute (stall-observer wiring)', async () => {
-    const dir = mkdtempSync(join(process.cwd(), '.test-tmp', 'toolpipeline-touch-'))
+    const dir = mkdtempSync(join(testTmp(), 'toolpipeline-touch-'))
     try {
       const deps = makeDeps(dir, {
         sessionId: 'touch-wiring-test',
@@ -3597,7 +3639,7 @@ describe('deliver_task abort — post-abort commit attribution', () => {
   })
 
   it('stage touch: pre 段在 trackEdit 前可指认（stall-observer 纵深 2026-09-10）', async () => {
-    const dir = mkdtempSync(join(process.cwd(), '.test-tmp', 'toolpipeline-stage-pre-'))
+    const dir = mkdtempSync(join(testTmp(), 'toolpipeline-stage-pre-'))
     try {
       const { _resetStallObserverForTest, getLastActivity } = await import('../stall-observer.js')
       _resetStallObserverForTest()
@@ -3623,7 +3665,7 @@ describe('deliver_task abort — post-abort commit attribution', () => {
   })
 
   it('stage touch: post 段在 firePostToolUse 前可指认（stall-observer 纵深 2026-09-10）', async () => {
-    const dir = mkdtempSync(join(process.cwd(), '.test-tmp', 'toolpipeline-stage-post-'))
+    const dir = mkdtempSync(join(testTmp(), 'toolpipeline-stage-post-'))
     try {
       const { _resetStallObserverForTest, getLastActivity } = await import('../stall-observer.js')
       _resetStallObserverForTest()

@@ -1167,9 +1167,9 @@ tianshu logs open desktop            # sidecar ログディレクトリを開く
 - **セキュリティ脆弱性** → [プライベート報告](https://github.com/huiliyi37/Tianshu-harness/security/advisories/new)（公開 issue を開かないでください）
 - **コードへのコントリビュート** → [CONTRIBUTING.md](CONTRIBUTING.md) を参照
 - **ヘルプガイド** → [SUPPORT.md](SUPPORT.md) を参照
-- **WeChat 交流グループ** →「天枢 harness 交流群」。QR コードで参加。日常の議論 / フィードバック / リリース情報をいち早く入手：
+- **WeChat 交流グループ** →「天枢 harness 交流群5群」。QR コードで参加。日常の議論 / フィードバック / リリース情報をいち早く入手：
 
-<img src="docs/brand/assets/wechat-group-qr.png" width="280" alt="天枢 harness 交流群 WeChat グループ QR コード">
+<img src="docs/brand/assets/wechat-group-qr.png" width="280" alt="天枢 harness 交流群5群 WeChat グループ QR コード">
 
 > WeChat グループの QR コードには有効期限（7 日）があります。期限切れの場合は [Discussions](https://github.com/huiliyi37/Tianshu-harness/discussions) または Issue にコメントしてください。メンテナーが新しい QR を補充します。
 

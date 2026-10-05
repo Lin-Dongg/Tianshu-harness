@@ -53,6 +53,12 @@ function asString(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined
 }
 
+function verificationKind(meta: Record<string, unknown> | undefined): VerificationMetadata['kind'] {
+  const kind = meta?.kind
+  return kind === 'test' || kind === 'typecheck' || kind === 'lint' || kind === 'build' || kind === 'check'
+    ? kind : undefined
+}
+
 function extractTestFiles(command: string): string[] {
   const files = new Set<string>()
   const matches = command.matchAll(/[^\s'"]+\.(?:test|spec)\.(?:ts|tsx|js|jsx|mjs|cjs)/g)
@@ -150,7 +156,7 @@ function deriveFailureKind(
 }
 
 function eventToVerificationMetadata(event: TaskLedgerEvent): VerificationMetadata {
-  const scope = event.meta?.scope === 'full' ? 'full' as const : 'targeted' as const
+  const scope = event.meta?.scope === 'full' ? 'full' as const : event.meta?.scope === 'unknown' ? 'unknown' as const : 'targeted' as const
   const status = (event.status ?? 'passed') as 'passed' | 'failed' | 'blocked'
   const command = event.command ?? 'unknown'
   const targetFiles = getMetaTargetFiles(event.meta)
@@ -160,11 +166,18 @@ function eventToVerificationMetadata(event: TaskLedgerEvent): VerificationMetada
   const phaseRaw = asString(event.meta?.verificationPhase)
   const verificationPhase = phaseRaw === 'isolated' || phaseRaw === 'integration' ? phaseRaw : undefined
   const failureKind = deriveFailureKind(command, status, event.meta)
+  // Preserve structured producer facts through the ledger boundary.
+  const blockedReasonRaw = asString(event.meta?.blockedReason)
+  const blockedReason = blockedReasonRaw === 'no_test_framework' || blockedReasonRaw === 'no_tests_found'
+    || blockedReasonRaw === 'filter_unresolved' || blockedReasonRaw === 'unknown_runner'
+    || blockedReasonRaw === 'timeout' || blockedReasonRaw === 'invocation_failure'
+    ? blockedReasonRaw : undefined
 
   return {
     command,
     status,
     scope,
+    kind: verificationKind(event.meta),
     exitCode: asNumber(event.meta?.exitCode, status === 'failed' ? 1 : 0),
     passed: asNumber(event.meta?.passed, status === 'passed' ? 1 : 0),
     failed: asNumber(event.meta?.failed, status === 'failed' ? 1 : 0),
@@ -176,6 +189,8 @@ function eventToVerificationMetadata(event: TaskLedgerEvent): VerificationMetada
     ...(recommendedCommand ? { recommendedCommand } : {}),
     ...(snapshotRef ? { snapshotRef } : {}),
     ...(verificationPhase ? { verificationPhase } : {}),
+    ...(typeof event.meta?.isolatedPassed === 'boolean' ? { isolatedPassed: event.meta.isolatedPassed } : {}),
+    ...(blockedReason ? { blockedReason } : {}),
   }
 }
 
@@ -185,7 +200,8 @@ function eventToVerificationMetadata(event: TaskLedgerEvent): VerificationMetada
  */
 function verificationKey(event: TaskLedgerEvent): string {
   const command = event.command ?? 'unknown'
-  const scope = event.meta?.scope === 'full' ? 'full' : 'targeted'
+  const scope = event.meta?.scope ?? 'targeted'
+  const identity = `${verificationKind(event.meta) ?? 'unknown'}::${asString(event.meta?.verificationPhase) ?? 'in-place'}::${asString(event.meta?.snapshotRef) ?? 'legacy'}`
   const resolvedCommand = asString(event.meta?.resolvedCommand) ?? ''
 
   // meta.targetFiles (populated by tools like run_tests) is authoritative:
@@ -202,10 +218,10 @@ function verificationKey(event: TaskLedgerEvent): string {
   const uniqueTargetFiles = [...new Set(targetFiles)].sort()
 
   if (uniqueTargetFiles.length > 0) {
-    return `tests::${scope}::${runnerFamily(`${command} ${resolvedCommand}`)}::${uniqueTargetFiles.join('|')}`
+    return `tests::${scope}::${runnerFamily(`${command} ${resolvedCommand}`)}::${uniqueTargetFiles.join('|')}::${identity}`
   }
 
-  return `${normalizeCommand(command)}::${scope}`
+  return `${normalizeCommand(command)}::${scope}::${identity}`
 }
 
 /**
@@ -225,8 +241,9 @@ export function getEffectiveVerifications(
   // matches reality. Drop it. Verifications without a snapshotRef (in-place /
   // legacy runs) are never dropped, preserving existing behavior.
   let staleSnapshotDropped = 0
+  const currentEvents = allVerificationEvents.filter(e => e.meta?.stale !== true)
   const verificationEvents = currentSnapshotRef
-    ? allVerificationEvents.filter(e => {
+    ? currentEvents.filter(e => {
         const ref = asString(e.meta?.snapshotRef)
         if (ref && ref !== currentSnapshotRef) {
           staleSnapshotDropped++
@@ -234,7 +251,7 @@ export function getEffectiveVerifications(
         }
         return true
       })
-    : allVerificationEvents
+    : currentEvents
 
   // Process in chronological order (events are already sorted by timestamp)
   const keyMap = new Map<string, { event: TaskLedgerEvent; index: number }>()
@@ -318,10 +335,8 @@ function pathsMatch(a: string, b: string): boolean {
  * Assess which Meridian-impacted tests were actually covered by passed
  * verifications. Pure function — filesystem access is injected via existsFn.
  *
- * Coverage rules:
- * - any passed full-scope verification covers everything → uncovered = []
- * - a passed targeted verification covers its targetFiles (or test files
- *   extractable from command/resolvedCommand)
+ * Only explicit test evidence covers selected files. A full label alone does
+ * not identify a runner's suite and cannot cover tests in other suites.
  */
 export function assessImpactedTestCoverage(
   impactedTests: readonly string[],
@@ -330,8 +345,7 @@ export function assessImpactedTestCoverage(
 ): ImpactedTestCoverage {
   if (impactedTests.length === 0) return { uncovered: [], uncoverable: [] }
 
-  const passed = verifications.filter(v => v.status === 'passed')
-  if (passed.some(v => v.scope === 'full')) return { uncovered: [], uncoverable: [] }
+  const passed = verifications.filter(v => v.status === 'passed' && v.kind === 'test' && v.scope !== 'unknown')
 
   const coveredFiles: string[] = []
   for (const v of passed) {
@@ -444,7 +458,7 @@ export function createVerificationAttribution(_opts: {
       // Phase B (integration) failure on current HEAD: the owned diff already
       // passed in isolation (Phase A), so this is a concurrent-change conflict,
       // not an owned defect. Advisory only — never blocks delivery.
-      if (result.verificationPhase === 'integration') {
+      if (result.verificationPhase === 'integration' && result.isolatedPassed === true && result.snapshotRef) {
         return {
           attribution: 'integration_conflict',
           isBlocking: false,
@@ -463,7 +477,7 @@ export function createVerificationAttribution(_opts: {
       }
 
       // Targeted test: scope is narrow, likely owned
-      if (result.scope === 'targeted') {
+      if (result.scope === 'targeted' && result.targetFiles?.some(file => _opts.ownership.isOwned(file) || _opts.ownership.isCoOwned(file))) {
         return {
           attribution: 'owned_failure',
           isBlocking: true,

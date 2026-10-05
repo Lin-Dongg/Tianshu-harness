@@ -19,7 +19,7 @@
  * 把别人的版本当成 CLI 版本显示出来——比不显示更坏。故改为同时校验 name 是本包。
  */
 import { existsSync, readFileSync, realpathSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 
 /** 本包名——用于确认找到的声明属于本包，而非祖先链上无关项目的。 */
 const PACKAGE_NAME = 'tianshu-harness'
@@ -46,7 +46,15 @@ export function findInstallRoot(scriptPath: string | undefined = process.argv[1]
         const parsed = JSON.parse(readFileSync(pkgPath, 'utf-8')) as { name?: unknown; version?: unknown }
         // name 必须匹配：只认本包的声明（含改名前的旧包名）。只看 version 会命中
         // 外层无关项目（runtime bundle 解压进别人的项目目录时），把他人版本当成本包版本。
-        if ((parsed.name === PACKAGE_NAME || parsed.name === LEGACY_PACKAGE_NAME) && typeof parsed.version === 'string' && parsed.version.length > 0) return dir
+        if ((parsed.name === PACKAGE_NAME || parsed.name === LEGACY_PACKAGE_NAME) && typeof parsed.version === 'string' && parsed.version.length > 0) {
+          // Staged dist carries product metadata too; a source/npm installation
+          // still owns its parent package root (including updater install type).
+          if (basename(dir) === 'dist') {
+            const parentRoot = findInstallRoot(join(dirname(dir), 'package.json'))
+            if (parentRoot === dirname(dir)) return parentRoot
+          }
+          return dir
+        }
       } catch {
         // 坏包声明不终止查找——继续向上（与版本兜底同一个 fail-open 姿态）。
       }

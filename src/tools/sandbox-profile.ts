@@ -1,3 +1,4 @@
+import { currentWorkspaceRoots } from './workspace-context.js'
 /**
  * Workspace-scoped command sandbox.
  *
@@ -102,7 +103,7 @@ export function defaultWritableRoots(ctx: { cwd: string; env?: NodeJS.ProcessEnv
   const tmp = env.TMPDIR || tmpdir()
   const roots = new Set<string>()
 
-  roots.add(ctx.cwd)
+  for (const root of currentWorkspaceRoots(ctx.cwd)) roots.add(root)
   roots.add(tmp)
   roots.add('/tmp')
   // macOS-specific paths — only add on darwin (Linux/WSL doesn't have these;

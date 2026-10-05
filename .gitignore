@@ -50,6 +50,7 @@ scripts/swebench-*.sh
 #  这些是 agent 的设计知识资产，gitignore 会导致 read_file 工具拒绝读取，
 #  迫使 agent 用 bash 绕路。源码层面已同步修复 read-file.ts 的豁免逻辑。)
 docs/research/*.md
+!docs/research/2026-10-05-ui-memory-and-prefix-cache.md
 .rivet/sensorium.jsonl
 .rivet/pheromones.json
 .rivet/debug-400.json
@@ -66,6 +67,9 @@ desktop/.rivet/
 .rivet/check2.txt
 .rivet/*.txt
 .rivet/tauri-key/
+.rivet/.ssh/
+# tianshu-bot：独立项目（自有 git 仓库与运行时服务），不进主仓、不参与同步
+/tianshu-bot/
 .rivet/frames.jsonl
 .rivet/tool-stream.jsonl
 # dsh-meridian.db*：2026-09-08 旧命名实验的残留库（现役为 meridian.db*）

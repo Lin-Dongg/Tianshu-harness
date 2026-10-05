@@ -24,18 +24,22 @@ import { installParentWatchdog } from './parent-watchdog.js'
 import { MissionStore } from './mission-store.js'
 import { buildHealthRoute, createHealthSnapshot, RUNTIME_INSTANCE_ID } from './health-route.js'
 import { buildAccountRoutesFor } from './account-routes.js'
+import { buildProfileRoutes } from './profile-routes.js'
+import { buildProfileLibraryRoutes } from './profile-library-routes.js'
+import { rivetHome as profileRivetHome } from '../config/paths.js'
 import { ServerEventBus } from './server-event-bus.js'
 import { SseConnectionRegistry } from './sse-registry.js'
 import { buildServerEventsRoute } from './server-events-route.js'
 import { buildGreetingRoute } from './greeting-route.js'
 import { buildSettingsIntentRoutes } from './settings-intent-route.js'
 import { isAuthorizedRequest } from './auth.js'
-import { LoopHealthMonitor } from './loop-health.js'
+import { LoopHealthMonitor, LoopStallDetector } from './loop-health.js'
 import { buildScheduleRoutes } from './schedule-routes.js'
 import { buildTaskRoutes } from './task-routes.js'
 import { buildConfigRoutes } from './config-routes.js'
 import { buildEnvRoute } from './env-route.js'
-import { buildBrowserRoutes } from './browser-routes.js'
+import { buildSessionBrowserRoutes } from './session-browser.js'
+import { buildBrowserRoutes, buildFileOpenRoutes } from './browser-routes.js'
 import { buildClipboardRoutes } from './clipboard-routes.js'
 import { buildProjectTemplatesRoutes } from './project-templates-routes.js'
 import { registeredWorkspaces } from './workspace-guard.js'
@@ -82,8 +86,10 @@ import type { AuthProvider } from '../auth/types.js'
 import { SessionPersist } from '../agent/session-persist.js'
 import { SessionContext } from '../agent/context.js'
 import { buildOpenPathCommand, buildRevealCommand, decideOpenAction, isDirectoryPath, windowsFileHasHandler } from '../tools/open-path.js'
-import { installStallObserver, listStallActivities } from '../agent/stall-observer.js'
+import { installStallObserver } from '../agent/stall-observer.js'
 import { SessionRegistry } from '../agent/session-registry.js'
+import { StoreLock, isStoreLockAcquired } from './store-lock.js'
+import { runPhantomResumeMigration, PHANTOM_RESUME_MIGRATION_VERSION } from './phantom-resume-migration.js'
 import { ProviderHealthTracker } from '../agent/provider-health.js'
 import type { Config, ProviderConfig, ModelConfig } from '../config/schema.js'
 import { FileSessionPersistence } from './session-persistence.js'
@@ -562,36 +568,6 @@ export function describeRestore(
   }
 }
 
-/** Type histogram of live event-loop handles — the loop-lag attribution field
- *  the 2026-09-08 report asked for (unref'd timers stay invisible, but sockets /
- *  servers / watchers / child processes are the meaningful in-flight set). */
-function activeHandleSummary(): string {
-  try {
-    const handles = (process as unknown as {
-      _getActiveHandles?: () => Array<{ constructor?: { name?: string } }>
-    })._getActiveHandles?.() ?? []
-    const counts = new Map<string, number>()
-    for (const h of handles) {
-      const name = h?.constructor?.name ?? 'unknown'
-      counts.set(name, (counts.get(name) ?? 0) + 1)
-    }
-    return [...counts.entries()].sort((a, b) => b[1] - a[1])
-      .slice(0, 8)
-      .map(([name, n]) => `${name}x${n}`)
-      .join(',') || 'none'
-  } catch {
-    return 'unavailable'
-  }
-}
-
-/** Last per-session activity markers — correlates a loop stall with the turn
- *  that was in flight when it happened. */
-function stallActivitySummary(): string {
-  const rows = listStallActivities().slice(0, 5)
-  if (rows.length === 0) return 'none'
-  return rows.map(r => `${r.key}:${r.activity.source}@${new Date(r.activity.ts).toISOString()}`).join(' | ')
-}
-
 export function isModelSpecUsable(spec: ResolvedModelSpec): boolean {
   return spec.apiKey !== '' || !!spec.auth
 }
@@ -671,6 +647,14 @@ export interface RunningServer {
 const DEFAULT_PORT = 3100
 
 /**
+ * 本进程是否为「拿不到会话库独占锁而降级运行」的实例（runServe 每次启动设置）。
+ * 降级实例不写 sidecar-exit.json：面包屑是给**会话库属主**的退出做归因用的
+ * （见 writeExitBreadcrumb），次级实例的退出写进去会把属主的「崩溃 vs 主动退出」
+ * 判据污染成别人的时间线（写入侧是『最后写的赢』，pid/buildId 会张冠李戴）。
+ */
+let storeLockDegraded = false
+
+/**
  * Start the runtime API server. Returns the bound port, a close() that aborts
  * all in-flight work, and the RuntimeSessionManager backing the multi-session
  * API. Throws if no token is available (fail-closed).
@@ -721,8 +705,40 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
   // seconds later by user interaction, by which time it's resolved. Tests pass a
   // pre-built registry. Ephemeral mode (tests) skips it → behavior unchanged.
   let initializationError: string | undefined
+
+  // P0-1 — 会话库单写者独占锁（store-lock.ts）。必须早于下面一切会写 desktopDir()
+  // 的装配：注册表、持久化、恢复台账、run 台账、定时任务、退出面包屑。
+  // 为什么：一旦构造 FileSessionPersistence，RuntimeSessionManager 的构造就会
+  // rehydrate()，把别的 sidecar 正在跑的会话标成『已中断』并写入 seq 高出
+  // CRASH_RECOVERY_SEQ_GAP 的假标记——前端 `ev.seq <= state.lastSeq` 守卫随后丢掉
+  // 这之后全部真实输出（『假续跑』）。拿不到锁的进程**一个字节都不许碰会话库**。
+  // acquire 默认 5s 重试窗口，覆盖监管器『杀掉旧进程 → 拉起新进程』的交接窗。
+  // opts.ephemeral（测试）跳过：与注册表/持久化同哲学，不得创建/触碰真实锁文件。
+  const storeLock = opts.ephemeral ? undefined : new StoreLock()
+  /** 本进程是否有资格写会话库；ephemeral（无锁）视为有资格——行为不变。 */
+  let ownsSessionStore = true
+  if (storeLock) {
+    const lockState = await storeLock.acquire()
+    ownsSessionStore = isStoreLockAcquired(lockState)
+    storeLockDegraded = !ownsSessionStore
+    if (!ownsSessionStore) {
+      // 降级运行：createAgent 见 initializationError 即拒绝建会话（下文 gateway 工厂）。
+      initializationError = 'data-dir-locked'
+      const holder = lockState.status === 'contended' ? lockState.holder : undefined
+      serverLogger.error(
+        `[serve] 会话库已被别的进程独占（${lockState.status}`
+        + `${lockState.status === 'contended' ? `: ${lockState.reason}` : ''}）——降级运行，不触碰会话库`,
+        { holder, reason: lockState.status === 'error' ? lockState.reason : undefined },
+      )
+    } else if (lockState.status === 'stale_recovered') {
+      serverLogger.warn('[serve] 接管陈旧会话库锁（前持有者已退出 / 心跳过期）', { previousOwner: lockState.previousOwner })
+    }
+  } else {
+    storeLockDegraded = false
+  }
+
   let sessionRegistry: SessionRegistry | undefined = opts.sessionRegistry
-  if (!sessionRegistry && !opts.ephemeral) {
+  if (!sessionRegistry && !opts.ephemeral && ownsSessionStore) {
     // 启动收割崩溃会话的幽灵独占锁（收编公开仓 PR #110）：硬杀 sidecar 留下的死行会让 R2 写前守卫永久拒写。
     void SessionRegistry.createWithReap(desktopDir(), (c) => console.error(`[serve] ↺ 已清理 ${c.length} 个异常退出会话的锁定`))
       .then((r) => { sessionRegistry = r })
@@ -738,7 +754,7 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
   // N1: durable session storage so sessions survive sidecar restarts.
   const lean = isRuntimeLeanAspect('pool', ctx.config.runtime?.lean)
   const sessionPool = resolveSessionPoolOptions(ctx.config.runtime, lean)
-  const persistence = opts.ephemeral
+  const persistence = opts.ephemeral || !ownsSessionStore
     ? undefined
     : new FileSessionPersistence(
         opts.sessionDir ?? desktopSessionsDir(),
@@ -823,7 +839,10 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
   // 恢复台账先建出来：网关工厂恢复时要用它取检查点的转录水位做对齐观测（PLAN §4
   // 第 2 步，只观测），随后同一个实例交给 RuntimeSessionManager——不能建两份，
   // 否则工厂读到的检查点与 manager 写入的不是同一个目录。
-  const recoveryJournal = new RecoveryJournal(join(desktopDir(), 'recovery-journal'))
+  // 降级实例（拿不到会话库锁）不建台账——desktopDir() 下一个字节都不许写。
+  const recoveryJournal = ownsSessionStore
+    ? new RecoveryJournal(join(desktopDir(), 'recovery-journal'))
+    : undefined
   // 执行后端选择：默认进程内执行；RIVET_EXECUTION_BACKEND=isolated 时走闭源
   // 进程隔离适配器（缺产物时回退进程内，绝不因闭源目录缺席而启动失败）。
   const buildGatewayAgent: AgentFactory = async (cwd, sessionId, approvalMode, modelId, allowedTools, signal) => {
@@ -854,7 +873,7 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
     // PLAN §4 恢复设计第 2 步（只观测）：把检查点的转录水位带进恢复路径，
     // 由 restoreHistoryMessages 记录「检查点水位 vs 实际恢复条数」的对齐情况。
     const expectedTranscriptWatermark = sessionId
-      ? (await recoveryJournal.load(sessionId))?.transcriptWatermark
+      ? (await recoveryJournal?.load(sessionId))?.transcriptWatermark
       : undefined
     return agentMod.buildManagedAgentAsync([
       ctx,        cwd ?? process.cwd(),
@@ -870,7 +889,7 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
   const executionBackend = await resolveExecutionBackend(buildGatewayAgent)
   // cold /health does not pay for tools/Meridian/council.
   const sessions = new RuntimeSessionManager({
-    runLedger: new RunLedger(join(desktopDir(), 'run-ledgers')),
+    runLedger: ownsSessionStore ? new RunLedger(join(desktopDir(), 'run-ledgers')) : undefined,
     recoveryJournal,
     globalApprovalMode: ctx.config.agent.approval as import('../agent/loop-types.js').ApprovalMode,
     createAgent: executionBackend.createAgent,
@@ -1022,7 +1041,7 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
 
   // Browser routes: chromium 就绪探测 + 一键安装。只装桌面端的用户没有 CLI 可敲
   // `rivet browser install`，缺了这两条路由截图能力对他们就是不可用。
-  Object.assign(routes, buildBrowserRoutes(apiToken))
+  Object.assign(routes, buildBrowserRoutes(apiToken), buildSessionBrowserRoutes(sessions, apiToken), buildFileOpenRoutes(sessions, apiToken))
 
   // Clipboard image route: WebKitGTK 的 paste 事件对纯图片剪贴板透出空数据，
   // 桌面端 Ctrl+V 取图靠它兜底（复用 TUI 取图链，见 #302）。
@@ -1125,44 +1144,34 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
   // "service busy" instead of a phantom "connection interrupted".
   const loopHealth = new LoopHealthMonitor()
   loopHealth.start()
+  // P1 卡顿归因（漂移检测）：250ms 量**实际间隔**，卡顿恢复后的第一个晚到 tick 就
+  // 报一条（含内存快照 + 卡顿开始前 1s 内碰过的活动）。替代此前按 30s 窗口 max
+  // 打印的 [loop-lag]——同一尖峰会在窗口内多个采样里重复打印，且尖峰只在卡顿
+  // **结束后**才可见，恢复后只留一行无归属的 max。LoopHealthMonitor 保留：/health
+  // 的 p99/max 字段仍由它回答「服务忙不忙」。
+  const loopStall = new LoopStallDetector({ warn: (line) => serverLogger.warn(line) })
+  loopStall.start()
   // registryOk lets the desktop tell "sidecar up but concurrency dormant" apart
   // from a healthy sidecar. In ephemeral/test mode (no registry wired) it reads
   // true so existing single-session behavior is unchanged.
   const registryReady = () => (opts.ephemeral ? true : sessionRegistry !== undefined)
   const serveConfigured = () => ctx.configured
-  let lastLoggedLagSample = 0
-  const loopLagForHealth = () => {
-    const snap = loopHealth.snapshot()
-    // 2026-08-09 卡顿归因遥测：>2s 的事件循环尖峰落 sidecar 日志（带堆/RSS），
-    // 让桌面端 degraded 横幅事后可区分 GC / swap / 同步阻塞（此前横幅亮了
-    // 却无任何数据可查，2026-08-09 首轮响应排查的观测缺口）。仅尖峰时写，
-    // 健康路径零开销。完全卡死时 /health 当窗答不出——尖峰记在恢复后首个
-    // 响应的 maxMs 里（loop-health.ts 注释的窗口语义），正好够归因。
-    if (snap.maxMs > 2000 && snap.sampledAt !== lastLoggedLagSample) {
-      lastLoggedLagSample = snap.sampledAt ?? 0
-      const mem = process.memoryUsage()
-      console.warn(
-        `[loop-lag] t=${new Date().toISOString()} event-loop stall: ` +
-        `max=${Math.round(snap.maxMs)}ms p99=${Math.round(snap.p99Ms)}ms ` +
-        `heapUsed=${Math.round(mem.heapUsed / 1048576)}MB rss=${Math.round(mem.rss / 1048576)}MB ` +
-        `handles=${activeHandleSummary()} activities=${stallActivitySummary()}`,
-      )
-    }
-    return snap
-  }
+  const loopLagForHealth = () => loopHealth.snapshot()
   // 账号路由（桌面端 device flow）；主体、代理注入与测试在 account-routes.ts。
   Object.assign(routes, buildAccountRoutesFor(apiToken, ctx.config))
+  Object.assign(routes, buildProfileRoutes(sessions, apiToken))
+  Object.assign(routes, buildProfileLibraryRoutes({ rivetHome: profileRivetHome(), apiToken }))
 
   Object.assign(
     routes,
-    buildHealthRoute(sessions, startedAt, version, apiToken, registryReady, serveConfigured, loopLagForHealth, () => initializationError),
+    buildHealthRoute(sessions, startedAt, version, apiToken, registryReady, serveConfigured, loopLagForHealth, () => initializationError, () => storeLock?.holder()),
   )
   // 阶段 4：GET /events 全局推送通道——sessions/tasks 失效提示 + 5s health 心跳
   // （心跳体与带 token 的 GET /health 同一构造点，前端直接 setQueryData）。
   Object.assign(
     routes,
     buildServerEventsRoute(serverEvents, apiToken, {
-      healthSnapshot: createHealthSnapshot(sessions, startedAt, version, registryReady, serveConfigured, loopLagForHealth, () => initializationError),
+      healthSnapshot: createHealthSnapshot(sessions, startedAt, version, registryReady, serveConfigured, loopLagForHealth, () => initializationError, () => storeLock?.holder()),
     }, sseRegistry),
   )
 
@@ -1197,7 +1206,7 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
   let scheduler: CronScheduler | undefined
   let wiring: CronWiring | undefined
   let taskRegistry: TaskRegistry | undefined
-  if (!opts.ephemeral) {
+  if (!opts.ephemeral && ownsSessionStore) {
     const rivetDir = desktopDir()
     scheduler = new CronScheduler({ schedulePath: join(rivetDir, 'scheduled_tasks.json') })
     setActiveScheduler(scheduler)
@@ -1252,6 +1261,23 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
   // 「就绪后首秒所有路由 300–600ms」的主因（agent chunk 预热只是次因）。
   void Promise.all([prewarmResolvedEnv(), prewarmShellProbes()])
     .then(() => timing.mark('host-probes'))
+  // P0-4 — 假中断标记一次性迁移：只有拿到会话库独占锁的 sidecar 有资格跑（迁移要读
+  // 并原子重写 events.jsonl）。挂在 listen 之后、后台异步：大日志扫描不能阻塞首批
+  // UI 请求。逐会话之间让出事件循环，done marker 只在全部成功时才落（幂等，失败
+  // 下次启动重试）；失败只记日志，绝不影响服务。opts.ephemeral 无锁 → 不跑。
+  if (storeLock && ownsSessionStore) {
+    void runPhantomResumeMigration({
+      sessionsDir: desktopSessionsDir(),
+      removedBackupPath: join(desktopDir(), '.migrations', `${PHANTOM_RESUME_MIGRATION_VERSION}.removed.jsonl`),
+      // 运行中的会话磁盘可能正被追加——跳过（判据取 sessions 的公开 API）。
+      isSessionRunning: (id) => sessions.getSession(id)?.status === 'running',
+      log: (line) => serverLogger.warn(line),
+    }).catch((err) => {
+      serverLogger.error('[phantom-resume] migration crashed (non-fatal)', {
+        error: (err as Error)?.message ?? String(err),
+      })
+    })
+  }
   // 预热（agent 装配 chunk import + 插件快照）延后到 listen 之后：首批 UI 请求
   // （/health、/sessions、/config/*）先过，再让预热吃 CPU。首个会话经 createAgent
   // 的 fireNow 即时触发，不等定时器；close 时取消未点火的定时器。
@@ -1301,10 +1327,15 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
           sharedRuntime.domainStores.clear()
         }
         loopHealth.stop()
+        loopStall.stop()
         // agent-16：会话事件写链（100ms debounce 批次）有界排空——CRITICAL 之外的
         // 滞留行否则随进程退出丢失（flushAllAsync 此前只有测试调用，生产关闭链
         // 缺这一环）。有界超时，best-effort。
         try { await persistence?.flushAllAsync(3_000) } catch { /* best-effort */ }
+        // P0-1 — 释放会话库独占锁。此刻所有会话库写入方（persistence / 台账 /
+        // 定时任务）都已停在上面的关闭链里，释放不会与残留写交错。release 只在锁
+        // 仍属于本进程时才删文件——拿不到锁的降级实例是 no-op。
+        storeLock?.release()
         // agent-13：先主动清场 SSE 长连（/events、/sessions/:id/stream、/prompt）。
         // 它们只挂 res.on('close') 清理，服务端不主动关则 server.close(cb) 永远
         // 等不到回调——桌面客户端连着时 SIGINT 只能 kill -9 的根因。
@@ -1329,6 +1360,8 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
  * scheduler artifacts; failures are swallowed.
  */
 function writeExitBreadcrumb(reason: string, extra: Record<string, unknown> = {}): void {
+  // 降级实例（拿不到会话库锁）不写面包屑——见 storeLockDegraded 注释。
+  if (storeLockDegraded) return
   try {
     const path = join(desktopDir(), 'sidecar-exit.json')
     mkdirSync(dirname(path), { recursive: true })

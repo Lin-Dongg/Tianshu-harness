@@ -45,6 +45,8 @@ const deepseekModels = [
 describe('模型引用别名归一', () => {
   it('canonicalizeModelId：短名/旧名归一到 canonical id', () => {
     assert.equal(canonicalizeModelId('v4.1-flash'), 'deepseek-flash')
+    assert.equal(canonicalizeModelId('4.1-flash'), 'deepseek-flash')
+    assert.equal(canonicalizeModelId('deepseek-4.1-flash'), 'deepseek-flash')
     assert.equal(canonicalizeModelId('v4-flash'), 'deepseek-v4-flash')
     assert.equal(canonicalizeModelId('deepseek-flash'), 'deepseek-flash')
   })

@@ -7,13 +7,15 @@ import { createMcpToolWrapper, createMcpConnectorConsent, type McpConnectorConse
 import {
   approveMcpServer,
   denyMcpServer,
+  mcpApprovalInteractive,
   mcpServerFingerprint,
   resolveMcpApproval,
   type McpApprovalDecision,
   type McpPendingApproval,
 } from './server-approval.js'
+import { armInventoryApproval, evaluateInventoryGate, formatInventoryNotice, type InventoryPendingPayload } from './tool-inventory.js'
 import { readSubAgentWorkspacePolicy, subAgentScratchRoot, workspaceDeclarationFor } from './workspace-policy.js'
-import { classifyMcpError } from './failure-classifier.js'
+import { classifyMcpError, describeTransportLoss } from './failure-classifier.js'
 import { createTransport, type TransportResult } from './transport-factory.js'
 import { LogRingBuffer } from './log-buffer.js'
 import { getNetworkConfig } from '../config/manager.js'
@@ -65,24 +67,7 @@ function formatConnectError(err: unknown, stderrTail: string, context?: { transp
   return parts.join(' — ')
 }
 
-/**
- * 断连/崩溃的一句话诊断（issue #148 建议 2）。
- *
- * stdio 走分类器：stderr 决定它是环境问题、包问题还是未知，用户据此知道该改配置
- * 还是该报 bug。remote 是网络语义，不套 stderr。**空 stderr 不硬凑**——不知道就
- * 说不知道，编一个「可能是网络问题」只会把人带偏。
- */
-function describeTransportLoss(transport: McpTransportType, stderrTail: string): string {
-  if (transport !== 'stdio') return 'connection lost'
-  const tail = stderrTail.trim()
-  if (!tail) return 'server process exited (no stderr captured)'
-  const classified = classifyMcpError(new Error('MCP server process exited'), {
-    transport: 'stdio',
-    stderr: tail,
-  })
-  const compact = tail.replace(/\n+/g, ' | ').slice(0, 300)
-  return `server process exited; stderr: ${compact} — ${classified.suggestion}`
-}
+// 断连诊断 describeTransportLoss 已迁至 failure-classifier.ts（沿接缝拆分，守行数红线）。
 
 export interface McpToolDef {
   name: string
@@ -236,11 +221,13 @@ export class McpManager {
     return resolveMcpApproval(cfg)
   }
 
-  /** issue #215 — 记录/清除待批登记，并把连接状态置为 awaiting-approval / denied。 */
+  /** issue #215 — 记录/清除待批登记，并把连接状态置为 awaiting-approval / denied。
+   *  inventory 缺省 = 连接级审批；传入 = 清单快照门拦截（①，附加 diff 摘要）。 */
   private _recordApprovalHold(
     serverId: string,
     cfg: McpServerConfig,
     decision: 'awaiting' | 'denied',
+    inventory?: InventoryPendingPayload,
   ): void {
     const transport: McpTransportType = cfg.command ? 'stdio' : 'streamableHttp'
     if (decision === 'awaiting') {
@@ -253,6 +240,10 @@ export class McpManager {
         cwd: cfg.cwd,
         envKeys: cfg.env ? Object.keys(cfg.env).sort() : [],
         url: cfg.url,
+        reason: inventory?.reason,
+        inventoryHash: inventory?.inventoryHash,
+        inventoryDiff: inventory?.inventoryDiff,
+        changedAt: inventory?.changedAt,
       })
     } else {
       this.pendingApprovals.delete(serverId)
@@ -276,6 +267,10 @@ export class McpManager {
     const c = cfg ?? this.config.servers[serverId]
     if (!c) return []
     approveMcpServer(c)
+    // 清单门待批（①）：把「被展示的那版 hash」arm 下来——重拉精确匹配才消费放行
+    // （用户批准的是他看到的版本；批准期间二次换毒拦得住，见 tool-inventory.ts）。
+    const held = this.pendingApprovals.get(serverId)
+    if (held?.inventoryHash) armInventoryApproval(mcpServerFingerprint(c), held.inventoryHash)
     this.pendingApprovals.delete(serverId)
     return this.connectAndDiscover(serverId, c)
   }
@@ -431,6 +426,25 @@ export class McpManager {
 
         const mcpTools = await this._discoverTools(serverId, server)
 
+        // 清单快照门（rug pull 防线 ①，见 tool-inventory.ts）：注册前 diff——变更在
+        // gate 宿主拦截待批（断开+不注册）；fail-open 宿主放行 + 变更标记（③）。
+        const inventory = evaluateInventoryGate({
+          fingerprint: mcpServerFingerprint(serverConfig),
+          serverId,
+          tools: mcpTools,
+          interactive: mcpApprovalInteractive(),
+        })
+        if (inventory.action === 'block') {
+          this.suppressReconnect.add(serverId) // 防 close→onclose→自动重连→再拦 循环
+          this.connections.delete(serverId)
+          try { await server.transport.close() } catch { /* best-effort */ }
+          this._recordApprovalHold(serverId, serverConfig, 'awaiting', inventory.pending)
+          return []
+        }
+        const inventoryNotice = inventory.changed
+          ? formatInventoryNotice(inventory.changed.diff, inventory.changed.changedAt)
+          : undefined
+
         const rivetTools = mcpTools.map(mcpDef => {
           const perToolCallFn = async (input: Record<string, unknown>) => {
             if (!this.connections.has(serverId)) {
@@ -490,6 +504,7 @@ export class McpManager {
                   scratchRoot: subAgentScratchRoot(),
                 }
               : undefined,
+            inventoryNotice,
           )
         })
 

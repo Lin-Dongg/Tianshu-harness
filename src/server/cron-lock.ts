@@ -53,7 +53,8 @@ export type LockState =
   | { status: 'stale_recovered'; previousOwner: LockInfo; info: LockInfo }
   | { status: 'error'; reason: string }
 
-type CreateLockResult =
+/** 原子锁文件创建结果。导出给其他 PID 租约锁（store-lock）复用，不改变 CronLock 行为。 */
+export type CreateLockResult =
   | { ok: true }
   | { ok: false; reason: 'exists' }
   | { ok: false; reason: 'error'; message: string }
@@ -113,7 +114,11 @@ export function isProcStatZombie(statLine: string): boolean {
 
 // ─── Lock File Operations ─────────────────────────────────────
 
-function readLockFile(path: string): LockInfo | null {
+/**
+ * 读取锁文件（缺失/损坏 → null）。
+ * 导出：store-lock 复用同一份原子锁文件机制，避免第二套实现漂移。
+ */
+export function readLockFile(path: string): LockInfo | null {
   if (!existsSync(path)) return null
   try {
     const raw = readFileSync(path, 'utf-8')
@@ -123,8 +128,8 @@ function readLockFile(path: string): LockInfo | null {
   }
 }
 
-/** O_EXCL 创建锁文件；写入完成后用 hard-link 发布，避免读到半写内容。 */
-function createLockFileExclusive(path: string, info: LockInfo): CreateLockResult {
+/** O_EXCL 创建锁文件；写入完成后用 hard-link 发布，避免读到半写内容。导出理由同 readLockFile。 */
+export function createLockFileExclusive(path: string, info: LockInfo): CreateLockResult {
   mkdirSync(dirname(path), { recursive: true })
   const tmpPath = `${path}.${process.pid}.${randomUUID()}.tmp`
   try {

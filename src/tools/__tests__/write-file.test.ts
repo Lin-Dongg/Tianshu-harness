@@ -1,6 +1,6 @@
 import { after, describe, it, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { writeFileSync, mkdirSync, rmSync, existsSync, statSync, readFileSync } from 'fs'
+import { writeFileSync, mkdirSync, rmSync, existsSync, statSync, readFileSync, utimesSync } from 'fs'
 import { join } from 'path'
 import { WRITE_FILE_TOOL } from '../write-file.js'
 import { __setFileReadMtimeForTests } from '../read-file.js'
@@ -255,6 +255,89 @@ describe('write_file tool — blind-overwrite guard', () => {
     assert.equal(result.isError, true)
     assert.ok(result.content.includes('新文件已自动移除'), `Expected removal note, got: ${result.content}`)
     assert.ok(!existsSync(file), 'broken new file must be removed from disk')
+  })
+})
+
+describe('write_file tool — 陈旧覆盖栅栏 W1（docs/design/2026-10-05-file-claim-lease-lifecycle.md）', () => {
+  beforeEach(() => {
+    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true })
+    mkdirSync(TEST_DIR, { recursive: true })
+  })
+
+  /** 外部写入并显式抬升 mtime——毫秒级时间戳下同刻写入会漏判（兄弟用例同纪律）。 */
+  function externalWrite(file: string, content: string): void {
+    writeFileSync(file, content)
+    const bumped = new Date(Date.now() + 5000)
+    utimesSync(file, bumped, bumped)
+  }
+
+  it('本会话读过之后被外部修改 → 拒绝整文件覆盖（旧行为是 warn 后照写）', async () => {
+    const file = join(TEST_DIR, 'stale.txt')
+    writeFileSync(file, 'v1 original\n')
+    markObserved(file)
+    externalWrite(file, 'v2 changed by someone else\n')
+
+    const result = await WRITE_FILE_TOOL.execute(makeParams({ file_path: file, content: 'v3 from stale view\n' }))
+    assert.ok(result.isError, '陈旧覆盖必须 fail-closed')
+    assert.ok(result.content.includes('外部修改'), `错误须点明外部修改：${result.content}`)
+    assert.equal(readFileSync(file, 'utf-8'), 'v2 changed by someone else\n', '他方改动未被覆盖')
+  })
+
+  it('拒绝不自我消解：不重读就重试仍拒绝（栅栏不是一次性提示）', async () => {
+    const file = join(TEST_DIR, 'stale-retry.txt')
+    writeFileSync(file, 'v1\n')
+    markObserved(file)
+    externalWrite(file, 'v2\n')
+    const p = makeParams({ file_path: file, content: 'v3\n' })
+    assert.ok((await WRITE_FILE_TOOL.execute(p)).isError, '首次拒绝')
+    assert.ok((await WRITE_FILE_TOOL.execute(p)).isError, '盲重试必须继续被拒——否则栅栏形同提示')
+    assert.equal(readFileSync(file, 'utf-8'), 'v2\n')
+  })
+
+  it('见证一致（无外部改动）→ 放行（防过度阻断）', async () => {
+    const file = join(TEST_DIR, 'not-stale.txt')
+    writeFileSync(file, 'v1\n')
+    markObserved(file)
+    const r = await WRITE_FILE_TOOL.execute(makeParams({ file_path: file, content: 'v2\n' }))
+    assert.ok(!r.isError, `不应误拦：${r.content}`)
+    assert.equal(readFileSync(file, 'utf-8'), 'v2\n')
+  })
+
+  it('要写的内容恰等于磁盘当前内容 → 豁免（写了也无信息损失）', async () => {
+    const file = join(TEST_DIR, 'identical-after-external.txt')
+    writeFileSync(file, 'v1\n')
+    markObserved(file)
+    externalWrite(file, 'v2\n')
+    const r = await WRITE_FILE_TOOL.execute(makeParams({ file_path: file, content: 'v2\n' }))
+    assert.ok(!r.isError, `幂等重写应豁免：${r.content}`)
+  })
+
+  it('活动草稿同样豁免（系统会在草稿上重建空文件）', async () => {
+    const relDraft = '.rivet/plans/draft-2234567890123.md'
+    const file = join(TEST_DIR, relDraft)
+    mkdirSync(join(TEST_DIR, '.rivet', 'plans'), { recursive: true })
+    writeFileSync(file, '')
+    markObserved(file)
+    externalWrite(file, '# 外部重建的草稿\n')
+    const r = await WRITE_FILE_TOOL.execute({
+      ...makeParams({ file_path: file, content: '# Plan\n' }),
+      activePlanFilePath: relDraft,
+    })
+    assert.ok(!r.isError, `草稿不应被陈旧栅栏拦：${r.content}`)
+  })
+
+  it('RIVET_WRITE_OVERWRITE_GUARD=0 同时关掉陈旧栅栏（与盲覆盖共用开关）', async () => {
+    const file = join(TEST_DIR, 'stale-disabled.txt')
+    writeFileSync(file, 'v1\n')
+    markObserved(file)
+    externalWrite(file, 'v2\n')
+    process.env.RIVET_WRITE_OVERWRITE_GUARD = '0'
+    try {
+      const r = await WRITE_FILE_TOOL.execute(makeParams({ file_path: file, content: 'v3\n' }))
+      assert.ok(!r.isError, `开关关闭后应放行：${r.content}`)
+    } finally {
+      delete process.env.RIVET_WRITE_OVERWRITE_GUARD
+    }
   })
 })
 

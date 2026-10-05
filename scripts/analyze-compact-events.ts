@@ -19,7 +19,7 @@
  * Requires the compact-attribution instrumentation (compactPreRatio etc. in cache-log).
  */
 import { readdirSync, readFileSync, existsSync, statSync } from 'node:fs'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import { getSessionDir } from '../src/agent/session-persist.js'
 import { LOW_PRESSURE_REWRITE_RATIO, isLowPressureRewrite } from '../src/agent/compact-attribution.js'
 
@@ -277,7 +277,7 @@ function main(): void {
       accumulateReclaim(reclaim, e); accumulateReclaim(overallReclaim, e)
     }
     if (agg.turns === 0) continue
-    const id = dir.split('/').pop() ?? dir
+    const id = basename(dir)
     reportAgg(id.slice(0, 12), agg)
     reportReclaim(id.slice(0, 12), reclaim)
     console.log('')

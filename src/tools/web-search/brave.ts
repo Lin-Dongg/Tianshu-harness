@@ -1,4 +1,5 @@
 import type { SearchBackend, SearchFetch, SearchResult } from './types.js'
+import { SearchHttpError } from './errors.js'
 
 const BRAVE_ENDPOINT = 'https://api.search.brave.com/res/v1/web/search'
 
@@ -38,7 +39,7 @@ export class BraveBackend implements SearchBackend {
       },
     })
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`)
+      throw new SearchHttpError(response.status)
     }
     const data = (await response.json()) as BraveResponse
     const raw = data.web?.results ?? []

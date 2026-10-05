@@ -873,7 +873,7 @@ export function buildManagedAgent(
     return oldAgent
   }
   return {
-    run: (prompt, callbacks, images) => {
+    run: (prompt, callbacks, images, options) => {
       // Auth pre-flight: if this session's model has no usable key (e.g. an
       // apiKeyEnv provider after a sidecar restart lost its env), fail with a
       // clear, actionable message instead of sending the request and surfacing
@@ -891,7 +891,7 @@ export function buildManagedAgent(
           return Promise.reject(new Error(unconfiguredSpecMessage(spec)))
         }
       }
-      return agent.run(prompt, callbacks, images)
+      return agent.run(prompt, callbacks, images, options)
     },
     abort: () => agent.abort(),
     setApprovalMode: (mode) => {
@@ -1242,7 +1242,7 @@ function kindForProfile(profile: string): import('../agent/coordinator.js').Dele
 /** User-dispatched background subagent runner. Mirrors delegate_task's request
  *  shaping but bridges activity to a plain callback (no tool pipeline) and
  *  produces a terminal summary for the adopt-to-composer flow. */
-async function delegateWorkerOnCoordinator(
+export async function delegateWorkerOnCoordinator(
   coordinator: import('../agent/coordinator.js').DelegationCoordinator | null,
   input: DelegateWorkerInput,
   opts: { workerId: string; signal: AbortSignal; onActivity: (a: DelegateActivityUpdate) => void },
@@ -1272,6 +1272,7 @@ async function delegateWorkerOnCoordinator(
     // the work order id), so every activity update merges into the same panel node.
     parentTurnId: opts.workerId,
     objective: input.objective,
+    budget: input.budget,
     kind: kindForProfile(profile),
     profile: profile as import('../agent/work-order.js').WorkerProfile,
     scope: input.files && input.files.length ? { files: input.files } : {},
@@ -1313,6 +1314,7 @@ async function delegateWorkerOnCoordinator(
         evidenceStatus: result.evidenceStatus,
       }
       activityMapper.finish(terminal)
+      opts.onActivity({ workOrderId: opts.workerId, status: terminal.status, resultWorkOrderId: result.workOrderId })
     } else {
       activityMapper.finish({
         workOrderId: opts.workerId,

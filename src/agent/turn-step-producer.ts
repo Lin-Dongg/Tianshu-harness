@@ -27,6 +27,7 @@ export { combineMemoryBlocks, crossSessionDisabled, crossSessionMemoryPushEnable
 import { parseMentions, renderMentionContext, normalizeMentionRefs } from '../tui/mention-parser.js'
 import { renderPlanCacheAdvisory } from './plan-cache-advisory.js'
 import { selectReasoningEffort } from './auto-reasoning.js'
+import { resetReasoningRecovery } from './thinking-retry.js'
 import { SessionPersist } from './session-persist.js'
 import { formatEventsForAppendix, invalidateReadCachesForEvents, renderCrossSessionClaims } from './hooks/cross-session-hook.js'
 import { loadPresence, formatPresenceForAppendix } from './companion-presence.js'
@@ -189,8 +190,7 @@ export class TurnStepProducer {
     this.self.runLoopTurn = 0
     this.self.lastUserInputRunTurn = 0
     // Reset accumulations from previous run
-    this.self.thinkingOnlyRetries = 0
-    this.self.lastThinkingContent = ''
+    resetReasoningRecovery(this.self)
     this.self.consecutiveNoToolTurns = 0
     this.self.wedgeToolFingerprint = ''
     this.self.wedgeRepeatCount = 0
@@ -234,6 +234,8 @@ export class TurnStepProducer {
     })()
 
     this.self.bindSessionDomain(userInput, callbacks)
+    const usedDomain = this.self.getSessionDomain()
+    if (usedDomain) callbacks.onDomainUsed?.(usedDomain.id)
     if (
       this.self.domainWasAutoResolved &&
       this.self.getSessionTurnCount() > 0 &&
@@ -242,7 +244,7 @@ export class TurnStepProducer {
       const drift = this.self.driftDetector.evaluate(userInput)
       if (drift) callbacks.onDomainDrift?.(drift)
     }
-    this.self.contextInjection.recordUserInputClaims(userInput)
+    this.self.contextInjection.recordUserInputClaims(userInput, this.self.activeInputOrigin)
     this.self.contextInjection.refreshPlaybookLessons(userInput)
 
     // Phase 2.3: Proactive session split — MUST run BEFORE addUserMessage.
@@ -266,7 +268,7 @@ export class TurnStepProducer {
       }
     }
 
-    this.self.session.addUserMessage(userInput, images)
+    this.self.session.addUserMessage(userInput, images, this.self.activeInputOrigin)
     // S2 CCR 可达性：用户边界重置连续只读流水。上一段排查（哪怕是同一个
     // 会话）的只读流水不能当成"新任务也在原地打转"的证据——用户刚重新
     // 定义了问题，CCR P6 的计时从零开始。
@@ -277,12 +279,12 @@ export class TurnStepProducer {
     const actionable = turnMode !== 'chat'
     this.self.config.promptEngine.setActionableTurn(actionable)
 
-    if (turnMode === 'task') {
+    if (turnMode === 'task' && this.self.activeInputOrigin === 'human') {
       this.self.taskContract = extractTaskContract(userInput, this.self.session.getTurnCount())
       // 证据义务任务边界：上一个用户任务的未决义务全部作废（satisfied 历史
       // 保留），latch 清空——新任务从干净的义务面开始。
       this.self.obligations.supersedeOpen()
-    } else if (turnMode === 'followUp') {
+    } else if (turnMode === 'followUp' && this.self.activeInputOrigin === 'human') {
       // P5: inherit the active contract, but fold in any new constraints/files
       // from this follow-up (multi-line corrections whose constraint sits past
       // the first line are classified followUp yet must reach the task-anchor).

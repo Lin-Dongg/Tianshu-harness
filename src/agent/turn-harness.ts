@@ -1,5 +1,5 @@
 import { TrajectoryRecorder, type TrajectoryEntry } from './trajectory.js'
-import type { FailureClass } from './failure-classifier.js'
+import { isTransient, type FailureClass } from './failure-classifier.js'
 import { shouldRetryToolFailure } from './retry-policy.js'
 import type { FailureJournal } from './failure-journal.js'
 import { toolTargetFromInput } from './tool-target.js'
@@ -56,6 +56,8 @@ export class TurnHarness {
             retried = true
             result = await exec.execute()
             if (!result.isError) break
+            errorClass = exec.classify(result.content) ?? undefined
+            if (!errorClass || !isTransient(errorClass) || !this.config.retryableClasses.includes(errorClass)) break
             if (attempt === this.config.maxRetries - 1) {
               // 瞬时失败重试耗尽时，不把大段 stderr 再灌一遍——超长只保留头部摘录，
               // 再接失败后缀，避免环境噪声二次膨胀上下文。

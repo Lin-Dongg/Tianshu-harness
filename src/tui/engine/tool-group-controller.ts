@@ -97,8 +97,8 @@ export class ToolGroupController {
     return group
   }
 
-  attachResult(id: string, content: string, isError: boolean): void {
-    this.toolGroupBuffer.attachResult(id, content, isError)
+  attachResult(id: string, content: string, isError: boolean, rawPath?: string): void {
+    this.toolGroupBuffer.attachResult(id, content, isError, rawPath)
   }
 
   // ── bashGroupBuffer ──
@@ -120,8 +120,8 @@ export class ToolGroupController {
     return group
   }
 
-  attachBashResult(id: string, content: string, isError: boolean): void {
-    this.bashGroupBuffer.attachResult(id, content, isError)
+  attachBashResult(id: string, content: string, isError: boolean, rawPath?: string): void {
+    this.bashGroupBuffer.attachResult(id, content, isError, rawPath)
   }
 
   hasBashEntry(id: string): boolean {

@@ -252,3 +252,29 @@ test('issue #300：PDF 附件 + 无 vision 通路 → 不尝试页图、run 正�
   assert.equal((user.data.documents as unknown[]).length, 1)
   assert.equal(user.data.imageIds, undefined)
 })
+
+
+test('welcome create and session prompt both decode legacy TXT/CSV and extract zipped Office attachments', async () => {
+  const { default: JSZip } = await import('jszip')
+  const { agents, router, manager } = setup()
+  const zip = new JSZip()
+  zip.file('ppt/slides/slide1.xml', '<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:p><a:r><a:t>shared-office-marker</a:t></a:r></a:p></p:sld>')
+  const documents = [
+    { name: 'gbk.txt', dataUrl: `data:text/plain;base64,${Buffer.from([0xd6,0xd0,0xce,0xc4]).toString('base64')}` },
+    { name: 'excel.csv', dataUrl: `data:text/plain;base64,${Buffer.from('name,value\n中文,1', 'utf16le').toString('base64')}` },
+    { name: 'deck.pptx', dataUrl: `data:application/vnd.openxmlformats-officedocument.presentationml.presentation;base64,${(await zip.generateAsync({type:'nodebuffer'})).toString('base64')}` },
+  ]
+  try {
+    const created = await router('POST', '/sessions', { prompt: 'read', documents }, AUTH)
+    assert.equal(created.status, 201)
+    const next = manager.createSession({ cwd: '/tmp/work' })
+    const sent = await router('POST', `/sessions/${next.id}/prompt`, { prompt: 'read', documents }, AUTH)
+    assert.equal(sent.status, 200)
+    for (const agent of agents) {
+      assert.match(agent.runPrompts[0]!, /中文/)
+      assert.match(agent.runPrompts[0]!, /name,value\n中文,1/)
+      assert.match(agent.runPrompts[0]!, /shared-office-marker/)
+      assert.ok(!agent.runPrompts[0]!.includes('extraction failed'))
+    }
+  } finally { await manager.shutdownAll() }
+})

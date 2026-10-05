@@ -12,12 +12,12 @@
  * @module project-fingerprint
  */
 
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 export interface ProjectFingerprint {
   /** Detected primary language. */
-  language: 'typescript' | 'rust' | 'go' | 'python' | 'java' | 'unknown'
+  language: 'typescript' | 'rust' | 'go' | 'python' | 'java' | 'dotnet' | 'unknown'
   /** Recommended test command (e.g. "npm test", "cargo test", "pytest"). */
   testCommand?: string
   /** Recommended build command (e.g. "npm run build", "cargo build"). */
@@ -45,6 +45,10 @@ const RUST_MARKERS = ['Cargo.toml']
 const PYTHON_MARKERS = ['pyproject.toml', 'requirements.txt', 'setup.py', 'setup.cfg', 'Pipfile']
 /** Markers that a directory contains a Java/Gradle project. */
 const JAVA_MARKERS = ['build.gradle', 'build.gradle.kts', 'pom.xml', 'mvnw']
+/** File extensions that mark a .NET project root (.NET project file names are
+ *  project-specific — App.csproj, SelfTest.csproj, … — so detection filters by
+ *  extension via readdir rather than probing a fixed marker name). */
+const DOTNET_EXTENSIONS = ['.csproj', '.fsproj', '.sln'] as const
 
 function hasAny(cwd: string, markers: readonly string[]): boolean {
   return markers.some(m => existsSync(join(cwd, m)))
@@ -140,16 +144,34 @@ function detectJava(cwd: string): ProjectFingerprint | null {
   }
 }
 
+function detectDotnet(cwd: string): ProjectFingerprint | null {
+  let entries: string[]
+  try {
+    entries = readdirSync(cwd)
+  } catch {
+    return null
+  }
+  if (!entries.some(name => DOTNET_EXTENSIONS.some(ext => name.endsWith(ext)))) return null
+  return {
+    language: 'dotnet',
+    testCommand: 'dotnet test',
+    buildCommand: 'dotnet build',
+    typecheckCommand: undefined, // dotnet build already typechecks
+    lintCommand: undefined, // no canonical lint command; analyzers run via build
+    hasTestInfra: true, // dotnet test always works
+  }
+}
+
 // ── Unified entry ──────────────────────────────────────────
 
 /**
  * Detect the project fingerprint for the given directory.
- * Language detectors are tried in priority order: Node → Rust → Go → Python → Java.
+ * Language detectors are tried in priority order: Node → Rust → Go → Python → Java → Dotnet.
  * Returns a minimal fingerprint with language='unknown' when nothing matches.
  * 单一出口：语言探测结果统一附加第三方 agent 配置存在性信号。
  */
 export function detectProjectFingerprint(cwd: string): ProjectFingerprint {
-  const detectors = [detectNode, detectRust, detectGo, detectPython, detectJava]
+  const detectors = [detectNode, detectRust, detectGo, detectPython, detectJava, detectDotnet]
   let base: ProjectFingerprint | null = null
   for (const detect of detectors) {
     base = detect(cwd)

@@ -120,7 +120,7 @@ tail -f run.jsonl | jq -c 'select(.type == "tool_use") | .data.name'
 
 前缀缓存已接近稳态上限后，成本优化转向 DeepSeek API 思考 token 侧——对按输出 token 计费的推理模型，降低 verbose reasoning 是 ROI 最高的杠杆。
 
-- **默认 reasoningEffort 降级** —— DeepSeek V4 Pro 从 `max` 降至 `high`，Flash 从 `max` 降至 `medium`。已有显式配置的用户不受影响（`reasoningFloor` 保护）。
+- **默认 reasoningEffort** —— DeepSeek 4.1 两个模型（Flash / V4 Pro）默认均为 `high`（2026-10-05：Flash 从 `medium` 升到 `high`——medium 对 agent 任务的执行落地不足，而 `max` 在 4.1 Flash 上过度推理；桌面新会话输入框默认档同为 `high`）。已有显式配置的用户不受影响（`reasoningFloor` 保护）。
 - **effort 路由（默认开启）** —— 低复杂度 + 高置信度的例行轮自动降一档 reasoning effort，从不升档。`RIVET_EFFORT_ROUTING=0` 关闭。
 - **Compact 走 flash 侧路** —— 修复了压缩未配 provider 时仍走主模型的 bug，自动从主 provider 推断 flash 端点。
 - **Doom-loop 自动收束** —— 检测到重复工具调用时，动态 appendix 注入更严格的 output-style 约束，减少无谓思考 token 消耗。`RIVET_TERSE=0` 关闭。
@@ -150,6 +150,10 @@ tail -f run.jsonl | jq -c 'select(.type == "tool_use") | .data.name'
 可选配置：`faceMode: "structuredRead"`（读面附加 `file_info` / `related_tests` / `repo_graph` / `semantic_search` / `read_section`）、`timeoutSteps`（0 = 禁用超时晋升）、`triage.maxChars`、`appendixLean`。
 
 > 注：桌面端快捷键 `⌘/Ctrl+.` 的「Zen 模式」是隐藏侧栏的纯 UI 专注模式——同名不同物，对缓存无任何影响。
+
+### 工具结果与上下文占用（为什么读文件这么占上下文）
+
+`read_file` 默认把**完整代码 inline 进对话历史**——这是刻意设计（2026-05-24 `afcff8ce4`）：`edit_file` 依赖 `old_string` 精确匹配，只给摘要会破坏 read→edit 工作流。只有超过 artifact 阈值的工具输出才换成「摘要 + `[artifact:X]` 引用、按需 `read_section` 回读」；阈值随上下文窗口缩放，1M 窗口下约为 read_file 300K 字符 / run_tests 225K / bash 150K / grep 100K，窗口越小收得越紧。低于阈值一律不 wrap，因为 `[artifact:X]` 标记曾让模型误以为内容被截断、转而去写 `/tmp` 文件绕过（事故见 `bash.ts` 注释）。两个边界：read_file 模型可见内容另有 120K 字符硬顶（超出头尾截断），所以它几乎碰不到 300K 的 artifact 阈值；审计/排查类任务想省上下文，优先用 `read_file` 的 `focus` 参数、`read_section` 行区间读、`grep` 带 `context_lines`——太一域的取证提醒（连续只读 ≥5 次且零锚点时触发）正是在推这种行为。桌面端拖入 zip/tar 压缩包只注入 ~90 token 的句柄（路径 + 字节数 + sha256），内容由 agent 按需 `unzip` 自取，大输出仍走上面的 artifact 拦截。
 
 ### 星域系统
 
@@ -789,10 +793,14 @@ tianshu logs open desktop            # 打开 sidecar 日志目录（GUI 起不�
 
 **长会话上下文不够怎么办？** 天枢在 800K tokens 自动压缩，保留前 2 条消息作为缓存锚点。也可手动 `/compact`。
 
+**为什么读个文件上下文涨这么多？** `read_file` 默认返回完整代码 inline——`edit_file` 精确匹配所需的刻意设计，只有超大输出才换成 artifact 引用。省上下文读法见「核心功能 → 工具结果与上下文占用」。
+
 **多个项目同时开会话冲突吗？** 不冲突。每次启动生成唯一 session ID，数据按 ID 隔离。用 git worktree 可获得最大隔离。
 
 **怎么恢复上次会话？** `/sessions` 列出所有会话，`/resume <序号>` 恢复。
 
 **agent 不回话/卡住了怎么办？** 先跑 `/doctor` 做环境健康检查，再 `/logs`（或 `tianshu logs`）看本会话日志落点；桌面端在 Settings → 存储位置 →「打开日志目录」直接看 sidecar 日志。更多现场见 [排障与 FAQ](guides/troubleshooting.md)。
+
+**回答被中途截断了（显示「输出已达 token 上限」）怎么办？** 说明这一轮输出达到了模型的 `maxTokens` 上限、内容被截断——但**已输出的部分全部保留在对话历史里**，直接发「继续」让模型接着往下写即可（不丢内容，也无需重述）。长回答频繁被截断时，自建 / 本地部署的模型可在 provider 配置里调大 `maxTokens`。
 
 **429 / 额度不足怎么办？** 桌面端 Insights 面板可查 DeepSeek 余额与欠费状态；降低成本可 `/effort` 降推理深度档，或 `/model` 换 flash 档（如 `deepseek-v4-flash`）。若该服务商频繁 429，可按「重试与速率限制」章节（[Provider 配置手册](user-guide-provider-config.md)）调整重试次数、退避曲线或开启客户端限速。

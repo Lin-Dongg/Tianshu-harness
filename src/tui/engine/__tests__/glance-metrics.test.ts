@@ -128,7 +128,9 @@ test('GlanceBar 显示可见对话 token（conversationTokens），颜色仍按�
   assert.ok(plain.includes('95k / 1.0M'), `optional context panel shows the actual API-facing occupancy: ${plain}`)
   assert.equal(app.getMetrics()?.conversationTokens, 47_000, 'visible conversation token count remains available to consumers')
   // 95k/1M = 9.5% → muted color, not warning/error; ratio is based on estimatedTokens.
-  assert.ok(!plain.includes('◧47k/1.0M'), 'removed default glance bar is not duplicated')
+  // full 档状态行（GlanceBar 回归）展示可见对话 token；侧栏面板行 `95k / 1.0M`
+  // 展示 API 口径占用——两者数据源不同，各司其职。
+  assert.ok(plain.includes('◧47k/1.0M'), `full 档状态行展示可见对话 token: ${plain}`)
 })
 
 test('pricingPhase 接线：provider 给值时 GlanceBar 渲染计价段，缺省不渲染', () => {

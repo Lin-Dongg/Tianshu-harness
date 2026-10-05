@@ -118,19 +118,22 @@ export interface PlanClosedInput {
 /** Plan submitted for approval — surfaced to the TUI so it can prompt the user
  *  for approve/reject without requiring a slash command. */
 export interface PlanSubmittedInfo {
+  requestId?: string
   slug: string
   title: string
   /** Plan options (approaches) recorded at submit time. */
-  options?: Array<{ label: string; description: string }>
+  options?: Array<{ label: string; description: string; recommended?: boolean; recommendationReason?: string }>
 }
 
 /** Ask-user-question surfaced to the TUI so it can render an arrow-key selector
  *  instead of requiring the user to type a number or option text. */
 export interface AskUserQuestionInfo {
+  requestId?: string
   questions: Array<{
     id: string
     prompt: string
     options: string[]
+    optionDetails?: import('./ask-user-question.js').DecisionOptionDetail[]
     allowMultiple: boolean
   }>
 }
@@ -353,9 +356,13 @@ export type VerificationBlockedReason =
   | 'invocation_failure'    // runner crashed / EPERM / could not start
 
 export interface VerificationMetadata {
+  stale?: boolean
   command: string
   status: 'passed' | 'failed' | 'blocked'
-  scope: 'full' | 'targeted'
+  scope: 'full' | 'targeted' | 'unknown'
+  /** Orthogonal to execution scope. Only explicit 'test' evidence can supply
+   *  runtime test coverage; absent kind remains unknown, including legacy data. */
+  kind?: 'test' | 'typecheck' | 'lint' | 'build' | 'check'
   /** 以下数值字段可选（2026-08-01）：run_tests 等真实执行始终填充；worker 自报
    *  的 verification 已降为交叉校验口径，系统补录的元数据不含计数。消费方不得
    *  假定它们必存在。 */
@@ -379,6 +386,9 @@ export interface VerificationMetadata {
   /** VSW two-phase: 'isolated' = Phase A on baseline.head + owned diff (blocking
    *  gate); 'integration' = Phase B on current HEAD + owned diff (advisory). */
   verificationPhase?: 'isolated' | 'integration'
+  /** Integration is advisory only after a matching isolated run passed. */
+  isolatedPassed?: boolean
+  countsReliable?: boolean
   /** Unix ms timestamp when this verification was recorded. */
   timestamp?: number
 }
@@ -387,10 +397,15 @@ export interface VerificationMetadata {
 export type ToolErrorClass = 'environment' | 'exec-failure' | 'timeout'
 
 export interface ToolResult {
+  /** Runtime presentation contract, never sent as model-generated metadata. */
+  presentation?: { kind: 'worker_packet'; bounded: true }
   /** Content sent to model as tool_result */
   content: string
   /** UI summary override — falls back to content if not provided */
   uiContent?: string
+  /** Full display-only output; never inserted into model context. */
+  displayOutput?: string
+  displayOutputTruncated?: boolean
   /** Path to persisted raw output file */
   rawPath?: string
   /** Observational fidelity of this result:

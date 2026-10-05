@@ -17,6 +17,8 @@ import { mkdtempSync, rmSync, readFileSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  cancelDeviceCode,
+  revokeAccountSession,
   parseDeviceCreate,
   parseDevicePoll,
   isTerminalPollStatus,
@@ -31,6 +33,8 @@ import {
   isAccountIdentityStale,
   jwtSubject,
   ACCOUNT_IDENTITY_TTL_MS,
+  fetchAccountProfile,
+  refreshAccountToken,
   fetchAccountAvatar,
   fetchFoundingBadge,
   fetchAccountProfileSnapshot,
@@ -333,6 +337,16 @@ function jwtWithSub(sub: string): string {
   return `header.${payload}.sig`
 }
 
+test('website profile display name supersedes stale Auth metadata and ignores another user', async () => {
+  const auth = { id: 'me', email: 'me@example.com', user_metadata: { username: 'old-name' } }
+  const read = (id: string) => fetchAccountProfile(jwtWithSub('me'), { fetchImpl: routedFetch([
+    { match: '/auth/v1/user', body: auth },
+    { match: '/profiles', body: [{ id, display_name: 'Website name', username: 'website-handle' }] },
+  ]) })
+  assert.equal((await read('me'))?.displayName, 'Website name')
+  assert.equal((await read('someone-else'))?.displayName, 'old-name')
+})
+
 test('头像：读本人 profiles 行的 avatar_url', async () => {
   const avatar = await fetchAccountAvatar('t', {
     fetchImpl: routedFetch([{ match: '/profiles', body: [{ id: 'u1', avatar_url: 'https://cdn.example/a.png' }] }]),
@@ -431,7 +445,7 @@ test('创始：limit 恒为「一档名额」，不随档位变——它不能�
   assert.equal(tier3.limit, 300, 'limit 是一档名额的语义，与消费方所在档位无关')
 })
 
-test('快照：两端都取不到回 null；任一取到就返回且缺的那半为 null', async () => {
+test('快照：确认无头像与铭牌仍返回确认状态；任一取到保留该项', async () => {
   const empty = await fetchAccountProfileSnapshot('t', {
     fetchImpl: routedFetch([
       { match: '/profiles', body: [{ id: 'u1', avatar_url: null }] },
@@ -439,7 +453,8 @@ test('快照：两端都取不到回 null；任一取到就返回且缺的那半
       { match: 'get_my_founder_rank', body: { is_founder: false } },
     ]),
   })
-  assert.equal(empty, null, '没取到就不造"看起来有但是空的"壳')
+  assert.ok(empty, '确认没有头像或创始身份，不等于网络失败')
+  assert.deepEqual(empty.unconfirmed, [])
 
   const avatarOnly = await fetchAccountProfileSnapshot('t', {
     fetchImpl: routedFetch([
@@ -498,4 +513,80 @@ test('cachedAccountProfile 形状不全回 null，字段类型不符时按缺省
     profile: { avatarUrl: null, founding: null, fetchedAt: 5 },
   })
   assert.equal(bothEmpty, null, '两半都空等于没有——回 null 而不是一个空壳')
+})
+
+test('authorization URL replaces stale codes and preserves query/hash routing', () => {
+  const url = new URL(deviceAuthorizeUrl('https://example.com/auth/device?code=old&lang=zh#confirm', 'NEW 42'))
+  assert.deepEqual(url.searchParams.getAll('code'), ['NEW 42'])
+  assert.equal(url.searchParams.get('lang'), 'zh')
+  assert.equal(url.hash, '#confirm')
+  assert.throws(() => deviceAuthorizeUrl('javascript:alert(1)', 'DEMO'))
+})
+test('unknown poll statuses are protocol errors, never silent undefined states', () => {
+  assert.deepEqual(parseDevicePoll({ status: 'unexpected' }), { status: 'error' })
+})
+
+
+test('account contact caches website name and valid join date without exposing credentials', async () => {
+  const profile = await fetchAccountProfile('FAKE', { fetchImpl: async () => new Response(JSON.stringify({
+    email: 'fixture@example.com', id: 'fake-user', user_metadata: { username: 'stellar-traveler' }, created_at: '2026-09-03T00:00:00Z',
+  })) })
+  assert.equal(profile?.displayName, 'stellar-traveler')
+  assert.equal(profile?.joinedAt, '2026-09-03T00:00:00Z')
+  const storeHome = mkdtempSync(join(tmpdir(), 'rivet-account-contact-'))
+  try {
+    const store = accountStore(storeHome)
+    const saved = saveAccountToken(store, { status: 'approved', accessToken: 'FAKE' })
+    saveAccountProfile(store, saved, { avatarUrl: null, founding: null, account: profile, fetchedAt: Date.now() })
+    assert.equal(cachedAccountProfile(store.load())?.account?.displayName, 'stellar-traveler')
+  } finally { rmSync(storeHome, { recursive: true, force: true }) }
+})
+
+
+test('device profile survives GoTrue rejecting the custom device session', async () => {
+  const profile = await fetchAccountProfile(jwtWithSub('device-owner'), { fetchImpl: async input => {
+    const url = String(input)
+    if (url.includes('/auth/v1/user')) return new Response('{}', { status: 403 })
+    assert.ok(url.includes('id=eq.device-owner'))
+    return new Response(JSON.stringify([{ id: 'device-owner', display_name: '官网昵称', username: 'stellar', created_at: '2026-09-03T00:00:00Z' }]))
+  } })
+  assert.equal(profile?.displayName, '官网昵称')
+  assert.equal(profile?.username, 'stellar')
+  assert.equal(profile?.userId, 'device-owner')
+  assert.equal(profile?.joinedAt, '2026-09-03T00:00:00Z')
+  assert.equal(profile?.email, null, 'do not fabricate email from the unsigned JWT payload')
+  assert.equal(await fetchAccountProfile(jwtWithSub('device-owner'), { fetchImpl: async input => String(input).includes('/auth/v1/user')
+    ? new Response('{}', {status:403}) : new Response(JSON.stringify([{id:'another-user',display_name:'Wrong user'}])) }), null)
+})
+test('a verified ordinary profile without avatar is distinct from failed synchronization', async () => {
+  const snapshot = await fetchAccountProfileSnapshot(jwtWithSub('me'), { fetchImpl: routedFetch([
+    { match: '/profiles', body: [{ id:'me', avatar_url:null }] },
+    { match: '/user_badges', body: [] },
+    { match: 'get_my_founder_rank', body: {is_founder:false,rank:null,total:1200} },
+  ]) })
+  assert.ok(snapshot)
+  assert.deepEqual(snapshot.unconfirmed, [])
+  assert.equal(snapshot.founding, null)
+})
+test('device refresh uses the website rotation endpoint and rejects incomplete responses', async () => {
+  const rotated = await refreshAccountToken('fake-refresh', { fetchImpl: async (input, init) => {
+    assert.ok(String(input).endsWith('/functions/v1/tui-auth-refresh'))
+    assert.equal((init?.headers as Record<string,string>).Authorization, 'Bearer fake-refresh')
+    return new Response(JSON.stringify({accessToken:'fake-new',refreshToken:'fake-next',expiresIn:3600}))
+  } })
+  assert.equal(rotated?.accessToken, 'fake-new')
+  assert.equal(await refreshAccountToken('fake-refresh', { fetchImpl: async () => new Response(JSON.stringify({accessToken:'incomplete'})) }), null)
+})
+
+test('real cancellation/logout clients send scoped capabilities and expose server failure', async () => {
+ const bodies:unknown[]=[]
+ const fetchImpl = (async (url:unknown, init?:RequestInit) => {
+  assert.match(String(url),/\/functions\/v1\/tui-auth-end$/)
+  assert.ok((init?.headers as Record<string,string>).apikey)
+  bodies.push(JSON.parse(String(init?.body)))
+  return new Response('{}',{status:bodies.length===1?200:503})
+ }) as typeof fetch
+ assert.equal(await cancelDeviceCode('CODE0001',{fetchImpl}),true)
+ assert.equal(await revokeAccountSession('session-fixture',{fetchImpl}),false)
+ assert.deepEqual(bodies,[{deviceCode:'CODE0001'},{accessToken:'session-fixture'}])
 })

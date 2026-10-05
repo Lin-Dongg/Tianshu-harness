@@ -9,7 +9,7 @@ import {
   type WorkOrder,
   type WorkerResult,
 } from './work-order.js'
-import { buildWorkerPrompt, buildWorkerRepairPrompt } from './worker-prompts.js'
+import { buildWorkerPrompt } from './worker-prompts.js'
 import {
   applyWriteGateToResult,
   buildWorkerVerifyRepairPrompt,
@@ -194,7 +194,7 @@ export async function runHandsSession(config: HandsSessionConfig): Promise<Hands
     let text = ''
     let apiError: string | undefined
     let turnUsage: Partial<Usage> = {}
-    // 首轮之外的 agent 轮次总账——续跑 / 解析修复 / 闸门修复共用，避免叠乘。
+    // 首轮之外的 agent 轮次总账——执行续跑 / 写闸门修复共用，避免叠乘。
     let extraRuns = 0
     // 预算回馈的实际用量信号：跨轮（首轮/续跑/修复）累计的工具调用数。
     let toolUses = 0
@@ -222,39 +222,9 @@ export async function runHandsSession(config: HandsSessionConfig): Promise<Hands
       result = parseWorkerResult(text, config.order.id)
    } catch (parseError) {
       const message = parseError instanceof Error ? parseError.message : String(parseError)
-      // Retry: send repair prompt and re-parse (mirrors worker-session.ts retry loop)
-      // Terminal default: field-level salvage first (recover parseable findings
-      // from the malformed report), empty blocked only when nothing salvages.
+      // Report repair belongs to worker-session; never re-enter execution here.
       result = salvageWorkerResult(text, config.order.id)
-        ?? buildBlockedWorkerResult(config.order, message, 'json_parse') // default — overwritten on success
-      for (let attempt = 0; attempt < config.maxTurns && attempt < 2; attempt++) {
-        // 总账留一格给写闸门修复，解析修复不许吃光。
-        if (extraRuns >= MAX_HANDS_EXTRA_RUNS - 1) break
-        extraRuns++
-        try {
-          const repairPrompt = buildWorkerRepairPrompt(config.order, text, message)
-          text = await config.runAgent(repairPrompt, {
-            onTextDelta: (delta) => { text += delta },
-            onThinkingDelta: () => {},
-            onToolUse: () => { toolUses++ },
-            onToolResult: () => {},
-            // 修复轮的 usage 是增量（runWorker 返回差值）——覆写会丢掉首轮
-            // 及此前修复轮的账，与续跑轮的 mergeUsage 记法保持一致。
-            onTurnComplete: (usage) => { turnUsage = mergeUsage(turnUsage, usage) ?? turnUsage },
-            onError: (err) => { apiError = err.message },
-            onAbort: () => { apiError = 'aborted' },
-            onApprovalRequired: async () => false,
-         }, wt.path)
-
-          if (apiError) break // API error during repair — fall through to blocked
-
-          result = parseWorkerResult(text, config.order.id)
-          break
-       } catch {
-          // Repair attempt failed — try again
-          continue
-       }
-     }
+        ?? buildBlockedWorkerResult(config.order, message, 'json_parse')
    }
 
     // ── Wave 7: 预算耗尽时在工作树内续跑 ─────────────────────────────────
@@ -333,7 +303,8 @@ export async function runHandsSession(config: HandsSessionConfig): Promise<Hands
         repairCount = 1
         extraRuns++
         try {
-          const repairText = await config.runAgent(buildWorkerVerifyRepairPrompt(config.order, report), {
+          const objective = buildWorkerVerifyRepairPrompt(config.order, report)
+          const repairText = await config.runAgent(objective, {
             onTextDelta: () => {},
             onThinkingDelta: () => {},
             onToolUse: () => { toolUses++ },
@@ -342,7 +313,7 @@ export async function runHandsSession(config: HandsSessionConfig): Promise<Hands
             onError: (err) => { apiError = err.message },
             onAbort: () => { apiError = 'aborted' },
             onApprovalRequired: async () => false,
-          }, wt.path)
+          }, wt.path, { objective, continueSession: true })
           if (!apiError) {
             result = parseWorkerResult(repairText, config.order.id)
             report = await evaluate({ cwd: wt.path, result })

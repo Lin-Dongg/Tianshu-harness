@@ -27,7 +27,7 @@
     "url": "https://github.com/huiliyi37/Tianshu-Tui"
   },
   "engines": {
-    "vscode": "^1.85.0"
+    "vscode": "^1.140.0"
   },
   "categories": [
     "AI",
@@ -267,6 +267,7 @@
   "dependencies": {
     "dompurify": "^3.4.12",
     "highlight.js": "^11.11.1",
-    "marked": "^18.0.7"
+    "marked": "^18.0.7",
+    "undici": "^8.3.0"
   }
 }

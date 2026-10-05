@@ -281,8 +281,8 @@ export class ToolExecutionController {
       onPlanSteps: this.deps.onPlanSteps,
       onAcceptance: this.deps.onAcceptance,
       onPlanClosed: this.deps.onPlanClosed,
-      onPlanSubmitted: this.deps.onPlanSubmitted,
-      onAskUserQuestion: this.deps.onAskUserQuestion,
+      onPlanSubmitted: info => { if (!state.abortSignal.aborted) this.deps.onPlanSubmitted?.(info) },
+      onAskUserQuestion: info => { if (!state.abortSignal.aborted) this.deps.onAskUserQuestion?.(info) },
       visionAsk: this.deps.visionAsk,
       assessDelivery: this.deps.assessDelivery,
       enterPlanMode: this.deps.enterPlanMode,
@@ -336,6 +336,7 @@ export class ToolExecutionController {
         }
       : input.callbacks
     const toolResults: ContentBlock[] = []
+    const structuredResults = new Set<string>()
     let checkpointCreatedThisTurn = input.checkpointCreatedThisTurn
     let traceStore = input.traceStore
     let importGraph = input.importGraph
@@ -402,6 +403,7 @@ export class ToolExecutionController {
           if (result.endTurn) endTurn = true
           if (result.images) pendingImages.push(...result.images)
           if (result.errorKind && result.toolResult.type === 'tool_result') errorKindByToolUse.set(result.toolResult.tool_use_id, result.errorKind)
+          if (result.presentation?.kind === 'worker_packet' && result.toolResult.type === 'tool_result') structuredResults.add(result.toolResult.tool_use_id)
           toolResults.push(result.toolResult)
         }
       } else {
@@ -438,6 +440,7 @@ export class ToolExecutionController {
         if (result.endTurn) endTurn = true
         if (result.images) pendingImages.push(...result.images)
         if (result.errorKind && result.toolResult.type === 'tool_result') errorKindByToolUse.set(result.toolResult.tool_use_id, result.errorKind)
+        if (result.presentation?.kind === 'worker_packet' && result.toolResult.type === 'tool_result') structuredResults.add(result.toolResult.tool_use_id)
         toolResults.push(result.toolResult)
       }
     }
@@ -447,7 +450,7 @@ export class ToolExecutionController {
       .map((r, i) => r.type === 'tool_result'
         ? { toolUseId: r.tool_use_id, content: typeof r.content === 'string' ? r.content : '', toolName: input.toolUses[i]?.name ?? '' }
         : null)
-      .filter((e): e is NonNullable<typeof e> => e !== null)
+      .filter((e): e is NonNullable<typeof e> => e !== null && !structuredResults.has(e.toolUseId))
     const toolTypeBudgeted = enforceToolTypeBudgets(budgetEntries, this.deps.config.contextWindow)
     for (const entry of toolTypeBudgeted) {
       const idx = toolResults.findIndex(r => r.type === 'tool_result' && r.tool_use_id === entry.toolUseId)
@@ -520,7 +523,7 @@ export class ToolExecutionController {
           const idx = toolResults.findIndex(r => r.type === 'tool_result' && r.tool_use_id === collapsedId)
           if (idx >= 0) {
             const orig = toolResults[idx]!
-            if (orig.type === 'tool_result') {
+            if (orig.type === 'tool_result' && !structuredResults.has(orig.tool_use_id)) {
               toolResults[idx] = { type: 'tool_result', tool_use_id: orig.tool_use_id, content: collapse.summary }
             }
           }
@@ -553,7 +556,7 @@ export class ToolExecutionController {
     if (ctxWin >= 500_000) {
       for (let i = 0; i < toolResults.length; i++) {
         const tr = toolResults[i]!
-        if (tr.type !== 'tool_result') continue
+        if (tr.type !== 'tool_result' || structuredResults.has(tr.tool_use_id)) continue
         const tu = input.toolUses[i]
         const toolName = tu?.name ?? 'unknown'
         const content = typeof tr.content === 'string' ? tr.content : ''

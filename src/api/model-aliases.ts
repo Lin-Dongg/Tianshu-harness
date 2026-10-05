@@ -40,7 +40,12 @@ export interface ModelAliasEntry {
 const MODEL_SYNONYMS: Record<string, string> = {
   'v4-flash': 'deepseek-v4-flash',
   'v4-pro': 'deepseek-v4-pro',
+  // 官方 DeepSeek-V4.1-Flash 的实际模型名是 deepseek-flash。短名给手输与
+  // 旧文档里的「4.1 Flash」写法；deepseek-v4-flash 仍是中转/方舟上的独立 id，
+  // 不在这里改指向。
   'v4.1-flash': 'deepseek-flash',
+  '4.1-flash': 'deepseek-flash',
+  'deepseek-4.1-flash': 'deepseek-flash',
   'glm': 'glm-5.2',
   'glm-53': 'glm-5.3',
   'glm-53-flash': 'glm-5.3-flash',

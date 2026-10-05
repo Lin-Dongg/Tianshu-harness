@@ -18,6 +18,9 @@ const NON_IDEMPOTENT_TOOLS = new Set([
   'edit_file',
   'undo',
   'rollback',
+  // commit=true 有 git 提交副作用（issue #356）：门禁拒绝重试必然复现，
+  // 且重试会重新进入 commit。工具级保守：连同 commit=false 只读查询一并禁自动重试。
+  'deliver_task',
 ])
 
 function isMcpWriteTool(toolName: string): boolean {

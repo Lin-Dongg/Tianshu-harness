@@ -348,7 +348,14 @@ describe('runWorkerSession repair ladder (full path)', () => {
     // 修复梯专用用例——钉旧契约（无收尾轮），否则终型轮先把报告救回、
     // repairAttempts 恒为 0。
     const run = await runWorkerSession(makeWorkerConfig({ client, finalizeReport: false }))
-    assert.equal(run.result.status, 'passed', 'repair round must recover the report')
+    // e3819d6dc：修复轮产出经 degradeRepairedReport 降级——残片修复的报告只算
+    // 未验证线索，不得冒充 passed。修复梯的验收点因此是「确实触发 + 字段保真 +
+    // 降级留痕」，而不是 status==='passed'。
+    assert.equal(run.result.status, 'blocked', '修复轮产出必须降级，不得冒充 passed')
+    assert.equal(run.result.evidenceStatus, 'unverified', '降级后证据状态必须是 unverified')
+    assert.ok(run.result.risks.some(r => r.includes('残片修复')), '降级必须留痕（不得静默）')
+    assert.equal(run.result.summary, 'repaired report', '字段保真：修复轮的完整报告必须原样解析')
+    assert.ok(run.transcript.repairAttempts >= 1, 'repair loop must have fired')
     assert.equal(run.result.summary, 'repaired report')
     assert.ok(run.transcript.repairAttempts >= 1, 'repair loop must have fired')
   })

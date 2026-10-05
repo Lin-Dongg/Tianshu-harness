@@ -1,4 +1,5 @@
 import { spawnGit } from './spawn-git.js'
+import { repositoryCapability, NonRepositoryError } from '../agent/repository-capability.js'
 import { readFile as fsReadFile, stat as fsStat } from 'node:fs/promises'
 import { isAbsolute, resolve } from 'node:path'
 import type { Tool, ToolCallParams } from './types.js'
@@ -190,7 +191,8 @@ async function createSafetyRef(cwd: string, abortSignal?: AbortSignal): Promise<
 
 /** Run `git log --graph --all --oneline --decorate` for the desktop Git graph view. */
 export async function getGitGraph(cwd: string, maxCount = 200): Promise<string> {
-  const count = Math.max(1, Math.min(maxCount, 500))
+  if (await repositoryCapability(cwd) === 'non_repository') throw new NonRepositoryError()
+  const count = Number.isFinite(maxCount) ? Math.max(1, Math.min(Math.floor(maxCount), 500)) : 200
   return runGit(
     ['log', `--max-count=${count}`, '--graph', '--all', '--oneline', '--decorate', '--branches', '--remotes'],
     cwd,

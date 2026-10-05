@@ -547,3 +547,17 @@ test('flushAllAsync 同款时序：撞上运行中的链、链耗尽停链后补
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+
+test('full tool output survives a new persistence instance and isolates session paths', () => {
+  const dir = tmp()
+  try {
+    const persistence = new FileSessionPersistence(dir)
+    const output = 'full line\n'.repeat(50000)
+    persistence.saveToolOutput('one', 'output-one', output)
+    const restarted = new FileSessionPersistence(dir)
+    assert.equal(restarted.readToolOutput('one', 'output-one'), output)
+    assert.equal(restarted.readToolOutput('two', 'output-one'), undefined)
+    assert.equal(restarted.readToolOutput('one', '../output-one'), undefined)
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})

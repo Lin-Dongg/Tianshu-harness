@@ -301,7 +301,7 @@ describe('coordinator delegate 全链路（completed-aborted）', () => {
         parentTurnId: 'turn-1',
         objective: 'Translate the README navigation and content into Japanese, writing the complete README.ja.md shard',
         kind: 'patch_proposal',
-        profile: 'code_scout',
+        profile: 'patcher',
         scope: { files: ['README.ja.md'] },
       })
       const result = run.results[0]!
@@ -322,7 +322,7 @@ describe('coordinator delegate 全链路（completed-aborted）', () => {
         parentTurnId: 'turn-1',
         objective: 'Translate the README navigation and content into Japanese, writing the complete README.ja.md shard',
         kind: 'patch_proposal',
-        profile: 'code_scout',
+        profile: 'patcher',
         scope: { files: ['README.ja.md'] },
       })
       const result = run.results[0]!
@@ -366,14 +366,14 @@ describe('coordinator delegate 全链路（completed-aborted）', () => {
           parentTurnId: 'wave:T3',
           objective: 'Insert ja/ko language navigation links into the README.md header block and verify with git diff',
           kind: 'patch_proposal',
-          profile: 'code_scout',
+          profile: 'patcher',
           scope: { files: ['README.md'] },
         },
         {
           parentTurnId: 'wave:T4',
           objective: 'Translate the README navigation and content into Japanese, writing the complete README.ja.md shard',
           kind: 'patch_proposal',
-          profile: 'code_scout',
+          profile: 'patcher',
           scope: { files: ['README.ja.md'] },
         },
       ], 'all_required')

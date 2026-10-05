@@ -19,12 +19,12 @@ function result(overrides: Partial<WorkerResult>): WorkerResult {
   }
 }
 
-function transcript(toolUses: string[], errors: string[] = [], bashCommands?: string[], failedBashCommands?: string[], mutatedFiles?: string[]): WorkerTranscript {
+function transcript(toolUses: string[], errors: string[] = [], bashCommands?: string[], failedBashCommands?: string[], mutatedFiles?: string[], toolResults: string[] = []): WorkerTranscript {
   return {
     text: '',
     thinking: '',
     toolUses,
-    toolResults: [],
+    toolResults,
     errors,
     repairAttempts: 0,
     bashCommands,
@@ -237,7 +237,7 @@ test('adversarial_verifier downgrades verified when run_tests errored', () => {
   }), 'adversarial_verifier', transcript(['read_file', 'run_tests'], ['run_tests: Test run failed']))
 
   assert.equal(checked.status, 'passed')
-  assert.equal(checked.evidenceStatus, 'unverified')
+  assert.equal(checked.evidenceStatus, 'failed')
   assert.ok(checked.risks.some(r => r.includes('errored')))
 })
 
@@ -292,7 +292,7 @@ test('failed verify-shaped bash is not verification proof — verified downgrade
     verification: { command: 'npm test', status: 'passed', exitCode: 0, passed: 10, failed: 0, skipped: 0, scope: 'targeted', durationMs: 1200 },
   }), 'implementer', transcript(['bash'], ['npm test failed: 2 failing'], ['npm test'], ['npm test']))
 
-  assert.equal(checked.evidenceStatus, 'unverified')
+  assert.equal(checked.evidenceStatus, 'failed')
   assert.ok(checked.risks.some(r => r.includes('errored')))
 })
 
@@ -440,4 +440,79 @@ test('reconcile: 幂等——重复调用结果不变', () => {
   const once = reconcileCapturedWorkerFacts(r, t)
   const twice = reconcileCapturedWorkerFacts(once, t)
   assert.deepEqual(twice, once)
+})
+
+// ── 修复③：run_tests 失败证据（ENOENT / 失败计数 / 非零退出码）不得被补记 passed ──
+// 背景：dotnet 项目被误判 Python 后 run_tests 直 spawn pytest ENOENT，结果文本
+// 进 transcript.errors（worker-session.ts:422-423），但旧判据只认 'run_tests'
+// 字样 → 系统给 blocked 工单补 verification.status='passed'，台账自相矛盾。
+
+test('reconcile: run_tests spawn ENOENT（errors 文本）→ 不补 passed', () => {
+  const checked = reconcileCapturedWorkerFacts(result({
+    status: 'blocked',
+    evidenceStatus: 'blocked',
+  }), transcript(['run_tests'], ['spawn pytest ENOENT']))
+
+  assert.equal(checked.verification, undefined)
+  assert.equal(checked.status, 'blocked')
+})
+
+test('reconcile: run_tests spawn ENOENT（toolResults 文本）→ 不补 passed', () => {
+  const checked = reconcileCapturedWorkerFacts(result({}), transcript(
+    ['run_tests'], [], [], [], [], ['spawn pytest ENOENT'],
+  ))
+
+  assert.equal(checked.verification, undefined)
+})
+
+test('reconcile: run_tests 失败计数 > 0 → 不补 passed', () => {
+  const checked = reconcileCapturedWorkerFacts(result({}), transcript(
+    ['run_tests'], ['退出码：1\n3 通过，2 失败，0 跳过'],
+  ))
+
+  assert.equal(checked.verification, undefined)
+})
+
+test('reconcile: run_tests 非零退出码 → 不补 passed', () => {
+  const checked = reconcileCapturedWorkerFacts(result({}), transcript(
+    ['run_tests'], ['退出码：1\n[运行器输出尾部]\nError: Cannot find module'],
+  ))
+
+  assert.equal(checked.verification, undefined)
+})
+
+test('reconcile: run_tests 正常输出（0 失败 / 退出码 0）→ 仍补 passed（不误杀）', () => {
+  const checked = reconcileCapturedWorkerFacts(result({}), transcript(
+    ['run_tests'], ['退出码：0\n5 通过，0 失败，0 跳过'],
+  ))
+
+  assert.deepEqual(checked.verification, { command: 'run_tests', status: 'passed', scope: 'targeted' })
+})
+
+test('reconcile: toolResults 只有工具名（真实固件形状）→ 仍补 passed（不误判）', () => {
+  const checked = reconcileCapturedWorkerFacts(result({}), transcript(
+    ['edit_file', 'run_tests'], [], [], [], [], ['edit_file', 'run_tests'],
+  ))
+
+  assert.deepEqual(checked.verification, { command: 'run_tests', status: 'passed', scope: 'targeted' })
+})
+
+test('reconcile: run_tests errored 却自报 passed → 改 failed + risk', () => {
+  const checked = reconcileCapturedWorkerFacts(result({
+    verification: { command: 'run_tests', status: 'passed', scope: 'targeted' },
+  }), transcript(['run_tests'], ['spawn pytest ENOENT']))
+
+  assert.equal(checked.verification?.status, 'failed')
+  assert.ok(checked.risks.some(r => r.includes('自报 passed 不可信')))
+})
+
+test('unsupported verification passed is removed locally and qualification is idempotent', () => {
+  const original = result({ status: 'passed', summary: '所有测试通过', evidenceStatus: 'verified', verification: { command: 'npm test', status: 'passed', scope: 'targeted' } })
+  const captured = transcript(['read_file'])
+  const first = verifyWorkerEvidence(original, 'code_scout', captured)
+  assert.equal(first.status, 'passed')
+  assert.equal(first.verification?.status, 'blocked')
+  assert.equal(first.evidenceStatus, 'unverified')
+  assert.match(first.summary, /未经执行验证/)
+  assert.deepEqual(verifyWorkerEvidence(first, 'code_scout', captured), first)
 })

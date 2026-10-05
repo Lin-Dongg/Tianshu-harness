@@ -12,7 +12,7 @@ import { describe, it, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync } from 'node:fs'
 import { join } from 'node:path'
-import { DelegationCoordinator, SUMMARY_MIN_LENGTH } from '../coordinator.js'
+import { DelegationCoordinator } from '../coordinator.js'
 import { PromptEngine } from '../../prompt/engine.js'
 import { ToolRegistry } from '../../tools/registry.js'
 import { READ_ONLY_WORKER_TOOLS, type WorkerResult } from '../work-order.js'
@@ -74,7 +74,7 @@ function makeResult(orderId: string, status: 'passed' | 'blocked' | 'failed', su
   }
 }
 
-describe('summary quality auto-expansion', () => {
+describe('short summaries are delivered without re-entry', () => {
   let homeDir: string
   let savedHome: string | undefined
 
@@ -128,7 +128,7 @@ describe('summary quality auto-expansion', () => {
     assert.equal(run.results[0]!.summary, LONG_SUMMARY)
   })
 
-  it('triggers expansion when summary < 200 chars and result is passed', async () => {
+  it('does not expand a short passed report', async () => {
     let callCount = 0
     const EXPANDED_SUMMARY = 'This is an expanded summary that provides much more detail about what the worker accomplished during the investigation. The worker traced the authentication flow, identified three key modules involved, and documented the data flow between them. No files were modified but several risks were identified for future work to address.'
 
@@ -170,8 +170,8 @@ describe('summary quality auto-expansion', () => {
       scope: { files: ['a.ts', 'b.ts'] },
     })
 
-    assert.ok(callCount >= 2, `runWorker should be called at least twice (initial + expansion), got ${callCount}`)
-    assert.equal(run.results[0]!.summary, EXPANDED_SUMMARY, 'should use expanded summary')
+    assert.equal(callCount, 1, 'a short valid summary must not re-enter the worker')
+    assert.equal(run.results[0]!.summary, SHORT_SUMMARY, 'preserve the original observation')
   })
 
   it('does NOT expand blocked results', async () => {
@@ -252,7 +252,7 @@ describe('summary quality auto-expansion', () => {
       scope: { files: ['a.ts', 'b.ts'] },
     })
 
-    assert.ok(callCount >= 2, 'expansion should have been attempted')
+    assert.equal(callCount, 1, 'no wording re-entry')
     assert.equal(run.results[0]!.summary, SHORT_SUMMARY, 'should keep the original when expansion is shorter')
   })
 
@@ -296,7 +296,7 @@ describe('summary quality auto-expansion', () => {
       scope: { files: ['a.ts', 'b.ts'] },
     })
 
-    assert.ok(callCount >= 2, 'expansion should have been attempted')
+    assert.equal(callCount, 1, 'no wording re-entry')
     assert.equal(run.results[0]!.status, 'passed', 'failed expansion must not flip a passed result')
     assert.equal(run.results[0]!.summary, SHORT_SUMMARY, 'should keep the original passed summary')
   })

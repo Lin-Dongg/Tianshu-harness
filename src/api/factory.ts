@@ -2,6 +2,7 @@ import { OpenAIClient } from './openai-client.js'
 import { CodexClient } from './codex-client.js'
 import { AnthropicClient } from './anthropic-client.js'
 import { ResponsesClient } from './responses-client.js'
+import { GeminiClient } from './gemini-client.js'
 import { proRegistry } from './pro-registry.js'
 import type { StreamClient } from './stream-client.js'
 import type { ProviderCapabilities } from './provider.js'
@@ -138,6 +139,7 @@ export function createProviderClient(
   // Codex OAuth uses the Responses API, not chat/completions
   if (provider.name === 'codex' && provider.auth?.type === 'oauth') {
     return new CodexClient({
+      sessionId: params.sessionId, providerName: provider.name,
     retryBudget: params.retryBudget,
       baseUrl: provider.baseUrl,
       model: params.model,
@@ -153,6 +155,7 @@ export function createProviderClient(
   // client above; the two converge in a later wave.
   if (provider.protocol === 'openai-responses') {
     return new ResponsesClient({
+      sessionId: params.sessionId,
     retryBudget: params.retryBudget,
       // Same normalization as the OpenAI branch: users paste full request URLs
       // (`…/v1/responses`) or trailing slashes; without stripping, the send path
@@ -217,6 +220,32 @@ export function createProviderClient(
       effortFormat: capabilities.effortFormat,
       effortCap: capabilities.effortCap,
       reasoningEffort: params.reasoningEffort,
+    })
+  }
+
+  // Gemini native protocol — path-carried model id + x-goog-api-key auth, and
+  // a request/response shape that is not reachable through the OpenAI-compatible
+  // path (see gemini-client.ts). Kept last-but-one so the OpenAI fallback below
+  // stays the terminal branch.
+  if (provider.protocol === 'gemini') {
+    return new GeminiClient({
+      retryBudget: params.retryBudget,
+      // No OpenAI-style request-path tail to strip here, but normalizeBaseUrl
+      // also trims trailing slashes users paste along with the console URL.
+      baseUrl: normalizeBaseUrl(provider.baseUrl),
+      apiKey: params.apiKey,
+      model: params.model,
+      maxTokens: params.maxTokens,
+      reasoningEffort: params.reasoningEffort,
+      effortCap: capabilities.effortCap,
+      temperature: provider.temperature,
+      thinking: provider.thinking as 'enabled' | 'disabled' | undefined,
+      firstByteTimeoutMs: provider.firstByteTimeoutMs,
+      requestTimeoutMs: provider.requestTimeoutMs,
+      maxRetries: provider.maxRetries,
+      retry: provider.retry,
+      proxy: provider.proxy,
+      providerName: provider.name,
     })
   }
 

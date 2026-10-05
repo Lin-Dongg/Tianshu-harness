@@ -192,7 +192,7 @@ describe('formatGlanceRight density（Wave 2 减密分档）', () => {
     todoSummary: { total: 5, done: 2, inProgress: 1, current: '修复主题' },
   }
 
-  it('compact 档保留模型 + effort + cache% + 上下文% + 耗时（权限 badge/todo/cost 收起）', () => {
+  it('compact 档保留模型 + effort + cache% + 上下文% + 耗时（权限 badge/todo 收起）', () => {
     const plain = stripAnsi(formatGlanceRight({ ...fullInput, density: 'compact' }, theme))
     assert.ok(!plain.includes('[safe]'), '权限 badge 不再出现在 GlanceBar')
     assert.ok(plain.includes('deepseek-v4'), '模型保留')
@@ -200,7 +200,7 @@ describe('formatGlanceRight density（Wave 2 减密分档）', () => {
     assert.ok(plain.includes('⚡80%'), 'cache 命中率保留')
     assert.ok(plain.includes('◧25%'), `上下文百分比保留: ${plain}`)
     assert.ok(plain.includes('1m5s'), '耗时保留')
-    assert.ok(!plain.includes('¥'), 'cost 收起')
+    assert.ok(plain.includes('¥1.23'), 'cost 保留——常驻指标契约（6dca8b545 恢复常驻指标）')
     assert.ok(plain.includes('≡2/5'), 'todo 徽章（compact 档 ≡done/total）显示')
     assert.ok(!plain.includes('○2'), '分态计数仅 full 档')
     assert.ok(!plain.includes('50k'), 'token 绝对值收起（只留百分比）')

@@ -27,6 +27,9 @@ export interface PostTurnDecisionDeps {
    *  GLM's deep reasoning without tools/text is a legitimate turn output,
    *  not a failed utterance — retrying only wastes time with fresh reasoning. */
   skipThinkingRetry?: boolean
+  maxTurns?: number
+  reserveReasoningRecovery?: () => boolean
+  markReasoningRecovery?: () => void
 }
 
 export type ThinkingRetryResult =
@@ -50,7 +53,7 @@ export class PostTurnDecisionController {
     callbacks: AgentCallbacks
     signal: AbortSignal
   }): Promise<ThinkingRetryResult> {
-    if (this.deps.skipThinkingRetry) return { shouldRetry: false }
+    if (this.deps.skipThinkingRetry || params.signal.aborted || (this.deps.maxTurns !== undefined && params.turn + 1 >= this.deps.maxTurns)) return { shouldRetry: false }
     const result = evaluateThinkingRetry({
       streamedText: this.deps.state.streamedText,
       collectedBlockCount: params.collectedBlockCount,
@@ -61,8 +64,10 @@ export class PostTurnDecisionController {
     this.deps.state.lastThinkingContent = result.nextState.lastThinkingContent
     this.deps.state.thinkingOnlyRetries = result.nextState.thinkingOnlyRetries
     if (result.shouldRetry) {
+      if (this.deps.reserveReasoningRecovery && !this.deps.reserveReasoningRecovery()) return { shouldRetry: false }
       const injected = this.deps.appendSystemReminderAndReport(result.retryMessage, 'functional')
       if (!injected) return { shouldRetry: false }
+      this.deps.markReasoningRecovery?.()
       params.callbacks.onTurnComplete(this.deps.getTotalUsage(), this.deps.getTurnCount(), false)
       return { shouldRetry: true }
     }

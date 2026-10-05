@@ -213,7 +213,9 @@ describe('REPO_MAP_TOOL', () => {
       assert.equal(result.isError, undefined)
       assert.ok(result.content.includes('root.txt'), 'should include root file')
       assert.ok(!result.content.includes('nested.txt'), 'depth 0 should exclude nested files')
-      assert.ok(!result.content.includes('sub'), 'depth 0 should exclude subdirectories')
+      assert.ok(result.content.includes('深度边界'), 'depth 0 should disclose unscanned subdirectories')
+      assert.match(result.content, /[├└]── sub \[深度边界：内容未扫描\]/, 'the actual boundary directory must stay visible')
+      assert.ok(result.content.includes('深度边界：内容未扫描'), 'the tree node must carry the omission label')
     } finally {
       rmSync(d0Dir, { recursive: true, force: true })
     }

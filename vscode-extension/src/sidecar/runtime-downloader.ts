@@ -10,7 +10,7 @@
  * jsDelivr 不承载 Release 资产（且 50MB 上限），不在链路内。
  *
  * 代理：Node 24 内置 fetch（undici）不会自动读 https_proxy。通过
- * EnvHttpProxyAgent 在企业代理环境下自动接入——零外部依赖。
+ * 随扩展打包的 EnvHttpProxyAgent 在企业代理环境下自动接入。
  */
 import * as vscode from 'vscode'
 import { createHash } from 'node:crypto'
@@ -79,6 +79,7 @@ export function rivetOnPath(): Promise<boolean> {
     const probe = spawn(os.platform() === 'win32' ? 'where' : 'which', ['rivet'], {
       stdio: 'ignore',
       shell: os.platform() === 'win32',
+      windowsHide: true,
     })
     probe.on('close', (code) => resolve(code === 0))
     probe.on('error', () => resolve(false))
@@ -124,7 +125,7 @@ function sha256File(path: string): string {
 function untar(archive: string, destDir: string): Promise<void> {
   // macOS / Linux / Windows 10+ 都自带 tar
   return new Promise((resolve, reject) => {
-    const child = spawn('tar', ['-xzf', archive, '-C', destDir], { stdio: 'ignore' })
+    const child = spawn('tar', ['-xzf', archive, '-C', destDir], { stdio: 'ignore', windowsHide: true })
     child.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`tar exit ${code}`))))
     child.on('error', reject)
   })

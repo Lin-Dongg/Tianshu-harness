@@ -3,7 +3,8 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { loadConfig, setupProvider } from '../manager.js'
+import { loadConfig, setupProvider, registerProvider } from '../manager.js'
+import { upsertProviderKeyModel } from '../provider-key-store.js'
 
 /**
  * 2026-09 模型保存语义修复的回归锚：
@@ -182,5 +183,63 @@ describe('model save semantics: id-only, selection-only', () => {
     const key = loadConfig().provider.providers.kimi!.keys![0]!
     assert.equal(key.models.length, 1, `keys 池内同 id 未去重：${key.models.map(m => m.id).join(',')}`)
     assert.equal('alias' in key.models[0]!, false)
+  })
+})
+
+/**
+ * D1：keys 池路径的模型编辑语义——桌面 Settings 表单只发
+ * `{id, contextWindow, maxTokens}`，整对象替换会把支撑生图/计费/档位的字段
+ * 一并抹掉：生图模型从选择器消失、tier 回退到按名猜测、成本归零，且全是静默的。
+ */
+describe('key 池模型编辑：局部更新不抹掉未携带字段（D1）', () => {
+  let dir = ''
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'rivet-key-model-merge-'))
+    process.env.RIVET_CONFIG_PATH = join(dir, 'config.json')
+  })
+
+  afterEach(() => {
+    delete process.env.RIVET_CONFIG_PATH
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('编辑 key 池模型（载荷仅 {id, contextWindow, maxTokens}）后 supportsImageGen/pricing/tier 保留、contextWindow 已更新', () => {
+    registerProvider({
+      providerName: 'relay-key-edit',
+      baseUrl: 'https://relay.example.com/v1',
+      apiKey: 'sk-main',
+      models: [{
+        id: 'img-1',
+        contextWindow: 128_000,
+        maxTokens: 8_192,
+        supportsImageGen: true,
+        pricing: { input: 1, output: 2 },
+        tier: 'strong',
+      }],
+    })
+    upsertProviderKeyModel('relay-key-edit', 'default', { id: 'img-1', contextWindow: 200_000, maxTokens: 16_384 })
+    const model = loadConfig().provider.providers['relay-key-edit']!.keys!
+      .find(k => k.id === 'default')!.models[0]!
+    assert.equal(model.contextWindow, 200_000, 'contextWindow 已更新')
+    assert.equal(model.maxTokens, 16_384, 'maxTokens 已更新')
+    assert.equal(model.supportsImageGen, true, 'supportsImageGen 保留（整对象替换会抹掉它）')
+    assert.deepEqual(model.pricing, { input: 1, output: 2 }, 'pricing 保留')
+    assert.equal(model.tier, 'strong', 'tier 保留')
+  })
+
+  it('显式 supportsVision:false 仍覆盖旧 true（undefined 才代表"无意见"）', () => {
+    registerProvider({
+      providerName: 'relay-key-false',
+      baseUrl: 'https://relay.example.com/v1',
+      apiKey: 'sk-main',
+      models: [{ id: 'v-1', contextWindow: 128_000, maxTokens: 8_192, supportsVision: true }],
+    })
+    upsertProviderKeyModel('relay-key-false', 'default', {
+      id: 'v-1', contextWindow: 128_000, maxTokens: 8_192, supportsVision: false,
+    })
+    const model = loadConfig().provider.providers['relay-key-false']!.keys!
+      .find(k => k.id === 'default')!.models[0]!
+    assert.equal(model.supportsVision, false, '显式 false 必须覆盖旧值——只有 undefined 才被当作无意见')
   })
 })

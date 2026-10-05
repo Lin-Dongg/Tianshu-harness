@@ -1,3 +1,6 @@
+import { createReportClientFactory } from '../../api/report-client.js'
+import { isLocalWorkerPolicyError } from '../../api/continuation-prefix.js'
+import { withWorkspaceRoots } from '../../tools/workspace-context.js'
 /**
  * worker-process child — worker 子进程隔离 v1 的子进程入口（tsup 独立 entry）。
  *
@@ -130,7 +133,11 @@ async function runChild(): Promise<void> {
   ticker.unref?.()
 }
 
-async function bootAndRun(
+function bootAndRun(init: WorkerChildInitPayload, steerQueue: string[], abortController: AbortController): Promise<void> {
+  return withWorkspaceRoots(init.config.workspaceRoots ?? [init.config.cwd], () => bootAndRunInWorkspace(init, steerQueue, abortController))
+}
+
+async function bootAndRunInWorkspace(
   init: WorkerChildInitPayload,
   steerQueue: string[],
   abortController: AbortController,
@@ -243,8 +250,10 @@ async function bootAndRun(
 
     // 5) 组装 WorkerSessionConfig（v1 降级项不注入）并执行。
     const workerConfig: WorkerSessionConfig = {
+      workspaceRoots: cfg.workspaceRoots,
       order: cfg.order,
       client,
+      reportRepairClient: createReportClientFactory(providerForDecision, capabilities, { apiKey, model: decision.model, auth, sessionId: deriveWorkerSessionId(cfg.order.id) }),
       promptEngine,
       toolRegistry: workerRegistry,
       cwd,
@@ -267,6 +276,9 @@ async function bootAndRun(
       onNestedDelegation: activity => writeFrame({ t: 'nested', activity }),
       checkpoint: cfg.checkpoint,
       priorMessages: cfg.priorMessages,
+      priorPrefixProof: cfg.priorPrefixProof,
+      continuationSource: cfg.continuationSource,
+      routeReason: cfg.routeReason,
       priorUsage: cfg.priorUsage,
       sessionNonce: cfg.sessionNonce,
       mailbox: createBridgedMailbox(),
@@ -286,6 +298,7 @@ async function bootAndRun(
         checkpoint: run.checkpoint,
         messages,
         // 冻结快照随结果上行——导出失败不毁结果（下一轮退化为冷启动，与旧行为一致）。
+        prefixProof: run.prefixProof,
         frozenSnapshot: (() => { try { return promptEngine.exportFrozenSnapshot() } catch { return undefined } })(),
         turnCount: messages.length,
       },
@@ -301,7 +314,7 @@ async function bootAndRun(
       run: {
         result: {
           workOrderId: init.config.order.id,
-          status: 'failed',
+          status: isLocalWorkerPolicyError(err) ? 'blocked' : 'failed',
           summary: `worker child crashed: ${err instanceof Error ? err.message : String(err)}`,
           findings: [],
           artifacts: [],
@@ -309,7 +322,7 @@ async function bootAndRun(
           risks: [],
           nextActions: [],
           evidenceStatus: 'skipped',
-          failureReason: 'worker_crash',
+          failureReason: isLocalWorkerPolicyError(err) ? 'policy_short_circuit' : 'worker_crash',
         },
         transcript: { text: '', thinking: '', toolUses: [], toolResults: [], repairAttempts: 0, errors: [String(err)] },
         usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },

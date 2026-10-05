@@ -144,7 +144,10 @@ function toRepoRelative(baseCwd: string, filePath: string): string | null {
     return filePath.startsWith('..') ? null : filePath
   }
   const rel = relative(baseCwd, filePath)
-  if (rel === '' || rel.startsWith('..')) return null
+  // Windows 跨盘时 relative() 返回绝对路径（不以 .. 开头）——同族判据
+  // （worktree-scope.ts 等 20 处 containment 检查）均带 isAbsolute(rel)
+  // fail-closed；此处曾是唯一漏网（审查发现，2026-10-04）。
+  if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) return null
   return rel
 }
 

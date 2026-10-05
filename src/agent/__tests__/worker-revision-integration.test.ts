@@ -106,7 +106,7 @@ function unprovenThenRetractClient(trace: Trace): StreamClient {
 }
 
 describe('证据不达标打回复核（接线）', () => {
-  it('宣称 verified 却无执行痕迹 → 打回一轮，撤回后的报告成为最终结果', async () => {
+  it('宣称 verified 却无执行痕迹 → 本地降级，保留诊断且不重跑', async () => {
     const tmp = mkdtempSync(join(tmpdir(), 'rivet-revision-'))
     const trace: Trace = { userMessages: [] }
     try {
@@ -143,23 +143,11 @@ describe('证据不达标打回复核（接线）', () => {
 
       const result = run.results[0]
       assert.ok(result, '应当有一个 worker 结果')
-      assert.ok(
-        trace.userMessages.some(m => m.includes('没通过证据闸门')),
-        `复核轮应当带着打回的 objective 出场，实际：${JSON.stringify(trace.userMessages.map(m => m.slice(0, 40)))}`,
-      )
-      assert.ok(
-        trace.userMessages.some(m => m.includes('二选一')),
-        '打回 objective 应当给出「复现或撤回」的二选一',
-      )
-      assert.ok(
-        result.risks.some(r => r.includes('evidence-revision')),
-        `复核应在 risks 上留痕，实际：${JSON.stringify(result.risks)}`,
-      )
-      assert.ok(
-        !result.risks.some(r => r.includes('budget-continuation')),
-        '复核不该被记成续跑——主控要能分清是哪一种再跑',
-      )
-      assert.match(result.summary, /撤回/, '复核轮撤回后的报告应当成为最终结果')
+      assert.equal(trace.userMessages.length, 1, 'short/unsupported claims never add a model request')
+      assert.equal(result.status, 'passed', 'completed static diagnosis remains completed')
+      assert.equal(result.evidenceStatus, 'unverified')
+      assert.match(result.summary, /未经执行验证的原始宣称/)
+      assert.ok(result.risks.some(r => r.includes('未经实际执行验证')))
       assert.equal(result.findings.length, 1, '复核不以丢失既有发现为代价')
     } finally {
       // Windows：句柄释放竞态（EPERM）——异步重试等待期间推进事件循环。

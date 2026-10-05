@@ -1,7 +1,10 @@
+import { buildOaiToolDefinitions } from './oai-tool-definitions.js'
+import { wireOaiMessage } from '../api/oai-types.js'
+import { currentWorkspaceRoots } from '../tools/workspace-context.js'
 import { createHash } from 'node:crypto'
 import { assertCompleteAttachments } from '../api/attachment-integrity.js'
 import { FrozenAnchors } from './frozen-anchors.js'
-import type { OaiChatRequest, OaiContentPart, OaiMessage, OaiToolDefinition } from '../api/oai-types.js'
+import type { OaiChatRequest, OaiContentPart, OaiMessage } from '../api/oai-types.js'
 import { pruneOutdatedQueryResults } from '../compact/semantic-prune.js'
 import { collapseToolResult } from '../compact/context-collapse.js'
 import { detectStaleness } from '../compact/staleness-detect.js'
@@ -298,6 +301,7 @@ export class PromptEngine {
   private onResetAppendixBaselineCb?: () => void
 
   constructor(config: PromptEngineConfig) {
+    config = { ...config, volatileCtx: { ...config.volatileCtx, workspaceRoots: config.volatileCtx.workspaceRoots ?? [...currentWorkspaceRoots(config.volatileCtx.cwd)] } }
     this.config = config
     // /cd frozen inheritance — adopt the previous engine's committed snapshot
     // state BEFORE any build, so historical slots resolve to the old bytes.
@@ -458,6 +462,11 @@ export class PromptEngine {
       collapseWatermark: this.collapseWatermark,
       collapseTokenStep: this.collapseTokenStep,
     }
+  }
+
+  /** Worker resume uses the same snapshot inheritance path as startup resume. */
+  withFrozenSnapshot(snapshot: FrozenSnapshotData): PromptEngine {
+    return new PromptEngine({ ...this.config, staticCtx: { ...this.config.staticCtx, tools: [...this.getTools()] }, inheritFrozenFrom: snapshot })
   }
 
   /** 冻结锚点总数（resume 公告「继承 N 个前缀锚点」用）。 */
@@ -795,19 +804,7 @@ export class PromptEngine {
       }
     }
 
-    const tools: OaiToolDefinition[] | undefined = this.config.staticCtx.tools.length > 0
-      ? this.config.staticCtx.tools.map(tool => {
-        const func: OaiToolDefinition['function'] = {
-          name: tool.name,
-          description: tool.description,
-          parameters: tool.input_schema ?? { type: 'object', properties: {} },
-        }
-        if (tool.providerFormat) {
-          func.providerFormat = tool.providerFormat
-        }
-        return { type: 'function' as const, function: func }
-      })
-      : undefined
+    const tools = buildOaiToolDefinitions(this.config.staticCtx.tools)
 
     // On 1M+ windows, skip pruning entirely — same rationale as observation masking:
     // mutating message content breaks DeepSeek exact-prefix cache. trySessionSplit (86%)
@@ -943,7 +940,7 @@ export class PromptEngine {
 
     const request: OaiChatRequest = {
       model: this.config.model,
-      messages: [{ role: 'system', content: this.systemPrompt }, ...result],
+      messages: [{ role: 'system', content: this.systemPrompt }, ...result.map(wireOaiMessage)],
       max_tokens: this.config.maxTokens,
       stream: true,
       stream_options: { include_usage: true },
@@ -1042,6 +1039,8 @@ export class PromptEngine {
   getToolCount(): number {
     return this.config.staticCtx.tools.length
   }
+  /** 当前上线的工具定义（只读）。 */
+  getTools(): readonly ToolDefinition[] { return this.config.staticCtx.tools }
 
   /**
    * 当前 frozen 前缀的分块构成（`/prefix-budget` 与 scripts/prefix-budget.ts 共用口径）。

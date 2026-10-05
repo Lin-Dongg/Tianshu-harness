@@ -307,10 +307,11 @@ test('replay stops writing and uncorks when the peer dies mid-slice', async () =
   const originalWrite = res.write.bind(res)
   const originalUncork = res.uncork.bind(res)
   let writeCalls = 0
+  let writeCallsAtDeath = 0
   let uncorkCalls = 0
   res.write = ((chunk: string) => {
     writeCalls++
-    if (writeCalls === 4) throw new Error('EPIPE')
+    if (chunk.includes('\"seq\":2,')) { writeCallsAtDeath = writeCalls; throw new Error('EPIPE') }
     return originalWrite(chunk)
   }) as typeof res.write
   res.uncork = (() => {
@@ -321,9 +322,9 @@ test('replay stops writing and uncorks when the peer dies mid-slice', async () =
   const handler = routes['GET /sessions/:id/stream']!
   await handler({}, { id, since: '0' }, AUTH, res)
 
-  assert.equal(writeCalls, 4, 'closed replay must stop attempting writes')
+  assert.ok(writeCallsAtDeath > 0, 'peer dies on the second replay event')
+  assert.equal(writeCalls, writeCallsAtDeath, 'closed replay must stop attempting writes')
   assert.equal(uncorkCalls, 1, 'the interrupted slice must still be uncorked')
-  // 第 1 次 write 是 replay_window 元事件，第 2 次是 job_snapshot 建连快照
-  // （同为 seq=0 合成事件），第 3 次是 seq 1，第 4 次抛 EPIPE。
+  // Synthetic control frames must not determine where the peer dies.
   assert.deepEqual(parseSeqs(writes), [1])
 })

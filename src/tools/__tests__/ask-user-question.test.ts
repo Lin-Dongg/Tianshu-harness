@@ -3,6 +3,8 @@ import assert from 'node:assert/strict'
 import { ASK_USER_QUESTION_TOOL, parseAskUserQuestions, renderAskUserQuestionText } from '../ask-user-question.js'
 import type { ToolCallParams, AskUserQuestionInfo } from '../types.js'
 
+function choices(...labels: string[]) { return labels.map((label, i) => ({ label, ...(i === 0 ? { recommended: true, recommendation_reason: '符合本次需求，取舍已核实' } : {}) })) }
+
 function params(input: Record<string, unknown>): ToolCallParams {
   return { input, cwd: process.cwd() } as unknown as ToolCallParams
 }
@@ -17,7 +19,7 @@ describe('ASK_USER_QUESTION_TOOL', () => {
   it('renders structured options as a numbered list in uiContent', async () => {
     const result = await ASK_USER_QUESTION_TOOL.execute(params({
       question: 'Which database?',
-      options: ['Postgres', 'SQLite', 'MySQL'],
+      options: choices('Postgres', 'SQLite', 'MySQL'),
     }))
     // With options, the model must see the SAME numbering the user sees — a
     // bare "1" reply is otherwise ambiguous to the model.
@@ -35,7 +37,7 @@ describe('ASK_USER_QUESTION_TOOL', () => {
   it('adds a multi-select hint when allow_multiple is true', async () => {
     const result = await ASK_USER_QUESTION_TOOL.execute(params({
       question: 'Which features?',
-      options: ['Auth', 'Billing'],
+      options: choices('Auth', 'Billing'),
       allow_multiple: true,
     }))
     assert.ok(result.uiContent!.includes('pick more than one'))
@@ -67,8 +69,8 @@ describe('ASK_USER_QUESTION_TOOL', () => {
   it('renders the multi-question form with per-question numbering', async () => {
     const result = await ASK_USER_QUESTION_TOOL.execute(params({
       questions: [
-        { prompt: 'Enter plan mode?', options: ['Yes', 'No'] },
-        { prompt: 'Which scope?', options: ['Frontend', 'Backend'], allow_multiple: true },
+        { prompt: 'Enter plan mode?', options: choices('Yes', 'No') },
+        { prompt: 'Which scope?', options: choices('Frontend', 'Backend'), allow_multiple: true },
       ],
     }))
     assert.ok(result.content.startsWith('[等待你的回复…]'))
@@ -82,7 +84,7 @@ describe('ASK_USER_QUESTION_TOOL', () => {
   it('calls onAskUserQuestion callback for single-select options', async () => {
     let called: AskUserQuestionInfo | null = null
     await ASK_USER_QUESTION_TOOL.execute({
-      input: { question: 'Which provider?', options: ['OpenAI', 'Anthropic'] },
+      input: { question: 'Which provider?', options: choices('OpenAI', 'Anthropic') },
       cwd: process.cwd(),
       toolUseId: 'test',
       onAskUserQuestion: (info: AskUserQuestionInfo) => { called = info },
@@ -97,7 +99,7 @@ describe('ASK_USER_QUESTION_TOOL', () => {
   it('calls onAskUserQuestion for multi-select options (so TUI can render a picker)', async () => {
     let called = false
     await ASK_USER_QUESTION_TOOL.execute({
-      input: { question: 'Which features?', options: ['Auth', 'Billing'], allow_multiple: true },
+      input: { question: 'Which features?', options: choices('Auth', 'Billing'), allow_multiple: true },
       cwd: process.cwd(),
       toolUseId: 'test',
       onAskUserQuestion: () => { called = true },
@@ -105,7 +107,7 @@ describe('ASK_USER_QUESTION_TOOL', () => {
     assert.equal(called, true)
   })
 
-  it('does not call onAskUserQuestion for open-ended questions', async () => {
+  it('calls onAskUserQuestion for open-ended questions', async () => {
     let called = false
     await ASK_USER_QUESTION_TOOL.execute({
       input: { question: 'Open ended?' },
@@ -113,7 +115,7 @@ describe('ASK_USER_QUESTION_TOOL', () => {
       toolUseId: 'test',
       onAskUserQuestion: () => { called = true },
     } as unknown as ToolCallParams)
-    assert.equal(called, false)
+    assert.equal(called, true)
   })
 })
 

@@ -1,3 +1,4 @@
+import { fitWorkerPacket } from './worker-packet-budget.js'
 import { type WorkOrder, type WorkerResult, type WorkerProfile } from './work-order.js'
 
 /** Tools that mutate the workspace. A worker is "write-capable" iff its allowlist
@@ -199,10 +200,7 @@ export interface WorkerPromptOptions {
   /** B3: 项目根 cwd（非 worktree），用于读 .rivet/generals/ 将星账本。
    *  提供且 order.authority 有账本时，权域指令后附「将星战绩」top-3 段。 */
   ledgerCwd?: string
-  /** B（终轮定型）：报告契约。'inline-json'（默认）要求 worker 探索循环自产
-   *  结果 JSON（hands-session 等旧路径不变）；'finalized' 时契约（结果卡
-   *  shape + 转义纪律）移至系统收尾轮（buildFinalizationInstruction），
-   *  主提示词不再携带——探索轮只需把活干完，报告是系统的事。 */
+  /** Legacy inline JSON contract or submit_result from the first turn. */
   reportContract?: 'inline-json' | 'finalized'
 }
 
@@ -317,12 +315,10 @@ export function buildWorkerPrompt(order: WorkOrder, _authoritySuffix?: string, o
   )
   parts.push(
     '执行纪律（全星域共享）：绿非证明，复现即证——宣称已修/已验证前，先用工具复现结论（run_tests 或验证命令）；summary 里的每个数字要能指到一条真实验证记录，否则宣称会被证据门降级。',
-    // B（终轮定型）：finalized 契约下报告由系统收尾轮统一索取，主提示词
-    // 不再携带 shape/转义段——探索轮只需把活干完、把发现收束成散文。
-    // inline-json（默认，hands-session 等旧路径）契约原样保留。
+    // Execution and soft landing use the same submission channel.
     ...(reportContract === 'finalized'
       ? [
-          '任务完成后无需自己输出报告 JSON——系统会在收尾时基于完整会话记录单独索取结构化报告，收尾前用散文把发现与改动讲清楚即可。',
+          '任务完成时立即调用 submit_result 提交 WorkerResult，工具从首轮起可用。不要用散文替代报告或等待系统索取报告；只写实际捕获的事实。',
           hasWriteTools
             ? '验证执行与改动文件以系统捕获的工具调用为准——没跑验证不要宣称 verified。'
             : '发现必须来自你实际读到的文件与跑过的命令——没读到、没跑过的内容不要写。',
@@ -361,25 +357,14 @@ export function buildWorkerPrompt(order: WorkOrder, _authoritySuffix?: string, o
   return parts.join('\n')
 }
 
-/** B（终轮定型）收尾指令——带完整会话历史的无工具收尾轮上唯一的新消息。
- *
- * 正常路径引导唯一 submit_result 工具提交结果（不诱导散文 JSON）；结果卡
- * shape + 转义纪律保留在无工具 fallback 段（本会话没有 submit_result 工具时
- * 才输出 JSON 对象）。与修复轮（buildWorkerRepairPrompt）的本质区别：
- * 修复轮是无历史单发——2026-07-24 假 summary 事故中模型凭空编造
- * "No work order context provided" 且解析通过；收尾轮的消息前缀是 worker
- * 自己的完整探索历史，只能基于实际发生的工具调用与结果写报告。 */
-export function buildFinalizationInstruction(order: WorkOrder, hasWriteTools: boolean): string {
-  const resultShape = hasWriteTools ? buildWriteResultShape() : buildReadOnlyResultShape()
+/** 收尾只向最后一次主请求追加提交指令，保持 system、历史与工具表稳定。
+ * 报告仍走 submit_result；独立 JSON 修复通道仅消费捕获事实及可恢复字段。 */
+export function buildFinalizationInstruction(order: WorkOrder, _hasWriteTools: boolean): string {
   return [
     '探索已结束。只基于上方对话中实际发生的工具调用及其结果，为这个工单产出 WorkerResult 报告。',
     '如实总结，不得编造：只写你实际做过的事——不得宣称跑过未执行的验证、读过未读的文件、改过未改的文件；没跑验证就标 evidenceStatus: "unverified"，summary 里的每个数字都要能指到一条真实的工具记录。',
-    '调用唯一 submit_result 工具提交最终结果——把 WorkerResult 作为该工具的参数传入，工具调用完成即交付完成；不要在工具外再输出散文 JSON、不要 ``` 围栏、不要 markdown。',
+    '调用 submit_result 工具提交最终结果——把 WorkerResult 作为该工具的参数传入，工具调用完成即交付完成；只调用这一次，不要再调用其他工具，不要在工具外再输出散文 JSON、不要 ``` 围栏、不要 markdown。',
     `工单 ID（原样复制）：${order.id}`,
-    '【无工具 fallback】若你无法调用 submit_result 工具（本会话没有该工具），才改为输出一个 JSON 对象：',
-    'JSON 对象必须匹配以下结构：',
-    resultShape,
-    JSON_STRING_DISCIPLINE,
   ].join('\n')
 }
 
@@ -454,9 +439,6 @@ export function buildWorkerRepairPrompt(order: WorkOrder, previousText: string, 
  *  but prevents a single delegate_task from consuming 50K+ tokens. */
 const MAX_WORKER_PACKET_CHARS = 32_000
 
-/** Maximum characters for a single non-diff artifact content field. */
-const MAX_ARTIFACT_CONTENT_CHARS = 2_000
-
 const WORKER_RESULTS_HINT = `<worker_results_hint>
 以下 worker 返回来自只读扫描或子代理摘要。除非某个 result 的 verification.status 为 "passed"，否则这些发现属于“待核验假设”，不是已验证事实。引用到具体文件前，请用 read_file/grep 独立确认。
 </worker_results_hint>`
@@ -486,7 +468,7 @@ function buildFailureNotice(results: readonly WorkerResult[]): string {
     const guidance = reason ? (FAILURE_GUIDANCE[reason] ?? reason) : '无 failureReason，读 summary 判断'
     return `- ${r.workOrderId}（${r.status}${reason ? `/${reason}` : ''}）：${guidance}`
   })
-  const resumable = failed.some(r => r.nextActions?.some(a => a.startsWith(RESUME_HINT_PREFIX)))
+  const resumable = failed.some(r => r.nextActions?.some(a => a.startsWith('Resumable:')))
   return [
     '<worker_dispatch_incomplete>',
     `本次派发有 ${failed.length}/${results.length} 个 worker 没有完成。它们的 findings 只是半程产出，不足以当作交付依据——不要在汇报里把它们说成"已完成"。`,
@@ -500,35 +482,11 @@ function buildFailureNotice(results: readonly WorkerResult[]): string {
 }
 
 function wrapWorkerResults(body: string, results: readonly WorkerResult[] = []): string {
-  const notice = buildFailureNotice(results)
+  const fullNotice = buildFailureNotice(results)
+  const notice = fullNotice.length <= 8000 ? fullNotice : '<worker_dispatch_incomplete>存在未完成工单，逐笔状态与原因见完整结果及覆盖清单，不得宣布全部完成。</worker_dispatch_incomplete>'
   return notice ? `${WORKER_RESULTS_HINT}\n${notice}\n${body}` : `${WORKER_RESULTS_HINT}\n${body}`
 }
 
-/** 超预算裁字段时，`nextActions` 里那条续跑指引不能跟着一起没。
- *  它由 `captureAbortCheckpoint` 写入，是主控知道「这活能接着干」的唯一线索——
- *  而 packet 超预算恰恰发生在派了一批 worker 的时候，正是最需要续跑的场景。 */
-const RESUME_HINT_PREFIX = 'Resumable:'
-
-function dropNextActionsKeepingResumeHints(result: Record<string, unknown>): void {
-  const actions = result.nextActions
-  const resumable = Array.isArray(actions)
-    ? actions.filter((a): a is string => typeof a === 'string' && a.startsWith(RESUME_HINT_PREFIX))
-    : []
-  if (resumable.length > 0) result.nextActions = resumable
-  else delete result.nextActions
-}
-
-/** Mark a compact result as truncated and downgrade any verified claim,
- *  because the metadata backing that claim may have been omitted. */
-function markTruncated(result: Record<string, unknown>): void {
-  result._truncated = true
-  result._truncationNote = '内联 packet 已截断；支撑该论断的验证元数据可能已被省略。'
-  if (result.evidenceStatus === 'verified') {
-    result.evidenceStatus = 'unverified'
-  }
-}
-
-/** Strip empty arrays/strings/undefined from an object to reduce JSON size. */
 function stripEmpty<T extends Record<string, unknown>>(obj: T): Partial<T> {
   const result: Record<string, unknown> = {}
   for (const [k, v] of Object.entries(obj)) {
@@ -538,16 +496,6 @@ function stripEmpty<T extends Record<string, unknown>>(obj: T): Partial<T> {
     result[k] = v
   }
   return result as Partial<T>
-}
-
-function truncateArtifactContent(artifacts: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
-  return artifacts.map(a => {
-    if (a.kind === 'diff') return a
-    if (typeof a.content === 'string' && a.content.length > MAX_ARTIFACT_CONTENT_CHARS) {
-      return { ...a, content: a.content.slice(0, MAX_ARTIFACT_CONTENT_CHARS) + '…' }
-    }
-    return a
-  })
 }
 
 /** packet 里 objective 的长度上限。目标通常一两句话，但模型偶尔写长文——
@@ -583,7 +531,7 @@ export async function buildPrimaryWorkerPacket(results: WorkerResult[], artifact
       status: result.status,
       summary: result.summary,
       findings: result.findings,
-      artifacts: result.artifacts ? truncateArtifactContent(result.artifacts as Array<Record<string, unknown>>) : undefined,
+      artifacts: result.artifacts,
       verification: result.verification,
       changedFiles: result.changedFiles,
       examinedFiles: result.examinedFiles,
@@ -595,92 +543,8 @@ export async function buildPrimaryWorkerPacket(results: WorkerResult[], artifact
     return stripEmpty(raw)
   })
 
-  let json = JSON.stringify(compact)
-
-  // Hard cap: if packet exceeds budget, try artifact handoff first
-  if (json.length > MAX_WORKER_PACKET_CHARS) {
-    if (artifactStore) {
-      const fullJson = JSON.stringify(results)
-      // Use the ID returned by save() — the store generates its own ID
-      // (`delegate_task:<hex>`), so a fabricated `worker-packet-…` reference
-      // would never resolve via read_section even on a successful save.
-      let artifactId: string | null = null
-      try {
-        artifactId = await artifactStore.save({
-          tool: 'delegate_task',
-          target: 'worker-packet',
-          rawContent: fullJson,
-          summary: `${results.length} worker results (${fullJson.length} chars) — full content in artifact store`,
-          sections: [],
-        })
-      } catch {
-        // Save failed — fall through to progressive field drop below
-      }
-
-      if (artifactId) {
-        // Build a compact packet with artifact reference
-        for (const result of compact) {
-          delete result.examinedFiles
-          delete result.risks
-          dropNextActionsKeepingResumeHints(result)
-          delete result.verification
-          delete result.artifacts
-          markTruncated(result)
-        }
-        json = JSON.stringify(compact)
-        // Append artifact reference so primary agent can read_section if needed
-        if (json.length > MAX_WORKER_PACKET_CHARS) {
-          json = json.slice(0, MAX_WORKER_PACKET_CHARS - 100) + '…"'
-        }
-        return wrapWorkerResults(`<worker_results>${json}\n[artifact:${artifactId}] — full worker results saved to artifact store, use read_section to retrieve</worker_results>`, results)
-      }
-      // artifact save failed → fall through to progressive field drop
-    }
-
-    // No artifact store or save failed: progressive field drop (fallback).
-    // Mark each result so the primary agent knows fields were removed —
-    // without this, evidenceStatus:'verified' is misleading when the
-    // verification metadata backing that claim was silently deleted.
-    for (const result of compact) {
-      delete result.examinedFiles
-      delete result.risks
-      dropNextActionsKeepingResumeHints(result)
-      delete result.verification
-      markTruncated(result)
-    }
-    json = JSON.stringify(compact)
-  }
-
-  // Final safety: if still over budget, truncate to the largest prefix whose
-  // JSON array is still valid. We must not emit unparseable JSON — the primary
-  // agent has no error recovery for a broken <worker_results> payload.
-  if (json.length > MAX_WORKER_PACKET_CHARS) {
-    // Strategy: try removing findings from the tail (keep earliest results
-    // intact), then hard-limit the remaining JSON. This is more principled
-    // than slicing a string at an arbitrary byte offset.
-    for (let i = compact.length - 1; i >= 0 && json.length > MAX_WORKER_PACKET_CHARS; i--) {
-      delete compact[i]!.findings
-      ;(compact[i]! as Record<string, unknown>)._truncated = true
-      json = JSON.stringify(compact)
-    }
-    // Last resort: truncate the array itself, keeping valid JSON structure.
-    while (json.length > MAX_WORKER_PACKET_CHARS && compact.length > 1) {
-      const dropped = compact.pop()
-      if (dropped) markTruncated(dropped)
-      json = JSON.stringify(compact)
-    }
-    // If a single result is still too large, keep only its core identifiers.
-    if (json.length > MAX_WORKER_PACKET_CHARS && compact.length === 1) {
-      const only = compact[0]!
-      const minimal: Record<string, unknown> = {
-        workOrderId: only.workOrderId,
-        status: only.status,
-        summary: typeof only.summary === 'string' ? only.summary.slice(0, 200) : '',
-      }
-      markTruncated(minimal)
-      json = JSON.stringify([minimal])
-    }
-  }
-
-  return wrapWorkerResults(`<worker_results>${json}</worker_results>`, results)
+  const overhead = wrapWorkerResults('', results).length + 256
+  const fitted = await fitWorkerPacket(compact as Array<Record<string, unknown>>, ordered, artifactStore, Math.max(1024, MAX_WORKER_PACKET_CHARS - overhead))
+  const ref = fitted.artifactId ? `\n[artifact:${fitted.artifactId}]` : ''
+  return wrapWorkerResults(`<worker_results>${fitted.json}</worker_results>${ref}`, results)
 }

@@ -45,13 +45,25 @@ export type CognitiveFrameRecord = {
   facts: CognitiveFrameFacts
   structureFlow: Pick<StructureFlowSnapshot,
     'mode' | 'relaxation' | 'planRecommendation' | 'tddRecommendation' | 'reasons'> | null
-  convergence: { level: number; shouldAbort: boolean; abortCause: 'no-tool' | 'score' | null } | null
+  convergence: {
+    level: number
+    shouldAbort: boolean
+    abortCause: 'no-tool' | 'score' | null
+    /** 方向凭证（Layer 2）：注入消息的结构化变体——发射门据它判"是否改道"。
+     *  可选：2026-10-05 之前的记录没有此字段（frames.jsonl 是跨版本资产）。 */
+    variant?: string | null
+    /** 该 turn 的发射决策：emitted + 被哪道门拦下（wall-clock / cooldown /
+     *  user-intervention …）。让「这几次被什么放行」只从落盘数据可答。
+     *  可选：同上，旧记录无此字段。 */
+    gate?: { emitted: boolean; suppressedBy: string | null } | null
+  } | null
 }
 
 export function buildCognitiveFrameRecord(
   frame: CognitiveFrame,
   structureFlow: StructureFlowSnapshot | null,
-  convergence: Pick<ConvergenceResult, 'level' | 'shouldAbort' | 'abortCause'> | null,
+  convergence: Pick<ConvergenceResult, 'level' | 'shouldAbort' | 'abortCause' | 'messageVariant'> | null,
+  gate: { emitted: boolean; suppressedBy: string | null } | null = null,
 ): CognitiveFrameRecord {
   return {
     kind: COGNITIVE_FRAME_KIND,
@@ -71,7 +83,13 @@ export function buildCognitiveFrameRecord(
       }
       : null,
     convergence: convergence
-      ? { level: convergence.level, shouldAbort: convergence.shouldAbort, abortCause: convergence.abortCause ?? null }
+      ? {
+        level: convergence.level,
+        shouldAbort: convergence.shouldAbort,
+        abortCause: convergence.abortCause ?? null,
+        variant: convergence.messageVariant ?? null,
+        gate,
+      }
       : null,
   }
 }

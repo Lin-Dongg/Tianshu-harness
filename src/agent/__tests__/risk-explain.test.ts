@@ -96,7 +96,8 @@ describe('explainToolRisk — 侧路纪律', () => {
       { toolName: 'bash', input: { command: 'ls' } },
     )
     assert.equal(captured.request?.tools, undefined)
-    assert.equal(captured.request?.tool_choice, 'none')
+    // 新骨架以「不提供 tools」表达无工具——tool_choice 随之缺席。
+    assert.equal(captured.request?.tool_choice, undefined)
   })
 
   it('不原地改写调用方的消息数组（同一 request 会被多个 stream 重入）', async () => {

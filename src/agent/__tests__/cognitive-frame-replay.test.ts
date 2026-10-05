@@ -32,7 +32,7 @@ function consistentRecord(overrides: Partial<CognitiveFrameInput> = {}): Cogniti
   const frame = assembleCognitiveFrame(frameInput(overrides))
   const inputs = projectStructureFlowInputs(frame)
   const sf = inputs ? computeStructureFlowControl(inputs) : null
-  const record = buildCognitiveFrameRecord(frame, sf, { level: 0, shouldAbort: false, abortCause: undefined })
+  const record = buildCognitiveFrameRecord(frame, sf, { level: 0, shouldAbort: false, abortCause: undefined, messageVariant: null })
   return JSON.parse(JSON.stringify(record)) as CognitiveFrameRecord
 }
 
@@ -88,7 +88,7 @@ describe('replayCognitiveFrames', () => {
   it('EFE 缺失记录：structureFlow=null 自洽通过，turn 报 degraded 不报 healthy', () => {
     const frame = assembleCognitiveFrame(frameInput({ efe: null }))
     const record = JSON.parse(JSON.stringify(
-      buildCognitiveFrameRecord(frame, null, { level: 0, shouldAbort: false, abortCause: undefined }),
+      buildCognitiveFrameRecord(frame, null, { level: 0, shouldAbort: false, abortCause: undefined, messageVariant: null }),
     )) as CognitiveFrameRecord
     const report = replayCognitiveFrames([record])
     assert.deepEqual(report.divergences, [])

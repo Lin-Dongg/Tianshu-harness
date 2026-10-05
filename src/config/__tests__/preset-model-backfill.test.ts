@@ -8,6 +8,7 @@ import {
   backfillModelFromPreset,
   backfillProviderFromPreset,
   backfillPresetModelFields,
+  migratePresetModelBackfill,
 } from '../preset-model-backfill.js'
 import { cloneProviderPreset, findPresetModel } from '../provider-presets.js'
 import { loadConfig, setApiKey } from '../manager.js'
@@ -28,13 +29,13 @@ describe('backfillModelFromPreset', () => {
   it('refills description on snapshots that predate the field (61224f45 存量断链)', () => {
     // description 数据链路落地前的存量快照没有该字段；不回填的话存量用户的
     // ModelPicker 永远看不到「擅长场景」（审查 61224f45 逮出的 HIGH）。
-    const stale: ModelConfig = { id: 'deepseek-v4-flash', contextWindow: 1_000_000, maxTokens: 384_000 }
+    const stale: ModelConfig = { id: 'deepseek-flash', contextWindow: 1_000_000, maxTokens: 384_000 }
     const fixed = backfillModelFromPreset('deepseek', stale)
-    assert.equal(fixed.description, '快速档：能力对标旗舰，成本更低')
+    assert.equal(fixed.description, 'DeepSeek 4.1 Flash：1M 上下文 + 原生多模态（图像输入）')
   })
 
   it('leaves a user-customized description alone', () => {
-    const stored: ModelConfig = { id: 'deepseek-v4-flash', contextWindow: 1_000_000, maxTokens: 384_000, description: '我自己的备注' }
+    const stored: ModelConfig = { id: 'deepseek-flash', contextWindow: 1_000_000, maxTokens: 384_000, description: '我自己的备注' }
     const out = backfillModelFromPreset('deepseek', stored)
     assert.equal(out.description, '我自己的备注', '用户写过的 description 不被 preset 覆盖')
   })
@@ -99,7 +100,49 @@ describe('backfillModelFromPreset', () => {
   })
 
   it('only touches fields on the allowlist', () => {
-    assert.deepEqual([...BACKFILLED_MODEL_FIELDS], ['supportsVision', 'supportsVideo', 'tier', 'pricing', 'reasoningEffort', 'description'])
+    assert.deepEqual([...BACKFILLED_MODEL_FIELDS], ['supportsVision', 'supportsVideo', 'supportsImageGen', 'tier', 'pricing', 'reasoningEffort', 'description'])
+  })
+
+  // D4：存量快照缺 supportsImageGen 时从预设回填——不回填的话生图模型升级后
+  // 从选择器里静默消失。
+  it('refills supportsImageGen on stored snapshots that lack it (D4)', () => {
+    const stale: ModelConfig = { id: 'agnes-image-2.5-flash', contextWindow: 8_192, maxTokens: 4_096 }
+    const fixed = backfillModelFromPreset('agnes', stale)
+    assert.equal(fixed.supportsImageGen, true)
+  })
+
+  // 纯文本模型不受白名单扩展影响（无该标记的预设条目照旧不 graft）。
+  it('does not graft supportsImageGen onto a text-only model (D4 guard)', () => {
+    const out = backfillModelFromPreset('minimax', { id: 'MiniMax-M3', contextWindow: 1_000_000, maxTokens: 64_000 })
+    assert.equal(out.supportsImageGen, undefined)
+  })
+})
+
+// ── migratePresetModelBackfill 回流：预设新增的生图模型带标记 ────────────────
+describe('migratePresetModelBackfill · 生图标记 (D4)', () => {
+  it('回流的预设生图模型带 supportsImageGen', () => {
+    const raw = {
+      provider: {
+        providers: {
+          agnes: {
+            name: 'agnes',
+            models: [
+              { id: 'agnes-3.0-flash', contextWindow: 512_000, maxTokens: 65_536 },
+              { id: 'agnes-2.5-flash', contextWindow: 512_000, maxTokens: 65_536 },
+              { id: 'agnes-2.5-pro', contextWindow: 1_000_000, maxTokens: 65_536 },
+            ],
+          },
+        },
+      },
+    } as unknown as Record<string, unknown>
+    const changed = migratePresetModelBackfill(raw)
+    assert.equal(changed, true)
+    const models = (raw as {
+      provider: { providers: { agnes: { models: Array<{ id: string; supportsImageGen?: boolean }> } } }
+    }).provider.providers.agnes.models
+    const img = models.find(m => m.id === 'agnes-image-2.5-flash')
+    assert.ok(img, '预设新增的生图模型应被回流追加')
+    assert.equal(img.supportsImageGen, true, '回流必须带上生图标记——否则存量快照升级后仍丢标记')
   })
 })
 
@@ -217,10 +260,11 @@ describe('loadConfig integration', () => {
       },
     }))
     const models = loadConfig().provider.providers.deepseek!.models
-    const flash = models.find(m => m.id === 'deepseek-v4-flash')!
-    assert.equal(flash.reasoningEffort, 'max', 'high migrated to max')
+    assert.equal(models.some(m => m.id === 'deepseek-v4-flash'), false, '旧 id 已退役，改名为 deepseek-flash')
+    const flash = models.find(m => m.id === 'deepseek-flash')!
+    assert.equal(flash.reasoningEffort, 'max', 'high migrated to max，再随 id 改名保留')
     // 幂等：再 load 一次不报错、值稳定
-    const flash2 = loadConfig().provider.providers.deepseek!.models.find(m => m.id === 'deepseek-v4-flash')!
+    const flash2 = loadConfig().provider.providers.deepseek!.models.find(m => m.id === 'deepseek-flash')!
     assert.equal(flash2.reasoningEffort, 'max')
   })
 })

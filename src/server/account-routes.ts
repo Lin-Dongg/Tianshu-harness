@@ -27,6 +27,7 @@ import type { RouteHandler } from './index.js'
 import { withAuth } from './routes.js'
 import { resolveProxyForUrl } from '../tools/net/proxy-resolver.js'
 import { rivetHome } from '../config/paths.js'
+import { accountDeviceFingerprint } from '../auth/account-device.js'
 import * as accountModule from '../auth/account.js'
 import type {
   AccountProfile,
@@ -47,9 +48,12 @@ import type { TokenStore, TokenData } from '../auth/token-store.js'
  * 「凭据进文件、不进响应体」这条不变量只有真实磁盘能证。
  */
 export interface AccountApi {
+  cancelDeviceCode?(deviceCode: string, opts?: FetchInjection): Promise<boolean>
+  revokeAccountSession?(accessToken: string, opts?: FetchInjection): Promise<boolean>
   requestDeviceCode(opts: RequestDeviceCodeOpts): Promise<DeviceCreateResult>
   checkDeviceOnce(deviceCode: string, opts?: FetchInjection): Promise<DevicePollResult>
   fetchAccountProfile(accessToken: string, opts?: FetchInjection): Promise<AccountProfile | null>
+  refreshAccountToken?(refreshToken: string, opts?: FetchInjection): Promise<DevicePollResult | null>
   accountStore(rivetHome: string): TokenStore
   saveAccountToken(store: TokenStore, poll: DevicePollResult): TokenData
   /** 读本人星籍（PostgREST + 用户 JWT，RLS 收口）。失败回 null，不抛。 */
@@ -115,8 +119,11 @@ function buildProxyFetch(deps: AccountRoutesDeps): FetchLike | undefined {
 function defaultAccountApi(): AccountApi {
   return {
     requestDeviceCode: accountModule.requestDeviceCode,
+    cancelDeviceCode: accountModule.cancelDeviceCode,
+    revokeAccountSession: accountModule.revokeAccountSession,
     checkDeviceOnce: accountModule.checkDeviceOnce,
     fetchAccountProfile: accountModule.fetchAccountProfile,
+    refreshAccountToken: accountModule.refreshAccountToken,
     accountStore: accountModule.accountStore,
     saveAccountToken: accountModule.saveAccountToken,
     fetchStellarIdentity: accountModule.fetchStellarIdentity,
@@ -140,215 +147,211 @@ export function buildAccountRoutes(deps: AccountRoutesDeps): Record<string, Rout
   // 认证规则漂移出第二份就是安全洞。
   const guard = (handler: RouteHandler): RouteHandler => withAuth(handler, deps.apiToken)
 
-  /**
-   * 后台刷新星籍缓存（stale-while-revalidate）。
-   *
-   * ⚠️ 写回前**重新 load 一次**并与发起时的 accessToken 对账：期间用户可能重新
-   * 登录（`POST /account/poll` 写入了新 token），用请求开始时的旧 token 覆盖，
-   * 等于把刚登录的会话打回旧凭据——用户表现为「登录后又掉线」。登录态变了就放弃
-   * 这次刷新（下一次 status 会自然重取）。
-   */
-  const refreshIdentity = async (store: TokenStore, accessToken: string): Promise<void> => {
-    try {
-      const identity = await api.fetchStellarIdentity(accessToken, { fetchImpl })
-      if (!identity) return
-      const fresh = store.load()
-      if (!fresh || fresh.accessToken !== accessToken) return
-      api.saveAccountIdentity(store, fresh, identity)
-    } catch {
-      // 拉不到就继续用旧值：宁可显示陈旧星籍，也不让身份消失
+  let activeDeviceCode: string | undefined
+  const cancelRemote = async () => {
+    const code = activeDeviceCode
+    activeDeviceCode = undefined
+    if (!code) return true
+    try { return await api.cancelDeviceCode?.(code, { fetchImpl }) ?? false } catch { return false }
+  }
+  let generation = 0
+  let refreshJob: { accessToken: string; promise: Promise<boolean> } | undefined
+  let lastRefresh: { accessToken: string; fromToken?: string; at: number; ok: boolean; partial?: boolean } | undefined
+  const polls = new Map<string, { generation: number; expiresAt: number; promise: Promise<Awaited<ReturnType<RouteHandler>>> }>()
+
+  // Independent requests merge into the latest disk snapshot. Logout or another login
+  // invalidates every pending write; a missing category never erases its cached data.
+  const refreshAccount = (store: TokenStore, accessToken: string, force = false): Promise<boolean> => {
+    if (refreshJob?.accessToken === accessToken) return refreshJob.promise
+    if (!force && lastRefresh?.accessToken === accessToken && Date.now() - lastRefresh.at < 30_000) {
+      return Promise.resolve(lastRefresh.ok)
     }
+    const started = generation
+    let activeToken = accessToken
+    const current = () => {
+      const fresh = store.load()
+      return generation === started && fresh?.accessToken === activeToken ? fresh : null
+    }
+    const identityTask = async () => {
+      const cached = api.cachedAccountIdentity(store.load())
+      if (!force && !api.isAccountIdentityStale(cached?.fetchedAt ?? 0)) return true
+      const identity = await api.fetchStellarIdentity(activeToken, { fetchImpl })
+      const fresh = current()
+      if (!identity || !fresh) return false
+      api.saveAccountIdentity(store, fresh, identity)
+      return true
+    }
+    const profileTask = async () => {
+      const previous = api.cachedAccountProfile(store.load())
+      if (!force && !previous?.unconfirmed?.length && !api.isAccountIdentityStale(previous?.fetchedAt ?? 0)) return true
+      const profile = await api.fetchAccountProfileSnapshot(activeToken, { fetchImpl })
+      const fresh = current()
+      if (!profile || !fresh) return false
+      const cached = api.cachedAccountProfile(fresh)
+      api.saveAccountProfile(store, fresh, { ...profile, founding: profile.unconfirmed?.includes('founding') ? profile.founding ?? cached?.founding ?? null : profile.founding, avatarUrl: profile.unconfirmed?.includes('avatar') ? cached?.avatarUrl ?? null : profile.avatarUrl, account: cached?.account })
+      return !profile.unconfirmed?.length
+    }
+    const contactTask = async () => {
+      const previous = api.cachedAccountProfile(store.load())
+      if (!force && previous?.account && !api.isAccountIdentityStale(previous.fetchedAt)) return true
+      const account = await api.fetchAccountProfile(activeToken, { fetchImpl })
+      const fresh = current()
+      if (!account || !fresh) return false
+      const cached = api.cachedAccountProfile(fresh)
+      api.saveAccountProfile(store, fresh, { avatarUrl: cached?.avatarUrl ?? null, founding: cached?.founding ?? null,
+        fetchedAt: Date.now(), account, unconfirmed: cached?.unconfirmed ?? (cached ? undefined : ['avatar', 'founding']) })
+      return true
+    }
+    const promise = (async () => {
+      const before = current()
+      if (!before) return false
+      if (before.expiresAt <= Date.now() + 60_000 && before.refreshToken && api.refreshAccountToken) {
+        const rotated = await api.refreshAccountToken(before.refreshToken, { fetchImpl })
+        const fresh = current()
+        if (!rotated?.accessToken || !fresh) {
+          if (!fresh && rotated?.accessToken) { try { await api.revokeAccountSession?.(rotated.accessToken, { fetchImpl }) } catch {} }
+          if (fresh) lastRefresh = { accessToken: activeToken, at: Date.now(), ok: false }
+          return false
+        }
+        store.save({ ...fresh, accessToken: rotated.accessToken, refreshToken: rotated.refreshToken,
+          expiresAt: Date.now() + (rotated.expiresIn ?? 3600) * 1000 })
+        activeToken = rotated.accessToken
+        if (refreshJob?.accessToken === accessToken) refreshJob.accessToken = activeToken
+      }
+      const results = await Promise.allSettled([identityTask(), profileTask(), contactTask()])
+      const succeeded = results.map(result => result.status === 'fulfilled' && result.value)
+      const ok = succeeded.every(Boolean)
+      if (current()) lastRefresh = { accessToken: activeToken, fromToken: accessToken, at: Date.now(), ok, partial: !ok && succeeded.some(Boolean) }
+      return results[0].status === 'fulfilled' && results[0].value
+    })().catch(() => {
+      if (current()) lastRefresh = { accessToken: activeToken, at: Date.now(), ok: false }
+      return false
+    }).finally(() => {
+      if (refreshJob?.promise === promise) refreshJob = undefined
+    })
+    refreshJob = { accessToken, promise }
+    return promise
   }
 
-  /**
-   * 后台刷新账号资料（头像 + 创始铭牌）——与星籍同一套 stale-while-revalidate。
-   *
-   * 同一条对账纪律：写回前重新 load 并与发起时的 accessToken 比对，期间换过
-   * 账号就放弃（把 A 的头像挂到 B 的凭据上，比不刷新糟得多）。
-   */
-  const refreshProfile = async (store: TokenStore, accessToken: string): Promise<void> => {
+  const pollOnce = async (deviceCode: string, started: number) => {
+    let poll: DevicePollResult
     try {
-      const profile = await api.fetchAccountProfileSnapshot(accessToken, { fetchImpl })
-      if (!profile) return
-      const fresh = store.load()
-      if (!fresh || fresh.accessToken !== accessToken) return
-      api.saveAccountProfile(store, fresh, profile)
+      poll = await api.checkDeviceOnce(deviceCode, { fetchImpl })
     } catch {
-      // 拉不到就继续用旧值：宁可显示陈旧头像，也不让资料消失
+      return { status: 502, body: { error: 'device check temporarily unavailable' } }
     }
+    if (started !== generation) {
+      if (poll.accessToken) { try { await api.revokeAccountSession?.(poll.accessToken, { fetchImpl }) } catch {} }
+      return { status: 200, body: { status: 'expired' } }
+    }
+    if (poll.status !== 'approved') return { status: 200, body: { status: poll.status } }
+    const store = api.accountStore(deps.rivetHome)
+    try {
+      const saved = api.saveAccountToken(store, poll)
+      void refreshAccount(store, saved.accessToken, true)
+    } catch {
+      return { status: 500, body: { error: 'could not save account login' } }
+    }
+    if (activeDeviceCode === deviceCode) activeDeviceCode = undefined
+    // Approval acknowledges durable credentials, never optional network metadata.
+    return { status: 200, body: { status: 'approved' } }
   }
 
   return {
-    /** 申请设备码。前端拿 userCode/verifyUrl 去 openExternal，拿 deviceCode 轮询。 */
-    'POST /account/device': guard(async (body) => {
-      const input = (body ?? {}) as { deviceName?: unknown }
-      const deviceName =
-        typeof input.deviceName === 'string' && input.deviceName ? input.deviceName : undefined
+    'POST /account/device': guard(async body => {
+      const started = ++generation
+      polls.clear()
+      await cancelRemote()
+      const input = (body ?? {}) as { deviceName?: unknown; deviceFingerprint?: unknown }
+      const deviceName = typeof input.deviceName === 'string' && input.deviceName ? input.deviceName : undefined
+      let deviceFingerprint: string
+      try { deviceFingerprint = accountDeviceFingerprint(deps.rivetHome, input.deviceFingerprint) }
+      catch { return { status: 400, body: { error: 'device identity unavailable or invalid' } } }
       try {
-        const created = await api.requestDeviceCode({ deviceName, fetchImpl })
+        const created = await api.requestDeviceCode({ deviceName, deviceFingerprint, fetchImpl })
+        if (started !== generation) {
+          try { await api.cancelDeviceCode?.(created.deviceCode, { fetchImpl }) } catch {}
+          return { status: 409, body: { error: 'authorization superseded' } }
+        }
+        activeDeviceCode = created.deviceCode
         return { status: 200, body: created }
-      } catch (e) {
-        return { status: 502, body: { error: `device code request failed: ${(e as Error).message}` } }
+      } catch {
+        return { status: 502, body: { error: 'device authorization temporarily unavailable' } }
       }
     }),
-
-    /** 单次检查；approved 时落盘凭据，但只回状态。 */
-    'POST /account/poll': guard(async (body) => {
+    'POST /account/poll': guard(async body => {
       const input = (body ?? {}) as { deviceCode?: unknown }
       const deviceCode = typeof input.deviceCode === 'string' ? input.deviceCode.trim() : ''
       if (!deviceCode) return { status: 400, body: { error: 'deviceCode is required' } }
-
-      let poll: DevicePollResult
-      try {
-        poll = await api.checkDeviceOnce(deviceCode, { fetchImpl })
-      } catch (e) {
-        return { status: 502, body: { error: `device check failed: ${(e as Error).message}` } }
+      for (const [key, receipt] of polls) {
+        if (receipt.expiresAt <= Date.now() || receipt.generation !== generation) polls.delete(key)
       }
-
-      if (poll.status !== 'approved') return { status: 200, body: { status: poll.status } }
-
-      // `approved` 却缺 accessToken 在 saveAccountToken 里抛错——空凭据落盘会让
-      // 下次启动谎报「已登录」，所以这里是 5xx 而不是 200。
-      const store = api.accountStore(deps.rivetHome)
-      let saved: TokenData
-      try {
-        saved = api.saveAccountToken(store, poll)
-      } catch (e) {
-        return { status: 500, body: { error: (e as Error).message } }
-      }
-
-      // 星籍随登录顺带取一次并落盘：这是唯一确定在线的时刻，也是身份归属刚确定
-      // 的时刻。**失败绝不影响登录结果**——星籍是装饰性信息，且用户可能压根没有
-      // （不是每个账号都建了 stellar_identities 行）。
-      try {
-        const identity = await api.fetchStellarIdentity(saved.accessToken, { fetchImpl })
-        if (identity) api.saveAccountIdentity(store, saved, identity)
-      } catch {
-        // 静默：登录已经成功，不该因为星籍拉不到而对外报异常
-      }
-
-      // 账号资料（头像 + 创始铭牌）同刻顺带取——理由与星籍相同：这是唯一确定
-      // 在线的时刻。失败同样静默，不拖垮登录结果。
-      try {
-        const profile = await api.fetchAccountProfileSnapshot(saved.accessToken, { fetchImpl })
-        if (profile) api.saveAccountProfile(store, saved, profile)
-      } catch {
-        // 静默：登录已成功，不该因为资料拉不到而对外报异常
-      }
-      return { status: 200, body: { status: 'approved' } }
+      const previous = polls.get(deviceCode)
+      if (previous) return previous.promise
+      if (polls.size >= 128) return { status: 429, body: { error: 'too many authorization attempts' } }
+      const receipt = { generation, expiresAt: Date.now() + 300_000, promise: pollOnce(deviceCode, generation) }
+      polls.set(deviceCode, receipt)
+      const result = await receipt.promise
+      // Only retain approved receipts, so a lost response or duplicate request can
+      // recover without consuming the one-use device grant a second time.
+      if ((result.body as { status?: string })?.status !== 'approved' && polls.get(deviceCode) === receipt) polls.delete(deviceCode)
+      return result
     }),
-
-    /** 登录态。拉不到资料只降级 email，不改判登录与否。 */
     'GET /account/status': guard(async () => {
       const store = api.accountStore(deps.rivetHome)
       const token = store.load()
-      if (!token?.accessToken) {
-        return {
-          status: 200,
-          body: {
-            loggedIn: false,
-            email: null,
-            userId: null,
-            expiresAt: null,
-            stellarId: null,
-            primaryDomain: null,
-            title: null,
-            avatarUrl: null,
-            founding: null,
-          },
-        }
-      }
-
-      let profile: AccountProfile | null = null
-      try {
-        profile = await api.fetchAccountProfile(token.accessToken, { fetchImpl })
-      } catch {
-        // 离线不等于未登录——本地 token 才是事实，拉不到资料只是拉不到
-      }
-
+      if (!token?.accessToken) return { status: 200, body: {
+        loggedIn: false, email: null, userId: null, expiresAt: null, stellarId: null,
+        primaryDomain: null, title: null, avatarUrl: null, founding: null,
+      } }
       const cached = api.cachedAccountIdentity(token)
-      const cachedProfile = api.cachedAccountProfile(token)
-      // 陈旧就后台刷新，**不 await**：星籍是装饰性信息，不该让设置页为它多等一次
-      // 网络往返；也绝不轮询（星籍一生只变一次，reroll 上限 1）。
-      if (api.isAccountIdentityStale(cached?.fetchedAt ?? 0)) {
-        void refreshIdentity(store, token.accessToken)
+      const profile = api.cachedAccountProfile(token)
+      if (token.expiresAt <= Date.now() + 60_000 || profile?.unconfirmed?.length || api.isAccountIdentityStale(cached?.fetchedAt ?? 0) || api.isAccountIdentityStale(profile?.fetchedAt ?? 0) || !profile?.account) {
+        void refreshAccount(store, token.accessToken)
       }
-      // 资料（头像 / 铭牌）同理：陈旧才后台刷、不 await。刷新失败继续用旧值——
-      // 宁可显示陈旧头像，也不让身份消失。
-      if (api.isAccountIdentityStale(cachedProfile?.fetchedAt ?? 0)) {
-        void refreshProfile(store, token.accessToken)
-      }
-
-      return {
-        status: 200,
-        body: {
-          loggedIn: true,
-          email: profile?.email ?? null,
-          userId: profile?.userId ?? null,
-          expiresAt: token.expiresAt,
-          // 离线/未取到时为 null —— 前端按"字段存在才渲染"，不显示空壳
-          stellarId: cached?.identity.stellarId ?? null,
-          primaryDomain: cached?.identity.primaryDomain ?? null,
-          title: cached?.identity.title ?? null,
-          // 上次同步时刻：让界面能解释"为什么这可能是旧的"（TTL 24h + 手动刷新）
-          identityFetchedAt: cached && cached.fetchedAt > 0 ? cached.fetchedAt : null,
-          identityUrl: api.accountIdentityUrl(),
-          manageUrl: api.accountManageUrl(),
-          avatarUrl: cachedProfile?.avatarUrl ?? null,
-          founding: cachedProfile?.founding ?? null,
-          profileFetchedAt: cachedProfile && cachedProfile.fetchedAt > 0 ? cachedProfile.fetchedAt : null,
-        },
-      }
+      return { status: 200, body: {
+        loggedIn: true, email: profile?.account?.email ?? null, userId: accountModule.jwtSubject(token.accessToken) ?? profile?.account?.userId ?? null,
+        username: profile?.account?.username ?? null,
+        displayName: profile?.account?.displayName ?? null, joinedAt: profile?.account?.joinedAt ?? null,
+        expiresAt: token.expiresAt, stellarId: cached?.identity.stellarId ?? null,
+        primaryDomain: cached?.identity.primaryDomain ?? null, title: cached?.identity.title ?? null,
+        identityFetchedAt: cached?.fetchedAt || null, identityUrl: api.accountIdentityUrl(), manageUrl: api.accountManageUrl(),
+        avatarUrl: profile?.avatarUrl ?? null, founding: profile?.founding ?? null, profileFetchedAt: profile?.fetchedAt || null,
+        profileConfirmed: Boolean(profile && !profile.unconfirmed?.includes('founding')),
+        syncState: refreshJob?.accessToken === token.accessToken ? 'syncing' : lastRefresh?.accessToken === token.accessToken && !lastRefresh.ok ? lastRefresh.partial ? 'partial' : 'offline' : 'cached',
+      } }
     }),
-
-    /**
-     * 强制刷新星籍（桌面端身份卡的「刷新」按钮）。
-     *
-     * 存在的理由：缓存 TTL 是 24h，而用户在官网 reroll 星域之后不会等一天。
-     * 与 status 的后台刷新共用同一套取数，区别是这里 **await**——用户明确点了
-     * 按钮，就该拿到结果或明确的「没刷上」，而不是回一个看不出新旧的值。
-     */
     'POST /account/identity/refresh': guard(async () => {
       const store = api.accountStore(deps.rivetHome)
       const token = store.load()
       if (!token?.accessToken) return { status: 401, body: { error: 'not signed in' } }
-
-      const identity = await api.fetchStellarIdentity(token.accessToken, { fetchImpl })
-      if (!identity) {
-        const cached = api.cachedAccountIdentity(token)
-        return {
-          status: 200,
-          body: {
-            refreshed: false,
-            stellarId: cached?.identity.stellarId ?? null,
-            primaryDomain: cached?.identity.primaryDomain ?? null,
-            title: cached?.identity.title ?? null,
-          },
-        }
-      }
-
-      // 刷新期间用户可能重新登录（新 token = 可能换了账号）。那就不写盘——
-      // 把 A 的星籍挂到 B 的凭据上比不刷新糟得多。
+      const started = generation
+      const refreshed = await refreshAccount(store, token.accessToken, true)
       const fresh = store.load()
-      if (!fresh || fresh.accessToken !== token.accessToken) {
-        return { status: 200, body: { refreshed: false, stellarId: null, primaryDomain: null, title: null } }
-      }
-      api.saveAccountIdentity(store, fresh, identity)
-      return {
-        status: 200,
-        body: {
-          refreshed: true,
-          stellarId: identity.stellarId,
-          primaryDomain: identity.primaryDomain,
-          title: identity.title,
-        },
-      }
+      const renewed = lastRefresh?.fromToken === token.accessToken && lastRefresh.accessToken === fresh?.accessToken
+      if (started !== generation || (fresh?.accessToken !== token.accessToken && !renewed)) return { status: 200, body: { refreshed: false, stellarId: null, primaryDomain: null, title: null } }
+      const identity = api.cachedAccountIdentity(fresh)?.identity
+      return { status: 200, body: { refreshed, complete: lastRefresh?.accessToken === fresh?.accessToken && lastRefresh.ok, stellarId: identity?.stellarId ?? null,
+        primaryDomain: identity?.primaryDomain ?? null, title: identity?.title ?? null } }
     }),
-
-    /** 只清账号凭据；provider 凭据按 provider 名分文件存放，登出不该连带清掉。 */
+    'POST /account/cancel': guard(async () => {
+      generation++
+      polls.clear()
+      const remoteCancelled = await cancelRemote()
+      return { status: 200, body: { ok: true, remoteCancelled } }
+    }),
     'POST /account/logout': guard(async () => {
-      api.accountStore(deps.rivetHome).clear()
-      return { status: 200, body: { ok: true } }
+      generation++
+      polls.clear()
+      refreshJob = undefined
+      lastRefresh = undefined
+      const store = api.accountStore(deps.rivetHome)
+      const credential = store.load()?.accessToken
+      store.clear()
+      await cancelRemote()
+      let remoteRevoked = !credential
+      try { if (credential) remoteRevoked = await api.revokeAccountSession?.(credential, { fetchImpl }) ?? false } catch {}
+      return { status: 200, body: { ok: true, remoteRevoked } }
     }),
   }
 }

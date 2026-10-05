@@ -10,6 +10,12 @@ import { RuntimeHookPipeline } from '../runtime-hooks.js'
 import { PromptEngine } from '../../prompt/engine.js'
 import { ToolRegistry } from '../../tools/registry.js'
 import { READ_FILE_TOOL } from '../../tools/read-file.js'
+import { createOwnershipLedger } from '../ownership-ledger.js'
+import { createTaskLedger } from '../task-ledger.js'
+import { createWorktreeBaseline } from '../worktree-baseline.js'
+import { createPersistentTaskState } from '../task-state-persist.js'
+import { getEffectiveVerifications } from '../verification-attribution.js'
+import { spawnSync } from 'node:child_process'
 import { ContextClaimStore } from '../../context/claim-store.js'
 import { PlaybookStore } from '../playbook-store.js'
 import { PrewarmCache } from '../prewarm.js'
@@ -1591,6 +1597,10 @@ describe('AgentLoop — convergence emission cooldown', () => {
 
   it('throttles the 改道 emission instead of firing every turn', async () => {
     const agent = stuckLoop()
+    // 墙钟下限（Layer 2）是独立的一道门：本用例断言的是 **cooldown** 节流，
+    // 故显式关闭墙钟——否则墙钟恒拦停、shifts 恒为 1，cooldown 回归也测不出
+    // （审查 09389b78e 指出）。
+    agent.convergenceEmitMinIntervalMs = 0
     let shifts = 0
     const cb = { ...makeCallbacks(), onDecisionShift: () => { shifts++ } }
 
@@ -1655,6 +1665,58 @@ describe('AgentLoop — convergence emission cooldown', () => {
     assert.ok(conv, 'expected a convergence advisory emission')
     assert.equal(conv.expect?.kind, 'tool_appears')
     assert.ok((conv.expect?.tools?.length ?? 0) > 0, 'diagnostic 变体带认知工具清单')
+  })
+
+  // ── Layer 2（2026-10-05）：发射门的凭证修正 ──
+  // 冷却以 turn 计数，而只读诊断轮的墙钟极短——"3 轮冷却"在用户感知里只有
+  // 几秒（实测会话 74f350c9：5 次告警，前 4 次落在 50 秒内）。墙钟下限只约束
+  // 面向人的告警节奏；level 升级是真实信号跃迁，必须穿透。
+  it('wall-clock floor blocks same-variant re-emission inside the interval (Layer 2)', async () => {
+    const agent = stuckLoop()
+    agent.convergenceEmitMinIntervalMs = 45_000
+    let shifts = 0
+    const cb = { ...makeCallbacks(), onDecisionShift: () => { shifts++ } }
+    await agent.runConvergenceCheck(14, 'plan', true, false, cb) // 首次：无历史 → 放行
+    // 冷却（3 turn）已过，但墙钟未过（同步调用，间隔 ≈0ms）
+    await agent.runConvergenceCheck(18, 'plan', true, false, cb)
+    assert.equal(shifts, 1, '墙钟下限必须拦住区间内的同变体重复发射')
+  })
+
+  it('level escalation pierces the wall-clock floor (Layer 2)', async () => {
+    const agent = stuckLoop()
+    agent.convergenceEmitMinIntervalMs = 45_000
+    let shifts = 0
+    const cb = { ...makeCallbacks(), onDecisionShift: () => { shifts++ } }
+    await agent.runConvergenceCheck(14, 'plan', true, false, cb) // L2
+    await agent.runConvergenceCheck(20, 'plan', true, false, cb) // L3 升级 → 必须放行
+    assert.ok(shifts >= 2, `升级必须穿透墙钟下限，got ${shifts}`)
+  })
+
+  // ── Layer 2 遥测（后续 A）：让「这几次是被什么放行的」只从落盘数据可答 ──
+  // 此前 messageVariant 与「为何未发射」只在 debugLog（需 RIVET_DEBUG=1），
+  // 复盘只能靠 ui-history 事后推断。
+  it('帧记录携带方向凭证与发射决策（Layer 2 遥测）', async () => {
+    const agent = stuckLoop()
+    agent.convergenceEmitMinIntervalMs = 45_000
+    const captured: Array<Record<string, unknown>> = []
+    agent.frameRecorder = {
+      enabled: true,
+      write: (r) => { captured.push(r as unknown as Record<string, unknown>) },
+      flush: async () => {},
+    } as typeof agent.frameRecorder
+
+    await agent.runConvergenceCheck(14, 'plan', true, false, makeCallbacks()) // 首次 → 发射
+    await agent.runConvergenceCheck(18, 'plan', true, false, makeCallbacks()) // 冷却已过、墙钟未过 → 被拦
+
+    type Conv = { variant?: string | null; gate?: { emitted: boolean; suppressedBy: string | null } | null } | null
+    const first = (captured[0]?.convergence ?? null) as Conv
+    const second = (captured[1]?.convergence ?? null) as Conv
+
+    assert.ok(first, '第一次应落一条含 convergence 的记录')
+    assert.ok(first.variant, '记录必须带方向凭证（messageVariant）')
+    assert.equal(first.gate?.emitted, true, '首次发射应记为 emitted')
+    assert.equal(second?.gate?.emitted, false, '第二次应记为未发射')
+    assert.equal(second?.gate?.suppressedBy, 'wall-clock', '第二次须记下被墙钟拦下')
   })
 
   it('对照:no-tool 变体仍是 tool_appears tools:[]（不受 B1b 影响）', async () => {
@@ -2206,6 +2268,100 @@ describe('AgentLoop — plan mode lifecycle (2026-07-03 缺陷复盘)', () => {
       assert.ok(existsSync(writtenDraft), 'non-empty draft preserved')
     } finally {
       cleanup()
+    }
+  })
+
+  it('exitPlanMode drops the draft from ownership（8784b64b8 审查 P1 W1-2）', () => {
+    const session = new SessionContext()
+    const registry = new ToolRegistry()
+    registry.register(READ_FILE_TOOL)
+    const cwd = mkdtempSync(join(tmpdir(), 'rivet-planmode-own-'))
+    const taskLedger = createTaskLedger({ taskId: 'plan-draft-release' })
+    const ownershipLedger = createOwnershipLedger({
+      baseline: createWorktreeBaseline({
+        branch: 'main', head: 'abc123', preExistingDirty: [], preExistingUntracked: [], capturedAt: Date.now(),
+      }),
+      taskLedger,
+    })
+    const agent = new AgentLoop({
+      client: mockClient([makeTextBlock('ok')]), promptEngine: makeEngine(), toolRegistry: registry,
+      taskLedger, ownershipLedger, maxTurns: 2, contextWindow: 1_000_000,
+      compact: { enabled: false, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash' },
+    }, session, cwd)
+    try {
+      agent.enterPlanMode()
+      const draft = agent.getActivePlanFilePath()!
+      assert.match(draft, /^\.rivet\/plans\/draft-\d+\.md$/, '前置：活动草稿路径形状')
+      // 模拟 tool-pipeline.ts:1726 的写时登记：写草稿 → ledger 事件 + registerOwned。
+      taskLedger.record({ type: 'file_write', path: draft })
+      ownershipLedger.registerOwned(draft)
+      assert.equal(ownershipLedger.isOwned(draft), true, '前置：草稿写入后确实进了归属集合')
+
+      agent.exitPlanMode()
+
+      assert.equal(
+        ownershipLedger.isOwned(draft), false,
+        '释放草稿必须同时清归属——只删 ledger 事件时草稿仍留在 owned-file 列表与交付范围（无写事件支撑的幽灵归属）',
+      )
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('T01：草稿写入→退出→代码验证 全程 fresh，草稿不残留（§10 验收矩阵，真实持久化层）', () => {
+    const home = mkdtempSync(join(tmpdir(), 'rivet-loop-home-'))
+    const prevHome = process.env.RIVET_HOME
+    process.env.RIVET_HOME = home
+    const cwd = mkdtempSync(join(home, 'repo-'))
+    const git = (...args: string[]) => {
+      const r = spawnSync('git', args, { cwd, encoding: 'utf8' })
+      assert.equal(r.status, 0, `git ${args.join(' ')}: ${r.stderr}`)
+      return r.stdout.trim()
+    }
+    git('init', '-q'); git('config', 'user.email', 't@example.com'); git('config', 'user.name', 'T')
+    writeFileSync(join(cwd, 'owned.ts'), 'original')
+    git('add', '--', 'owned.ts'); git('commit', '-qm', 'initial')
+
+    const state = createPersistentTaskState(cwd, 'loop-draft-e2e', {
+      branch: 'main', head: git('rev-parse', 'HEAD'), preExistingDirty: [], preExistingUntracked: [], capturedAt: Date.now(),
+    })
+    const session = new SessionContext()
+    const registry = new ToolRegistry()
+    registry.register(READ_FILE_TOOL)
+    const agent = new AgentLoop({
+      client: mockClient([makeTextBlock('ok')]), promptEngine: makeEngine(), toolRegistry: registry,
+      taskLedger: state.taskLedger, ownershipLedger: state.ownership, maxTurns: 2, contextWindow: 1_000_000,
+      compact: { enabled: false, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash' },
+    }, session, cwd)
+    try {
+      // 既有代码证据：改文件 + 记验证。
+      writeFileSync(join(cwd, 'owned.ts'), 'modified')
+      state.taskLedger.record({ type: 'file_write', path: 'owned.ts' })
+      state.taskLedger.record({ type: 'verification', command: 'npm test', status: 'passed', meta: { scope: 'full' } })
+      assert.equal(getEffectiveVerifications(state.taskLedger.getEvents()).effective.length, 1, '前置：代码验证有效')
+
+      // plan mode：写草稿走 tool-pipeline.ts:1726 的真实路径（file_write + 归属）。
+      agent.enterPlanMode()
+      const draft = agent.getActivePlanFilePath()!
+      state.taskLedger.record({ type: 'file_write', path: draft })
+      assert.equal(state.ownership.isOwned(draft), true, '前置：草稿写入后进了归属（autoOwnFromLedger）')
+      assert.equal(
+        getEffectiveVerifications(state.taskLedger.getEvents()).effective.length, 1,
+        'plan mode 里写草稿不得作废此前跑过的代码验证',
+      )
+
+      agent.exitPlanMode()
+
+      assert.equal(state.ownership.isOwned(draft), false, '退出后草稿不残留归属')
+      assert.equal(state.taskLedger.getEvents().some(e => e.path === draft), false, '退出后草稿不残留事件')
+      assert.equal(
+        getEffectiveVerifications(state.taskLedger.getEvents()).effective.length, 1,
+        '退出后既有验证仍 fresh——草稿的写与删都不该动代码证据',
+      )
+    } finally {
+      if (prevHome === undefined) delete process.env.RIVET_HOME
+      else process.env.RIVET_HOME = prevHome
+      rmSync(home, { recursive: true, force: true })
     }
   })
 })

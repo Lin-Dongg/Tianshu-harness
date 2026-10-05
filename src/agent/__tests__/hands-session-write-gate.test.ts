@@ -96,8 +96,12 @@ describe('runHandsSession × worker write gate (W4-D1)', () => {
     const prompts: string[] = []
     let evaluations = 0
     const run = await runHandsSession(baseConfig(order, {
-      runAgent: async (prompt, _callbacks, workerCwd) => {
+      runAgent: async (prompt, _callbacks, workerCwd, options) => {
         prompts.push(prompt)
+        if (prompts.length === 2) {
+          assert.equal(options?.continueSession, true, 'write repair continues the existing execution')
+          assert.equal(options?.objective, prompt, 'coordinator receives the actual repair target')
+        }
         mkdirSync(join(workerCwd, 'src'), { recursive: true })
         writeFileSync(join(workerCwd, 'src', 'output.ts'), `export const v = ${prompts.length}\n`)
         execSync('git add -A && git commit --allow-empty -m "worker output"', { cwd: workerCwd, stdio: 'pipe' })

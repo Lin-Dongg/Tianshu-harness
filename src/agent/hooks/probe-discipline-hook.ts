@@ -34,7 +34,10 @@ const COOLDOWN_CALLS = 12
  *  行号区间、上下文行、精确符号定位，都让结论落回可复核的观察；
  *  无锚点的 read/grep 读再多也只是在叠推断层。 */
 const ANCHORED_READONLY_TOOLS = new Set(['read_section', 'lsp_goto_definition', 'lsp_find_references'])
-const ANCHOR_HINT = /(?:offset|limit|focus|context_lines|start|end|line)\s*[=:]/
+const ANCHOR_HINT = /"(?:offset|limit|focus|context_lines|start|end)"\s*:|(?:^|[\s,{[])(?:offset|limit|focus|context_lines|start|end)\s*=/
+// 注：输入经 safeArgs = JSON.stringify 后 key 带引号（"context_lines":3）——旧的
+// /(?:…|line)\s*[=:]/ 不跨引号，永不命中（grep/read_file 的锚点全被漏计，恒走「取证」
+// 零锚点分支）；同时去掉过宽的 line 备选（它会命中 baseline = x 之类的参数值）。
 
 export function createProbeDisciplineHook(deps: ProbeDisciplineDeps): PostToolRuntimeHook {
   let readStreak = 0
@@ -64,7 +67,11 @@ export function createProbeDisciplineHook(deps: ProbeDisciplineDeps): PostToolRu
         if (anchoredReads === 0) {
           // 连续只读但零观察锚点——推断叠推断，没有骨头。先补取证，探针还排不上。
           deps.advisoryBus.submit({
-            key: `probe-discipline-${Date.now()}`,
+            // 稳定 key（原以 Date.now() 后缀每次唯一，令 bus 的 key 级去重与
+            // 习惯化-降频失效）。恢复后本条纳入 adopted/ignored 账本
+            //（advisory-bus.ts:24-27）：长期无人照做的会话里本提醒会逐渐淡出
+            // ——期望行为，属语义变化（见 changelog）。
+            key: 'probe-discipline',
             priority: 0.5,
             category: 'discipline',
             tier: 'operational',
@@ -74,7 +81,7 @@ export function createProbeDisciplineHook(deps: ProbeDisciplineDeps): PostToolRu
           })
         } else {
           deps.advisoryBus.submit({
-            key: `probe-discipline-${Date.now()}`,
+            key: 'probe-discipline',
             priority: 0.5,
             category: 'discipline',
             tier: 'operational',

@@ -1,3 +1,5 @@
+import { observeBrowserTargets } from './target-observer.js'
+import { browserKeyParameters } from './keyboard-input.js'
 /**
  * browser-debug/driver — Playwright-backed CDP driver (lazy, optional dep).
  */
@@ -66,6 +68,7 @@ export interface ScreencastFrame {
   height: number
   /** 单调递增帧号——前端据此丢弃过期帧（背压）。 */
   seq: number
+  interactionId?: string
 }
 
 /** 反向输入事件（面板 → CDP Input 域）。坐标是视口 CSS 像素。 */
@@ -74,6 +77,7 @@ export interface BrowserInputEvent {
   x?: number
   y?: number
   button?: 'left' | 'right' | 'middle' | 'none'
+  buttons?: number
   clickCount?: number
   deltaX?: number
   deltaY?: number
@@ -84,7 +88,18 @@ export interface BrowserInputEvent {
   modifiers?: number
 }
 
+export interface BrowserPageInfo {id:string;url:string;title:string;active:boolean;canBack:boolean;canForward:boolean;loading:boolean}
 export interface BrowserDebugDriver {
+  subscribeTargetChanges?(listener: () => void): () => void
+  listPages?():Promise<BrowserPageInfo[]>
+  selectPage?(id:string):Promise<void>
+  newPage?(url:string):Promise<void>
+  closePage?(id:string):Promise<void>
+  insertText?(text:string, checkContext?: () => void):Promise<void>
+  uploadFiles?(files:string[]):Promise<void>
+  uploadBuffers?(files:Array<{name:string;mimeType:string;buffer:Buffer}>):Promise<void>
+  downloads?():Array<{id:string;name:string;path:string|null}>
+
   goto(url: string, signal?: AbortSignal): Promise<void>
   evaluate(expression: string): Promise<string>
   screenshot(opts?: ScreenshotOptions): Promise<Buffer>
@@ -132,7 +147,7 @@ export interface BrowserDebugDriver {
   /** 主动取一张当前画面——用于连接瞬间补首帧（静态页不产帧）。 */
   captureFrame?(opts?: ScreencastOptions): Promise<ScreencastFrame | null>
   /** 反向注入鼠标/键盘事件。 */
-  dispatchInput?(evt: BrowserInputEvent): Promise<void>
+  dispatchInput?(evt: BrowserInputEvent, checkContext?: () => void): Promise<void>
 }
 
 /** Viewport bounds. The lower bound keeps a resize from producing a degenerate
@@ -274,6 +289,8 @@ export interface PageTracker {
   /** 当前 active 指针（可能为 null 或已关闭）——供 currentUrl/viewportSize 等同步方法容错读取。 */
   activePage(): PwPage | null
   pageUrls(): string[]
+  pages():Array<{id:string;page:PwPage}>
+  selectPage(id:string):void
 }
 
 /**
@@ -296,9 +313,11 @@ export function attachPageTracker(
   let active: PwPage | null = initial
   let creating: Promise<PwPage> | null = null
   const known = new WeakSet<PwPage>()
+  const pageIds=new WeakMap<PwPage,string>();let pageSeq=0
   const track = (page: PwPage): void => {
     if (known.has(page)) return
     known.add(page)
+    pageIds.set(page,`page-${++pageSeq}`)
     wireEvents(page, events, counter)
     active = page
     page.on('close', (() => {
@@ -330,6 +349,8 @@ export function attachPageTracker(
     },
     activePage: () => active,
     pageUrls: () => context.pages().map((p) => p.url()),
+    pages:()=>context.pages().filter(p=>!p.isClosed()).map(page=>{if(!pageIds.has(page))track(page);return {id:pageIds.get(page)!,page}}),
+    selectPage:(id)=>{const page=context.pages().find(p=>pageIds.get(p)===id&&!p.isClosed());if(!page)throw new Error('Page not found');active=page},
   }
 }
 
@@ -340,6 +361,7 @@ function buildDriver(
   pageUrls: () => string[],
   closeFn: () => Promise<void>,
   isAlive: () => boolean,
+  tracker:PageTracker,
 ): BrowserDebugDriver {
   // ── 实时帧流（可选能力）────────────────────────────────────────────────
   // 一个 driver 同时只跑一条 screencast；CDP session 惰性建立并绑定 active page，
@@ -348,6 +370,9 @@ function buildDriver(
   let cdpPage: PwPage | null = null
   let frameSeq = 0
   let frameSink: ((frame: ScreencastFrame) => void) | null = null
+  const targets = observeBrowserTargets(context, tracker, activePage)
+  const targetChanged = targets.notify
+  let cdpBinding: Promise<unknown> = Promise.resolve()
 
   const detachCdp = async (): Promise<void> => {
     const cur = cdp
@@ -362,16 +387,40 @@ function buildDriver(
   }
 
   /** 绑定到当前 active page；page 换了就重建（旧 session 先 detach）。 */
-  const ensureCdp = async (): Promise<PwCDPSession> => {
-    const page = await resolvePage()
-    if (cdp && cdpPage === page) return cdp
-    await detachCdp()
-    cdp = await context.newCDPSession(page)
-    cdpPage = page
-    return cdp
+  const ensureCdp = (): Promise<PwCDPSession> => {
+    const next = cdpBinding.catch(() => {}).then(async () => {
+      const page = await resolvePage()
+      if (cdp && cdpPage === page) return cdp
+      await detachCdp()
+      cdp = await context.newCDPSession(page)
+      cdpPage = page
+      return cdp
+    })
+    cdpBinding = next
+    return next
   }
 
+
+  const downloads:Array<{id:string;name:string;path:string|null}>=[]
+  const loading=new WeakMap<PwPage,boolean>()
+  const observed=new WeakSet<PwPage>()
+  const watch=()=>{for(const {page} of tracker.pages())if(!observed.has(page)){observed.add(page);page.on('request',((request:{resourceType():string})=>{if(request.resourceType()==='document')loading.set(page,true)}) as never);page.on('domcontentloaded',(()=>loading.set(page,false)) as never);page.on('load',(()=>loading.set(page,false)) as never);page.on('requestfailed',(()=>loading.set(page,false)) as never);page.on('download',((d:{suggestedFilename():string;path():Promise<string|null>})=>{const item={id:`download-${downloads.length+1}`,name:d.suggestedFilename(),path:null as string|null};downloads.push(item);void d.path().then(path=>{item.path=path}).catch(()=>{})}) as never)}}
+  watch();context.on('page',(()=>watch()) as never)
   return {
+    subscribeTargetChanges: targets.subscribe,
+    listPages:async()=>{watch();const rows=[];for(const {id,page} of tracker.pages()){
+      let title='';try{title=String(await page.evaluate('document.title'))}catch{}
+      let canBack=false,canForward=false
+      if(page===activePage()){try{const history=await (await ensureCdp()).send('Page.getNavigationHistory') as {currentIndex:number;entries:unknown[]};canBack=history.currentIndex>0;canForward=history.currentIndex<history.entries.length-1}catch{}}
+      rows.push({id,url:page.url(),title,active:page===activePage(),canBack,canForward,loading:loading.get(page)??false})
+    }return rows},
+    selectPage:async id=>{tracker.selectPage(id);targetChanged();await detachCdp()},
+    newPage:async url=>{const page=await context.newPage();if(url)await page.goto(url,{waitUntil:'domcontentloaded',timeout:30000})},
+    closePage:async id=>{const p=tracker.pages().find(p=>p.id===id)?.page;if(!p?.close)throw new Error('Page cannot be closed');await p.close();await detachCdp()},
+    insertText:async (text,checkContext)=>{const session=await ensureCdp();checkContext?.();await session.send('Input.insertText',{text})},
+    uploadFiles:async files=>{const page=await resolvePage();if(!page.setInputFiles)throw new Error('File upload unavailable');await page.setInputFiles('input[type=file]',files)},
+    uploadBuffers:async files=>{const page=await resolvePage();if(!page.setInputFiles)throw new Error('File upload unavailable');await page.setInputFiles('input[type=file]',files)},
+    downloads:()=>downloads,
     goto: async (url, signal) => {
       const page = await resolvePage()
       const merged = mergeAbortSignal(30_000, signal)
@@ -528,7 +577,11 @@ function buildDriver(
       await (await resolvePage()).evaluate(`${varName}.clear()`)
     },
     setViewport: async (width, height) => {
-      await (await resolvePage()).setViewportSize({ width, height })
+      const page = await resolvePage()
+      const size = page.viewportSize()
+      if (size?.width === width && size.height === height) return
+      await page.setViewportSize({ width, height })
+      targetChanged()
     },
     viewportSize: () => {
       const page = activePage()
@@ -560,7 +613,7 @@ function buildDriver(
           seq: frameSeq,
         }
         try {
-          frameSink?.(frame)
+          if (cdp === session && frameSink === onFrame) onFrame(frame)
         } catch {
           /* 订阅方抛错不得打断推流 */
         }
@@ -579,6 +632,7 @@ function buildDriver(
     },
     stopScreencast: async () => {
       frameSink = null
+      await cdpBinding.catch(() => {})
       if (cdp) {
         try {
           await cdp.send('Page.stopScreencast')
@@ -603,15 +657,16 @@ function buildDriver(
         return null
       }
     },
-    dispatchInput: async (evt) => {
+    dispatchInput: async (evt, checkContext) => {
       const session = await ensureCdp()
+      checkContext?.()
       const params: Record<string, unknown> = {}
-      for (const k of ['x', 'y', 'button', 'clickCount', 'deltaX', 'deltaY', 'key', 'code', 'text', 'modifiers'] as const) {
+      for (const k of ['x', 'y', 'button', 'buttons', 'clickCount', 'deltaX', 'deltaY', 'key', 'code', 'text', 'modifiers'] as const) {
         const v = evt[k]
         if (v != null) params[k] = v
       }
       const method = evt.type.startsWith('mouse') ? 'Input.dispatchMouseEvent' : 'Input.dispatchKeyEvent'
-      await session.send(method, { type: evt.type, ...params })
+      await session.send(method, { type: evt.type, ...params, ...(evt.type.startsWith('key') ? browserKeyParameters(evt) : {}) })
     },
   }
 }
@@ -704,6 +759,7 @@ export const playwrightDriverFactory: BrowserDebugDriverFactory = async (opts) =
     tracker.pageUrls,
     () => context.close(),
     wireLiveness(context),
+    tracker,
   )
 }
 
@@ -731,6 +787,7 @@ export const playwrightConnectFactory: BrowserDebugDriverFactory = async (opts) 
     tracker.pageUrls,
     () => browser.close(),
     wireLiveness(context),
+    tracker,
   )
 }
 

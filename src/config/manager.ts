@@ -15,7 +15,7 @@ import { backfillPresetModelFields, migratePresetModelBackfill } from './preset-
 import { migrateProviderToKeys, keyRefFor, defaultKeyOf, keyRefReferrers } from './provider-keys.js'
 import { injectProviderKeys, stripProviderKeys, writeProviderKeysFile, providerKeysPath } from './provider-keys-store.js'
 import { assertDefaultModelRef } from './contract-models.js'
-import { migrateDeepseekVisionExpRetirement } from './preset-model-retirement.js'
+import { migrateDeepseekVisionExpRetirement, migrateDeepseekV4FlashRetirement } from './preset-model-retirement.js'
 import { writeSecret, readSecret, deleteSecret } from './secrets-store.js'
 import { invalidateToolPreset } from '../tools/tool-preset.js'
 import { invalidatePromptBlocks } from '../prompt/block-policy.js'
@@ -437,6 +437,7 @@ export function loadConfig(options?: {
     const dsChanged = migrateDeepseekMaxTokens(cpMigrated)
     const flashChanged = migrateV4FlashEffort(cpMigrated)
     const visionExpRetired = migrateDeepseekVisionExpRetirement(cpMigrated)
+    const v4FlashRetired = migrateDeepseekV4FlashRetirement(cpMigrated)
     const keysMoved = migrateInlineApiKeys(cpMigrated)
     const searchKeysMoved = migrateSearchInlineApiKeys(cpMigrated)
     const capsChanged = migrateLegacyCapabilities(cpMigrated)
@@ -445,7 +446,7 @@ export function loadConfig(options?: {
     const aliasStripped = migrateStripModelAlias(cpMigrated)
     // Write back if any migration modified the raw config so the fix
     // persists across restarts (one-shot, idempotent).
-    if (cpMigrated !== raw || dsChanged || flashChanged || visionExpRetired || keysMoved || searchKeysMoved || capsChanged || protoChanged || backfillChanged || aliasStripped) {
+    if (cpMigrated !== raw || dsChanged || flashChanged || visionExpRetired || v4FlashRetired || keysMoved || searchKeysMoved || capsChanged || protoChanged || backfillChanged || aliasStripped) {
       try {
         writeFileAtomicSync(configPath, JSON.stringify(cpMigrated, null, 2) + '\n')
       } catch {
@@ -1702,10 +1703,10 @@ export interface GreetingConfigSnapshot {
 }
 
 /** Snapshot of the greeting LLM config for the desktop/TUI settings UI.
- *  Falls back to defaults ({ enabled: true, model: 'deepseek-v4-flash' })
+ *  Falls back to defaults ({ enabled: true, model: 'deepseek-flash' })
  *  when no user config is present. */
 export function getGreetingConfig(): GreetingConfigSnapshot {
-  return loadConfig().agent.greeting ?? { enabled: true, model: 'deepseek-v4-flash' }
+  return loadConfig().agent.greeting ?? { enabled: true, model: 'deepseek-flash' }
 }
 
 /**
@@ -1995,7 +1996,7 @@ export function clampModelTokens<T extends { contextWindow: number; maxTokens: n
  * clearing a field is `removeModel`'s job, not a side effect of editing a
  * context window.
  */
-function mergeModelUpdate(existing: ModelConfig, incoming: ModelConfig): ModelConfig {
+export function mergeModelUpdate(existing: ModelConfig, incoming: ModelConfig): ModelConfig {
   const merged: Record<string, unknown> = { ...existing }
   for (const [key, value] of Object.entries(incoming)) {
     if (value !== undefined) merged[key] = value

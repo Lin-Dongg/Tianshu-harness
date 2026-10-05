@@ -77,6 +77,11 @@ export interface Usage {
     attemptId: string
     status: 'complete' | 'aborted'
     fields: Record<string, string>
+    wire?: { provider: string; model: string; purpose?: string; continuationSource?: string; previousMainRequestId?: string; baseline: string; comparison?: string; endpointHash?: string; messages: Array<{ hash: string; chars: number; role: string }>; toolsHash: string; options: Record<string, unknown> }
+    responseId?: string
+    responseModel?: string
+    systemFingerprint?: string
+    finishReason?: string
     prefix?: { system: string; tools: string; history: string; chars: number; messages: number; changed: boolean; firstChange?: number }
   }
   /**

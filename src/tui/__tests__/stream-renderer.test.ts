@@ -1,5 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { stripVTControlCharacters } from 'node:util'
 import { StreamRenderer, findStableBoundary } from '../engine/stream-renderer.js'
 import { getTheme } from '../theme.js'
 
@@ -256,4 +257,19 @@ test('multibyte segments larger than 16KB UTF-8 bytes bypass the cache', () => {
   renderer.reset()
   renderer.push(`${overLimit}\n\n`)
   assert.deepEqual(cacheEvents, [], 'oversized segments should avoid cache bookkeeping')
+})
+
+test('live disclosure distinguishes truncation without modifying pending or committed text', () => {
+  const { renderer, commits } = makeRenderer(80)
+  renderer.push('短句')
+  assert.ok(!renderer.getLiveTailView(6, '', true).join('\n').includes('当前仅展示'))
+  const raw = '中文段落'.repeat(300)
+  renderer.reset(); renderer.push(raw)
+  const view = renderer.getLiveTailView(6, '', true)
+  assert.match(view[0]!, /当前仅展示末 6 行/)
+  assert.equal(view.length, 7)
+  assert.equal(renderer.pendingText, raw)
+  renderer.finalize()
+  assert.equal(stripVTControlCharacters(commits.join('')).replace(/\s/g, ''), raw)
+  assert.deepEqual(renderer.getLiveTailView(6, '', true), [])
 })

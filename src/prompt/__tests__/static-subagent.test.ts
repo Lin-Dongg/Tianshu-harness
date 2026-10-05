@@ -89,10 +89,16 @@ import type { ToolDefinition } from '../../api/types.js'
  *  显式格式，把可核销的 commit 事实摆在报告最前，而不是散在正文里让读者自己去找。
  *  行数不变仍 252（同一行内换文案），identity 占比不变 5.16%——本笔零行数代价。
  *  同前几笔：改 hash 即所有会话前缀缓存冷启动一次，这是本笔的已知代价，不是意外。
+ *  2026-10-05 **有意变更**：delegation 指南的「只读探查用 profile」行补能力边界——
+ *  「只读档无 shell/写工具，需运行命令或改文件的任务不要派给它们」。来源：子代理失败
+ *  诊断（修复计划 W3）——9 个失败工单中 2 个是 profile 错配（code_scout 接 shell
+ *  探测 / PNG 判读工单，worker 只能 blocked 白跑）；配套把同一能力边界同步进
+ *  delegate_task / delegate_batch 的 profile 字段描述。行数不变仍 292（同一行内追加）。
+ *  同前几笔：改 hash 即所有会话前缀缓存冷启动一次，这是本笔的已知代价，不是意外。
  */
 // 辅胶囊可读性调校：固定四栏目替换为五条按信息关系组织的规则，保留交付披露。
 // 静态前缀有意变更；新提示词可能冷启动缓存，运行中的冻结快照不在此迁移。
-const MAIN_PROMPT_SHA256 = '2eaf4d3a238e58174ea51f48af6f7f5510cc5d1c51950f3a14749d0dd2fd2c42'
+const MAIN_PROMPT_SHA256 = 'b7885a6111da5b4bacbad2269560a52a6aada4ea6e6719620d9b8b88889631e9'
 
 function tool(name: string): ToolDefinition {
   return { name, description: '', input_schema: { type: 'object', properties: {} } } as ToolDefinition

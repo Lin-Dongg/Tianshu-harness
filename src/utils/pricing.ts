@@ -46,8 +46,9 @@ export function computeUsageCost(
   const outputCost = (outputTokens / 1_000_000) * (pricing.output ?? 0)
   const cacheReadCost = (cacheReadTokens / 1_000_000) * (pricing.cacheRead ?? pricing.input ?? 0)
   const cacheWriteCost = (cacheWriteTokens / 1_000_000) * (pricing.cacheWrite ?? pricing.input ?? 0)
-  const reasoningCost = reasoningTokens > 0
-    ? (reasoningTokens / 1_000_000) * (pricing.reasoning ?? pricing.output ?? 0)
+  // Provider reasoning is included in output; bill separately only with an explicit rate.
+  const reasoningCost = reasoningTokens > 0 && pricing.reasoning !== undefined
+    ? (reasoningTokens / 1_000_000) * (pricing.reasoning ?? 0)
     : 0
 
   const round = (v: number) => Math.round(v * 1_000_000) / 1_000_000

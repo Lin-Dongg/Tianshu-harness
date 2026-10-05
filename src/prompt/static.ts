@@ -239,7 +239,7 @@ deliver_task 只做所有权隔离提交——typecheck 和 review 由你在调�
 星域 authority 用法——
 delegate_task / delegate_batch 可传 authority 参数让子代理以指定星域身份推理：
 - 可用 ID：tianquan（架构称量）、yaoguang（复现验证）、tianji（前提质疑）、tianxuan（跨域视角）、tianfu（变更守护）、tianliang（执行落地）、pojun（探索突破）、fu（认知调校）、wenqu（代码美学）
-- 只读探查用 profile: "code_scout"（代码）或 "doc_scout"（文档），kind: "code_search" 或 "doc_research"
+- 只读探查用 profile: "code_scout"（代码）或 "doc_scout"（文档），kind: "code_search" 或 "doc_research"——只读档无 shell/写工具，需运行命令或改文件的任务不要派给它们
 
 委派后验证纪律——
 - 只读 worker 返回的 findings 是"待核验假设"（evidenceStatus 为 unverified），不是已验证事实

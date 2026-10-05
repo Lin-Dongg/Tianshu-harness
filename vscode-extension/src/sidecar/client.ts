@@ -378,6 +378,7 @@ export class SidecarClient {
     opts?: { clientId?: string },
   ): () => void {
     let cancelled = false
+    const controller = new AbortController()
     let lastSeq = since
     let retryMs = 500
     const clientQ = opts?.clientId ? `&clientId=${encodeURIComponent(opts.clientId)}` : ''
@@ -387,17 +388,22 @@ export class SidecarClient {
         try {
           const res = await fetch(
             `${this.baseUrl}/sessions/${encodeURIComponent(id)}/stream?since=${lastSeq}${clientQ}`,
-            { headers: { authorization: `Bearer ${this.token}` } },
+            { headers: { authorization: `Bearer ${this.token}` }, signal: controller.signal },
           )
+          if (cancelled) {
+            await res.body?.cancel()
+            return
+          }
           if (!res.ok || !res.body) throw new Error(`stream → ${res.status}`)
           onStateChange?.(true)
           retryMs = 500
           await this.consumeSse(res.body, (ev) => {
+            if (cancelled) return
             const kind = classifyStreamEvent(ev.seq, lastSeq)
             if (kind === 'dup') return
             if (kind === 'next') lastSeq = ev.seq
             onEvent(ev)
-          })
+          }, controller.signal)
         } catch {
           // fall through to retry
         }
@@ -408,34 +414,44 @@ export class SidecarClient {
       }
     }
     void connect()
-    return () => { cancelled = true }
+    return () => {
+      cancelled = true
+      controller.abort()
+    }
   }
 
   /** 解析 SSE 帧：`event: <type>` + `data: <json SessionEvent>`；`:` 开头为心跳注释。 */
-  private async consumeSse(body: ReadableStream<Uint8Array>, onEvent: (ev: SessionEvent) => void): Promise<void> {
+  private async consumeSse(body: ReadableStream<Uint8Array>, onEvent: (ev: SessionEvent) => void, signal: AbortSignal): Promise<void> {
     const reader = body.getReader()
+    const cancel = () => { void reader.cancel().catch(() => {}) }
+    signal.addEventListener('abort', cancel, { once: true })
     const decoder = new TextDecoder()
     let buf = ''
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) return
-      buf += decoder.decode(value, { stream: true })
-      let idx: number
-      while ((idx = buf.indexOf('\n\n')) >= 0) {
-        const frame = buf.slice(0, idx)
-        buf = buf.slice(idx + 2)
-        const dataLines = frame
-          .split('\n')
-          .filter((l) => l.startsWith('data:'))
-          .map((l) => l.slice(5).trimStart())
-        if (dataLines.length === 0) continue
-        try {
-          const ev = JSON.parse(dataLines.join('\n')) as SessionEvent
-          if (typeof ev?.seq === 'number' && typeof ev?.type === 'string') onEvent(ev)
-        } catch {
-          // 忽略无法解析的帧（向后兼容：未知格式不致命）
+    try {
+      while (!signal.aborted) {
+        const { done, value } = await reader.read()
+        if (done || signal.aborted) return
+        buf += decoder.decode(value, { stream: true })
+        let idx: number
+        while ((idx = buf.indexOf('\n\n')) >= 0) {
+          const frame = buf.slice(0, idx)
+          buf = buf.slice(idx + 2)
+          const dataLines = frame
+            .split('\n')
+            .filter((l) => l.startsWith('data:'))
+            .map((l) => l.slice(5).trimStart())
+          if (dataLines.length === 0) continue
+          try {
+            const ev = JSON.parse(dataLines.join('\n')) as SessionEvent
+            if (typeof ev?.seq === 'number' && typeof ev?.type === 'string') onEvent(ev)
+          } catch {
+            // 忽略无法解析的帧（向后兼容：未知格式不致命）
+          }
         }
       }
+    } finally {
+      signal.removeEventListener('abort', cancel)
+      reader.releaseLock()
     }
   }
 }

@@ -73,7 +73,7 @@ test('本 run 写入新 todo 后：新清单正常显示', async () => {
   t.out.clear()
   t.app.setTodos([mk('n1', 'new task', 'in_progress'), mk('n2', 'another', 'pending')])
   const plain = stripAnsi(t.out.chunks.join(''))
-  assert.ok(plain.includes('步骤 2'), 'new unfinished steps have a real expansion entry')
+  assert.ok(plain.includes('≡0/2'), 'new unfinished steps are visible via the chrome badge (0 done / 2 total)')
   ;(t.app as any).state.todoExpanded = true
   t.app.setInput('review')
   assert.ok(stripAnsi(t.out.chunks.join('')).includes('new task'), 'explicit review displays the new checklist')
@@ -86,7 +86,7 @@ test('本 run 内推进到全完成：仍显示（本 run 有效信息）', asyn
   t.out.clear()
   t.app.setTodos([mk('n1', 'new task', 'completed')])
   const plain = stripAnsi(t.out.chunks.join(''))
-  assert.ok(!plain.includes('步骤 1'), 'completed steps no longer claim pending work')
+  assert.ok(!plain.includes('≡0/'), 'completed steps no longer claim pending work')
   ;(t.app as any).state.todoExpanded = true
   t.app.setInput('review completed')
   assert.ok(stripAnsi(t.out.chunks.join('')).includes('new task'), 'completed checklist remains available through explicit review')
@@ -120,5 +120,5 @@ test('部分完成清单跨 run 仍显示（不视为陈旧）', async () => {
   t.out.clear()
   await startStreamingRun(t.app)
   const plain = stripAnsi(t.out.chunks.join(''))
-  assert.ok(plain.includes('步骤 1'), 'unfinished checklist retains its entry across runs')
+  assert.ok(plain.includes('≡1/2'), 'unfinished checklist retains its entry across runs (1 done / 2 total)')
 })

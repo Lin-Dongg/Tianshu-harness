@@ -36,14 +36,26 @@ function tokenStore(serverId: string): TokenStore {
   return new TokenStore(mcpOAuthDir(), serverId)
 }
 
-/** Start the full OAuth flow for a given server + provider.
- *  Returns the serialized token on success. */
-export async function startMcpOAuth(
+/** 已开始、尚未完成的 OAuth 流程——授权页 URL 立即交出，回调与换 token 在后台跑。 */
+export interface McpOAuthBegin {
+  /** 授权页 URL——由调用方负责打开（TUI 打 stderr；桌面端 openExternal）。 */
+  authUrl: string
+  /** 回调等待 + code 交换 + 落盘的完整流程；成功 resolve token，超时/被拒 reject。
+   *  调用方必须立即挂 then/catch——不挂的话 reject 会变 unhandled。 */
+  completion: Promise<McpOAuthToken>
+}
+
+/**
+ * 开始 OAuth 流程但**不阻塞等待**：拿到授权页 URL 即返回，回调监听与换 token
+ * 收进 completion。桌面 sidecar 用（端点先把 authUrl 还给前端开浏览器，前端再
+ * 轮询 oauth/status）——serveCallback 只把 URL 写 stderr，桌面端用户看不到。
+ */
+export async function beginMcpOAuth(
   serverId: string,
   provider: McpOAuthProvider,
   clientId: string,
   extraScopes?: string[],
-): Promise<McpOAuthToken> {
+): Promise<McpOAuthBegin> {
   const pkce = await generatePKCE()
   const state = randomBytes(16).toString('hex')
   const redirectUri = `http://localhost:${REDIRECT_PORT}${CALLBACK_PATH}`
@@ -61,22 +73,31 @@ export async function startMcpOAuth(
   const url = new URL(authUrl)
   url.searchParams.set('scope', scopes.join(' '))
 
-  const code = await serveCallback(REDIRECT_PORT, state, url.toString())
-  const token = await exchange(code, pkce.verifier, redirectUri, provider, clientId)
+  const completion = (async () => {
+    const code = await serveCallback(REDIRECT_PORT, state, url.toString())
+    const token = await exchange(code, pkce.verifier, redirectUri, provider, clientId)
+    // Save metadata (provider, scopes) alongside the raw TokenData so
+    // loadMcpOAuthToken can reconstruct the full McpOAuthToken.
+    tokenStore(serverId).save({
+      ...token,
+      _provider: provider.id,
+      _scopes: scopes,
+    } as TokenData & { _provider: string; _scopes: string[] })
+    return { ...token, provider: provider.id, scopes }
+  })()
+  return { authUrl: url.toString(), completion }
+}
 
-  const mcpToken: McpOAuthToken = {
-    ...token,
-    provider: provider.id,
-    scopes,
-  }
-  // Save metadata (provider, scopes) alongside the raw TokenData so
-  // loadMcpOAuthToken can reconstruct the full McpOAuthToken.
-  tokenStore(serverId).save({
-    ...token,
-    _provider: provider.id,
-    _scopes: scopes,
-  } as TokenData & { _provider: string; _scopes: string[] })
-  return mcpToken
+/** Start the full OAuth flow for a given server + provider.
+ *  Returns the serialized token on success. */
+export async function startMcpOAuth(
+  serverId: string,
+  provider: McpOAuthProvider,
+  clientId: string,
+  extraScopes?: string[],
+): Promise<McpOAuthToken> {
+  const { completion } = await beginMcpOAuth(serverId, provider, clientId, extraScopes)
+  return completion
 }
 
 /** Get a fresh access token for a server, refreshing if needed. */
@@ -131,6 +152,10 @@ type PendingCallback = {
 let sharedServer: Server | null = null
 let sharedServerPort: number | null = null
 let serverStartPromise: Promise<void> | null = null
+/** 回调服务器处于「关」态（含从未启动）。close 与 listen 完成的竞态里，
+ *  listen 回调与 serveCallback 都按它决定是领养还是立即关回——不判就会出现
+ *  close 后又被重新挂上监听的复活泄漏（2026-10-04 实测吊住测试进程）。 */
+let sharedServerClosed = true
 const pendingCallbacks = new Map<string, PendingCallback>()
 
 async function getOrStartSharedServer(port: number): Promise<void> {
@@ -147,7 +172,9 @@ async function getOrStartSharedServer(port: number): Promise<void> {
     const server = createServer((req: IncomingMessage, res: ServerResponse) => {
       handleCallbackRequest(req, res)
     })
-
+    // 进入「开」态必须在 listen 之前——listen 回调的竞态判据就指望它：
+    // close 先到则回调里看到 closed=true 立即关回。
+    sharedServerClosed = false
     server.once('error', (err) => {
       const wasStarting = serverStartPromise !== null
       const allPending = Array.from(pendingCallbacks.values())
@@ -165,6 +192,12 @@ async function getOrStartSharedServer(port: number): Promise<void> {
     // 代价：IPv6 回环（::1）不再可达（实测 ECONNREFUSED）——浏览器对 localhost
     // 通常有 IPv4 回退，且与 oauth-auth.ts 同口径，故接受。
     server.listen(port, '127.0.0.1', () => {
+      if (sharedServerClosed) {
+        // close 与 listen 完成撞在同一代际——立即关回，不得领养。
+        server.close(() => {})
+        reject(new Error('OAuth callback server closed'))
+        return
+      }
       sharedServer = server
       sharedServerPort = port
       resolve()
@@ -180,15 +213,28 @@ async function getOrStartSharedServer(port: number): Promise<void> {
 }
 
 async function closeSharedServer(): Promise<void> {
+  sharedServerClosed = true
   const server = sharedServer
   sharedServer = null
   sharedServerPort = null
   serverStartPromise = null
-  for (const pending of pendingCallbacks.values()) clearTimeout(pending.timeout)
+  // 拒掉在途回调——对应的 serveCallback promise 以 error 落定（completion 走
+  // catch），而不是永远 pending 把调用方的句柄挂在半空。
+  for (const pending of pendingCallbacks.values()) {
+    clearTimeout(pending.timeout)
+    pending.reject(new Error('OAuth callback server closed'))
+  }
   pendingCallbacks.clear()
   if (server) {
     await new Promise<void>((resolve) => server.close(() => resolve()))
   }
+}
+
+/** @internal 测试专用：关共享回调服务器、清在途回调与超时句柄（否则监听 + 5 分钟
+ *  超时把测试进程的事件循环吊住——runner 已移除 --test-force-exit）。生产不需要：
+ *  CALLBACK_TIMEOUT_MS 是在途流程的天然回收口。 */
+export async function _closeMcpOAuthCallbackServerForTests(): Promise<void> {
+  await closeSharedServer()
 }
 
 function handleCallbackRequest(req: IncomingMessage, res: ServerResponse): void {
@@ -251,6 +297,10 @@ export async function serveCallback(
   timeoutMs: number = CALLBACK_TIMEOUT_MS,
 ): Promise<string> {
   await getOrStartSharedServer(port)
+  if (sharedServerClosed) {
+    // close 与我们的 await 撞车——不得再登记 pending（否则新超时句柄无人清）。
+    throw new Error('OAuth callback server closed')
+  }
 
   return new Promise<string>((resolve, reject) => {
     const timeout = setTimeout(() => {

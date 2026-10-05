@@ -47,6 +47,16 @@ export class CoordinatorState {
     return this.consecutiveFailures >= this.failureBudget.maxFailures
   }
 
+  recordFinalOutcome(type: 'passed' | 'blocked' | 'failed', workOrderId: string): { escalated: boolean; consecutiveFailures: number } {
+    this.recordEvent({ type, workOrderId, timestamp: Date.now(), detail: 'objective and evidence gates applied' })
+    const escalated = type === 'failed' && this.shouldEscalate()
+    if (escalated) {
+      this.events[this.events.length - 1] = { type: 'blocked', workOrderId, timestamp: Date.now(), detail: 'execution failed; failure budget escalated final delivery' }
+      this.recordEvent({ type: 'escalated', workOrderId, timestamp: Date.now() })
+    }
+    return { escalated, consecutiveFailures: this.consecutiveFailures }
+  }
+
   getEvents(): WorkerEvent[] {
     return [...this.events]
   }

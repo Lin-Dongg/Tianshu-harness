@@ -19,7 +19,7 @@ function makeVerificationEvent(
   return { type: 'verification', timestamp, command, status, meta: { scope, ...metaOverrides } }
 }
 
-const stubOwnership = {} as OwnershipLedger
+const stubOwnership = { isOwned: () => true, isCoOwned: () => false } as unknown as OwnershipLedger
 
 describe('getEffectiveVerifications — VSW snapshotRef staleness', () => {
   it('keeps all events when no currentSnapshotRef supplied (legacy behavior)', () => {
@@ -82,7 +82,7 @@ describe('attribution — integration_conflict (Phase B advisory)', () => {
       failed: 1,
       skipped: 0,
       durationMs: 100,
-      verificationPhase: 'integration',
+      verificationPhase: 'integration', isolatedPassed: true, snapshotRef: 'current-ref', targetFiles: ['src/x.test.ts'],
     }
   }
 
@@ -112,7 +112,7 @@ describe('attribution — integration_conflict (Phase B advisory)', () => {
   it('aggregate: owned_failure still outranks integration_conflict', () => {
     const ownedFail: VerificationMetadata = {
       command: 'run_tests src/y.test.ts', status: 'failed', scope: 'targeted',
-      exitCode: 1, passed: 0, failed: 2, skipped: 0, durationMs: 50,
+      exitCode: 1, passed: 0, failed: 2, skipped: 0, durationMs: 50, targetFiles: ['src/y.test.ts'],
     }
     const result = attr.getAggregateAttribution([ownedFail, integrationFailure()])
     assert.equal(result.attribution, 'owned_failure')

@@ -5,7 +5,7 @@
  * 1. Worker session messages are persisted after a delegate() call
  * 2. A subsequent delegate() with resumeWorkOrderId loads those messages and
  *    injects them as priorMessages into the worker config
- * 3. When the saved session doesn't exist, the worker starts fresh
+ * 3. Missing full history refuses execution instead of silently starting fresh
  */
 import { describe, it, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
@@ -201,7 +201,7 @@ describe('coordinator session resume', () => {
     assert.equal(capturedConfigs[0]!.priorMessages![0]!.role, 'user')
   })
 
-  it('degrades to fresh worker when resumeWorkOrderId has no saved session', async () => {
+  it('refuses execution when resumeWorkOrderId has no saved session', async () => {
     const capturedConfigs: { priorMessages?: readonly OaiMessage[] }[] = []
     const coordinator = makeCoordinator({
       homeDir,
@@ -215,7 +215,7 @@ describe('coordinator session resume', () => {
       },
     })
 
-    await coordinator.delegate({
+    const run = await coordinator.delegate({
       parentTurnId: 'tu_test_fresh',
       objective: 'Search for something entirely new here',
       kind: 'code_search',
@@ -224,8 +224,8 @@ describe('coordinator session resume', () => {
       resumeWorkOrderId: 'wo_nonexistent',
     })
 
-    // priorMessages should NOT be set — degraded to fresh worker
-    assert.equal(capturedConfigs.length, 1)
-    assert.equal(capturedConfigs[0]!.priorMessages, undefined, 'should start fresh when no saved session')
+    assert.equal(capturedConfigs.length, 0)
+    assert.equal(run.results[0]?.failureReason, 'policy_short_circuit')
+    assert.match(run.results[0]?.summary ?? '', /no recoverable complete history/)
   })
 })

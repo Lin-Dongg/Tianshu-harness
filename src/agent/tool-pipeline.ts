@@ -4,6 +4,7 @@ import type { ContentBlock } from '../api/types.js'
 import type { ToolCallParams, VerificationMetadata, ToolErrorClass } from '../tools/types.js'
 import type { TurnHarness } from './turn-harness.js'
 import type { EvidenceTrackerPublic } from './evidence.js'
+import { buildBashVerification } from './bash-verification.js'
 import type { TraceStore } from './trace-store.js'
 import type { RepairHintTracker } from './repair-hint.js'
 import type { ImportGraph } from './import-graph.js'
@@ -44,7 +45,7 @@ import { batchPrewarm } from './prewarm-file.js'
 import { compactThresholds, pruneThresholds } from '../compact/constants.js'
 import { getToolArtifactThreshold } from '../tools/artifact-threshold.js'
 import { extractTrailingArtifactId } from './tool-result-tiering.js'
-import { truncateToolResult } from './tool-result-truncate.js'
+import { boundToolFailure, truncateToolResult } from './tool-result-truncate.js'
 import { getStarSignature } from './star-signature.js'
 import type { ImmuneHook } from './immune-hook.js'
 import { detectMistakeResolution, sanitizeMistakeResolutionInput } from './mistake-detector.js'
@@ -54,6 +55,7 @@ import type { CacheAdvisor } from '../cache/advisor.js'
 import type { TaskLedger } from './task-ledger.js'
 import type { P3Integration } from './p3-integration.js'
 import { buildCommitNudge } from './commit-nudge.js'
+import { repositoryCapability } from './repository-capability.js'
 import { evaluateTddGate, parseTddGateConfig, EDIT_TOOLS, type TddGateConfig } from './tdd-gate.js'
 import { checkPlanMode } from './plan-mode.js'
 import { checkAskMode } from './ask-mode.js'
@@ -447,6 +449,7 @@ export interface ToolPipelineDeps {
 }
 
 export interface ToolExecResult {
+  presentation?: import('../tools/types.js').ToolResult['presentation']
   toolResult: ContentBlock
   traceStore: TraceStore
   importGraph: ImportGraph | null
@@ -611,7 +614,7 @@ async function artifactIntercept(
   const summary = generateToolSummary(content, toolName, toolInput)
 
   try {
-    const artifactId = await artifactStore.save({
+    const artifactId = await artifactStore.saveDurable({
       tool: toolName,
       target: target as string,
       rawContent: content,
@@ -1311,7 +1314,7 @@ async function executeToolUseInner(
     // this now covers bash (and apply_patch): any shell side effect must fall
     // inside the rollback window, so the snapshot baseline has to be taken
     // before bash runs — not only before write_file/edit_file.
-    if (isMutatingTool(tu.name) && !checkpointCreated) {
+    if (isMutatingTool(tu.name) && !checkpointCreated && (deps.createCheckpoint || await repositoryCapability(deps.cwd) !== 'non_repository')) {
       touchActivity(activityKey, `tool:${tu.name}:pre:checkpoint`)
       const cp = await (deps.createCheckpoint ?? createCheckpoint)(deps.cwd, 'auto', deps.config.sessionId)
       // E6：失败不得置位——旧代码无条件置位会掩盖失败，本回合剩余破坏性操作全落在
@@ -1418,6 +1421,7 @@ async function executeToolUseInner(
       input: tu.input,
       turn,
       execute: async () => {
+        rawToolResult = undefined
         setActivityPhase(activityKey, 'saving', Date.now() + 30_000)
         await callbacks.beforeToolExecute?.(tu.id, tu.name, tu.input)
         deps.abortSignal?.throwIfAborted()
@@ -1565,7 +1569,7 @@ async function executeToolUseInner(
     }
 
     if (!harnessResult.isError) {
-      if (FIDELITY_EXEMPT_TOOLS.has(tu.name)) {
+      if (FIDELITY_EXEMPT_TOOLS.has(tu.name) || rawToolResult?.presentation?.kind === 'worker_packet') {
         // Fidelity-first: deliver the skill instructions verbatim. We still
         // account for the budget so later tools see the cost, but we never
         // rewrite the content (no artifact summary, no truncation, no preview).
@@ -1588,8 +1592,8 @@ async function executeToolUseInner(
         deps.turnBudget.consume(tokenEstimate)
         if (deps.turnBudget.isExhausted()) {
           const preview = finalContent.slice(0, 500)
-          const refPath = rawToolResult?.rawPath ?? 'unknown'
-          finalContent = `<stored ref="${refPath}" chars=${contentChars} tool="${tu.name}">\n${preview}\n...(turn budget exceeded — use read_file with offset/limit for full content)</stored>`
+          const refPath = rawToolResult?.rawPath
+          finalContent = refPath ? `<stored ref="${refPath}" chars=${contentChars} tool="${tu.name}">\n${preview}\n...(turn budget exceeded — use read_file with offset/limit for full content)</stored>` : `${preview}\n...(turn budget exceeded; complete output was not saved)`
         }
       }
    } else {
@@ -1603,6 +1607,8 @@ async function executeToolUseInner(
       // Track eviction for GhostRegistry (error artifacts too)
       const evictedErrId = extractArtifactId(finalContent)
       if (evictedErrId) deps.artifactIdsEvicted?.push(evictedErrId)
+      finalContent = boundToolFailure(truncateSuccessfulToolResult(finalContent, deps.config))
+      deps.turnBudget.consume(Math.ceil(finalContent.length / 4))
 
       // P3-A: inject mistake hints for known error patterns
       if (deps.p3) {
@@ -1696,7 +1702,7 @@ async function executeToolUseInner(
     // DEBUG: unconditional trace for TUI rendering-loss investigation.
     // Log file: ~/.rivet/sessions/<project-slug>/<sessionId>/tool-result-trace.jsonl
     void emitToolResultTrace({ cwd: deps.cwd, sessionId: deps.sessionId, id: tu.id, name: tu.name, isError: harnessResult.isError, contentLen: finalContent.length, source: 'pipeline', errorKind: rawToolResult?.errorKind ?? harnessResult.errorClass })
-    callbacks.onToolResult(tu.id, tu.name, finalContent, harnessResult.isError ?? false, rawToolResult?.rawPath, rawToolResult?.uiContent)
+    callbacks.onToolResult(tu.id, tu.name, finalContent, harnessResult.isError ?? false, rawToolResult?.rawPath, rawToolResult?.uiContent, { command: rawToolResult?.command, outputText: rawToolResult?.displayOutput ?? rawToolResult?.uiContent ?? rawToolResult?.content, outputTruncated: rawToolResult?.displayOutputTruncated, images: rawToolResult?.images, exitCode: rawToolResult?.exitCode, lossiness: rawToolResult?.lossiness })
 
     deps.recordToolHistory(tu.name, tu.input, harnessResult.isError, harnessResult.content, rawToolResult?.errorClass, rawToolResult?.errorKind)
 
@@ -1747,7 +1753,7 @@ async function executeToolUseInner(
           }
         }
         // Commit nudge: warn when uncommitted files accumulate
-        const nudge = buildCommitNudge({ ownedFiles: deps.taskLedger.getOwnedFiles() })
+        const nudge = await repositoryCapability(deps.cwd) === 'repository' ? buildCommitNudge({ ownedFiles: deps.taskLedger.getOwnedFiles() }) : ''
         if (nudge) finalContent += nudge
      } else if (tu.name === 'apply_patch' || tu.name === 'ast_edit') {
         // 路径与写前守卫同源（pre-write-claims 的 preWriteClaimPaths）：同一套
@@ -1815,51 +1821,26 @@ async function executeToolUseInner(
             })
           }
        } else if (/\b(tsc|typecheck|check|test|jest|vitest|mocha|pytest|eslint|lint|build)\b/.test(cmd) || classifyDeclaredCommand(cmd, loadDeclaredVerify(deps.cwd))) {
-          const testStatus = harnessResult.isError ? 'failed' : 'passed'
-          // Parse test counts from bash output so deliver_task shows real numbers
-          // instead of always "0 pass 0 fail". Supports node:test format
-          // ("ℹ pass N" / "ℹ fail N") and common TAP/jest patterns.
-          const output = typeof harnessResult.content === 'string' ? harnessResult.content : ''
-          const passedMatch = output.match(/ℹ\s+pass\s+(\d+)|✅\s+(\d+)\s+passed|Tests?\s+(\d+)\s+passed/i)
-          const failedMatch = output.match(/ℹ\s+fail\s+(\d+)|❌\s+(\d+)\s+failed|Tests?\s+(\d+)\s+failed/i)
-          const skippedMatch = output.match(/ℹ\s+skip\s+(\d+)/i)
-          const passed = passedMatch ? Number.parseInt(passedMatch[1] ?? passedMatch[2] ?? passedMatch[3] ?? '0', 10) : 0
-          const failed = failedMatch ? Number.parseInt(failedMatch[1] ?? failedMatch[2] ?? failedMatch[3] ?? '0', 10) : 0
-          const skipped = skippedMatch ? Number.parseInt(skippedMatch[1] ?? '0', 10) : 0
-          // A2: bash commands matching a declared verify command get structured
-          // semantics (kind + declared flag) instead of regex-only guesses.
+          const verification = buildBashVerification(rawToolResult?.command ?? cmd, rawToolResult, harnessResult)
           const declaredKind = classifyDeclaredCommand(cmd, loadDeclaredVerify(deps.cwd))
-          // exitCode / errorClass 是「这条命令到底怎么结束的」的原始事实。
-          // 此前只记 passed/failed/skipped，而这三者在输出不含测试计数时被默认
-          // 成 0（typecheck/lint/build 天然没有计数）——下游据此把「没解析到计数」
-          // 误读成「没跑成」，把真实编译错误与超时都归为 tool_invocation_failure，
-          // 并告诉模型「不是代码问题」。这里补齐原始事实，判定策略统一放读取侧
-          // （verification-attribution）。timeout 尤其要留痕：超时不等于执行停止，
-          // 底层进程可能仍在写盘（见 TOOL_TIMEOUT_RECOVERY_HINT）。
-          const exitCode = harnessResult.isError ? 1 : 0
-          const timedOut = harnessResult.errorClass === 'timeout'
-            || /timed out after \d+s/.test(output)
+          const errorClass = rawToolResult?.errorClass ?? (harnessResult.isError ? harnessResult.errorClass : undefined)
+          const timedOut = verification.failureKind === 'timeout'
+          const { command: verificationCommand, status: testStatus, ...verificationMeta } = verification
           deps.taskLedger.record({
             type: 'verification',
-            command: cmd.slice(0, 200),
+            command: verificationCommand,
             status: testStatus,
             meta: {
-              scope: 'full', passed, failed, skipped,
-              exitCode,
-              ...(harnessResult.errorClass ? { errorClass: harnessResult.errorClass } : {}),
+              ...verificationMeta,
+              ...(errorClass ? { errorClass } : {}),
               ...(timedOut ? { timedOut: true } : {}),
               ...(declaredKind ? { declared: true, kind: declaredKind } : {}),
             },
           })
           // bash 跑测试/typecheck/lint 也归零 TDD 门禁——否则 agent 用 bash npm test
           // 而非 run_tests 工具时门禁计数器永远不重置，第 4 次编辑必误报拦截。
-          deps.evidence.trackVerification({
-            command: cmd.slice(0, 200),
-            status: testStatus === 'passed' ? 'passed' : 'failed',
-            scope: 'full',
-            exitCode: harnessResult.isError ? 1 : 0, passed, failed, skipped, durationMs: 0,
-          })
-          deps.destructiveGate?.noteVerification(testStatus === 'passed' ? 'passed' : 'failed')
+          deps.evidence.trackVerification(verification)
+          deps.destructiveGate?.noteVerification(testStatus)
        } else {
           deps.taskLedger.record({ type: 'tool_exec', tool: tu.name, meta: { command: cmd.slice(0, 200) } })
        }
@@ -1870,6 +1851,7 @@ async function executeToolUseInner(
         const buildMeta = (v?: VerificationMetadata): Record<string, unknown> => {
           const m: Record<string, unknown> = { scope: v?.scope ?? (filter ? 'targeted' : 'full') }
           if (v) {
+            if (v.kind) m.kind = v.kind
             m.exitCode = v.exitCode
             m.passed = v.passed
             m.failed = v.failed
@@ -1887,10 +1869,12 @@ async function executeToolUseInner(
             // staleness supersession and integration_conflict attribution.
             if (v.snapshotRef) m.snapshotRef = v.snapshotRef
             if (v.verificationPhase) m.verificationPhase = v.verificationPhase
+            if (v.isolatedPassed !== undefined) m.isolatedPassed = v.isolatedPassed
+            if (v.countsReliable !== undefined) m.countsReliable = v.countsReliable
           }
           return m
         }
-        deps.taskLedger.record({ type: 'verification', command, status: harnessResult.isError ? 'failed' : 'passed', meta: buildMeta(verification) })
+        deps.taskLedger.record({ type: 'verification', command, status: verification?.status ?? (harnessResult.isError ? 'failed' : 'blocked'), meta: buildMeta(verification) })
         // VSW two-phase: record the integration (Phase B) verification too so a
         // Phase B failure surfaces as a non-blocking integration_conflict.
         for (const extra of rawToolResult?.extraVerifications ?? []) {
@@ -2129,12 +2113,13 @@ async function executeToolUseInner(
           diagnosedContent = await artifactIntercept(diagnosedContent, tu.name, tu.input, deps.artifactStore, harnessResult.isError, diagThreshold, diagBudgetFrac, deps.config.contextWindow)
           const diagEvictedId = extractArtifactId(diagnosedContent)
           if (diagEvictedId) deps.artifactIdsEvicted?.push(diagEvictedId)
-          return { toolResult: { type: 'tool_result', tool_use_id: tu.id, content: starSig ? diagnosedContent + starSig : diagnosedContent, is_error: harnessResult.isError }, traceStore, importGraph, lastConflictCheckCount, checkpointCreated, latestRisk, errorKind: harnessResult.isError ? resolveErrorKind(rawToolResult) : undefined }
+          if (harnessResult.isError) diagnosedContent = boundToolFailure(diagnosedContent)
+          return { toolResult: { type: 'tool_result', tool_use_id: tu.id, content: starSig ? diagnosedContent + starSig : diagnosedContent, is_error: harnessResult.isError }, traceStore, importGraph, lastConflictCheckCount, checkpointCreated, latestRisk, errorKind: harnessResult.isError ? resolveErrorKind(rawToolResult) : undefined, presentation: rawToolResult?.presentation }
        }
      }
    }
 
-    return { toolResult: { type: 'tool_result', tool_use_id: tu.id, content: starSig ? finalContent + starSig : finalContent, is_error: harnessResult.isError }, traceStore, importGraph, lastConflictCheckCount, checkpointCreated, latestRisk, endTurn: rawToolResult?.endTurn === true ? true : undefined, images: rawToolResult?.images, errorKind: harnessResult.isError ? resolveErrorKind(rawToolResult) : undefined }
+    return { toolResult: { type: 'tool_result', tool_use_id: tu.id, content: starSig ? finalContent + starSig : finalContent, is_error: harnessResult.isError }, traceStore, importGraph, lastConflictCheckCount, checkpointCreated, latestRisk, endTurn: rawToolResult?.endTurn === true ? true : undefined, images: rawToolResult?.images, errorKind: harnessResult.isError ? resolveErrorKind(rawToolResult) : undefined, presentation: rawToolResult?.presentation }
  } catch (err) {
     // AbortError: user cancelled — not a tool failure.
     // Skip failure recording so immune/doom-loop signals aren't polluted.
@@ -2162,6 +2147,7 @@ async function executeToolUseInner(
       return { toolResult: { type: 'tool_result', tool_use_id: tu.id, content: abortedNote, is_error: false }, traceStore, importGraph, lastConflictCheckCount, checkpointCreated, latestRisk }
    }
     let msg = err instanceof Error ? err.message : String(err)
+    let deliveryFact = ''
     // deliver_task timeout/crash attribution (240s 事故链 2026-07-07): the
     // pipeline timeout used to replace the ENTIRE tool result with an error,
     // swallowing the fact that the commit had already landed — the model then
@@ -2171,9 +2157,9 @@ async function executeToolUseInner(
       const headNow = await gitHeadQuiet(deps.cwd)
       if (headNow && headNow !== preAbortHead) {
         const summary = await gitHeadSummaryQuiet(deps.cwd)
-        msg += `\n\n⚠️ BUT the commit already landed before this error: ${summary ?? headNow.slice(0, 8)}. The delivery succeeded — only the result report was lost. Do NOT re-commit or retry; verify with git log and treat the task as delivered.`
+        deliveryFact = `\n\n⚠️ BUT the commit already landed before this error: ${summary ?? headNow.slice(0, 8)}. The delivery succeeded — only the result report was lost. Do NOT re-commit or retry; verify with git log and treat the task as delivered.`
       } else if (headNow) {
-        msg += `\n\nNo new commit landed (HEAD unchanged at ${headNow.slice(0, 8)}). Check git log before retrying to avoid a duplicate commit.`
+        deliveryFact = `\n\nNo new commit landed (HEAD unchanged at ${headNow.slice(0, 8)}). Check git log before retrying to avoid a duplicate commit.`
       }
     }
     const caughtFailureClass = classifyFailure(msg).class
@@ -2183,6 +2169,9 @@ async function executeToolUseInner(
       caughtFailureClass,
       typeof tu.input?.file_path === 'string' ? tu.input.file_path as string : toolTargetFromInput(tu.name, tu.input),
     )
+    msg = await artifactIntercept(msg, tu.name, tu.input, deps.artifactStore, true)
+    msg = boundToolFailure(truncateSuccessfulToolResult(msg, deps.config)) + deliveryFact
+    deps.turnBudget.consume(Math.ceil(msg.length / 4))
     callbacks.onToolResult(tu.id, tu.name, msg, true)
     return { toolResult: { type: 'tool_result', tool_use_id: tu.id, content: starSig ? msg + starSig : msg, is_error: true }, traceStore, importGraph, lastConflictCheckCount, checkpointCreated, latestRisk, errorKind: caughtFailureClass }
   }

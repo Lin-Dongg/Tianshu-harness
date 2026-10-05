@@ -2,7 +2,7 @@
 /**
  * 冰鉴缓存命中率验证脚本
  *
- * 模拟 5 轮对话，记录每轮的 cache hit/miss tokens。
+ * 模拟 20 轮对话，记录每轮的 cache hit/miss tokens。
  * 用法：
  *   ./node_modules/.bin/tsx scripts/verify-cache-hit-rate.ts
  *
@@ -10,6 +10,7 @@
  *   DEEPSEEK_API_KEY — DeepSeek API key
  *   DEEPSEEK_BASE_URL — (可选) 默认 https://api.deepseek.com
  *   DEEPSEEK_MODEL — (可选) 模型名，默认 deepseek-chat（3.15 回流验证用 deepseek-v4-flash）
+ *   RIVET_TRUST_PROJECT — (可选) 默认按授信跑；=0 时不注入 AGENTS.md / .rivet.md
  */
 
 import { PromptEngine } from '../src/prompt/engine.js'
@@ -45,6 +46,8 @@ const MODEL = process.env.DEEPSEEK_MODEL ?? 'deepseek-chat'
 // ── PromptEngine 初始化 ─────────────────────────────────────────
 
 const cwd = process.cwd()
+// 未授信项目不注入 AGENTS.md / .rivet.md，读数与历史基线（v0 94.8%）不可比；新建的 worktree 默认未授信。
+process.env.RIVET_TRUST_PROJECT ??= '1'
 const snapshot = createVolatileSnapshot({ cwd })
 
 const engine = new PromptEngine({
@@ -170,10 +173,11 @@ async function sendTurn(turn: number, userText: string): Promise<TurnResult> {
 // ── 主流程 ──────────────────────────────────────────────────────
 
 async function main() {
-  console.log('🧊 冰鉴缓存验证 — 5 轮对话测试')
+  console.log(`🧊 冰鉴缓存验证 — ${PROMPTS.length} 轮对话测试`)
   console.log(`   Provider: DeepSeek (${BASE_URL})`)
   console.log(`   Model: ${MODEL}`)
   console.log(`   Volatile snapshot gitStatus: ${snapshot.gitStatus ? '✅ captured' : '⚠️ empty'}`)
+  console.log(`   Project instructions: ${snapshot.rivetMd ? `✅ injected (${snapshot.rivetMd.length} chars)` : '⚠️ not injected — 读数与基线不可比'}`)
   console.log('')
 
   for (let i = 0; i < PROMPTS.length; i++) {

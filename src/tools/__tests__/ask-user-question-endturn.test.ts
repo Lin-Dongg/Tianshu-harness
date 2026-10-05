@@ -17,7 +17,7 @@ describe('ask_user_question endTurn signal', () => {
 
   it('returns endTurn: true even with options', async () => {
     const result = await ASK_USER_QUESTION_TOOL.execute(
-      makeParams({ question: 'Which?', options: ['a', 'b', 'c'] }),
+      makeParams({ question: 'Which?', options: [{ label: 'a', recommended: true, recommendation_reason: '满足目标' }, 'b', 'c'] }),
     )
     assert.equal(result.endTurn, true)
     assert.ok(result.uiContent)

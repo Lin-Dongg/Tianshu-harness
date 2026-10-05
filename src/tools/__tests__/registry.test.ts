@@ -1,6 +1,11 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { ToolRegistry } from '../registry.js'
+import {
+  ToolRegistry,
+  classifyToolOverwrite,
+  __resetOverwriteLog,
+  __setOverwriteSink,
+} from '../registry.js'
 import type { Tool, ToolCallParams } from '../types.js'
 
 function fakeTool(name: string): Tool {
@@ -48,7 +53,9 @@ describe('ToolRegistry.execute: unknown tool surfaces did-you-mean hint', () => 
   // feedback in the error message so the next model turn can self-correct.
 
   function makeRegistry(): ToolRegistry {
-    const registry = new ToolRegistry()
+    // onToolOverwrite: no-op —— 夹具内有意覆盖（TodoWrite/disabled 用例用新实例
+    // 替换同名工具），不是被测行为；默认通道的告警语义在「同名覆盖检测」块单独测。
+    const registry = new ToolRegistry({ onToolOverwrite: () => {} })
     registry.register(fakeTool('read_file'))
     registry.register(fakeTool('write_file'))
     registry.register(fakeTool('edit_file'))
@@ -276,5 +283,80 @@ describe('ToolRegistry 晚到注册闸门', () => {
     r.endExtraRegistration()
     r.endExtraRegistration()
     // 不抛错即通过；内部计数已钳制为 0
+  })
+})
+
+// ── 同名覆盖检测（rug pull 防线 ④：后到者赢 → 至少可观察）────────────────
+// 背景：安全报告《MCP 工具描述 rug pull》——ToolRegistry.register 为裸 Map.set，
+// 同名覆盖（后到者赢）无任何告警。本块锁定：已知刷新源（mcp__/lsp_ 前缀）静默、
+// 其余覆盖经可注入 reporter 上报、默认通道进程级去重、覆盖行为本身不变。
+describe('ToolRegistry 同名覆盖检测', () => {
+  it('classifyToolOverwrite：mcp__/lsp_ 前缀为已知刷新，其余为意外覆盖', () => {
+    assert.equal(classifyToolOverwrite('mcp__web__search'), 'known-refresh')
+    assert.equal(classifyToolOverwrite('lsp_goto_definition'), 'known-refresh')
+    assert.equal(classifyToolOverwrite('lsp_find_references'), 'known-refresh')
+    assert.equal(classifyToolOverwrite('read_file'), 'unexpected')
+    assert.equal(classifyToolOverwrite('plugin_export'), 'unexpected')
+  })
+
+  it('意外同名覆盖（新实例）触发注入 reporter', () => {
+    const seen: string[] = []
+    const r = new ToolRegistry({ onToolOverwrite: (n) => seen.push(n) })
+    r.register(fakeTool('custom_tool'))
+    r.register(fakeTool('custom_tool'))
+    assert.deepEqual(seen, ['custom_tool'])
+  })
+
+  it('已知刷新前缀（mcp__/lsp_）静默——不触发 reporter', () => {
+    const seen: string[] = []
+    const r = new ToolRegistry({ onToolOverwrite: (n) => seen.push(n) })
+    r.register(fakeTool('mcp__web__search'))
+    r.register(fakeTool('mcp__web__search'))
+    r.register(fakeTool('lsp_goto_definition'))
+    r.register(fakeTool('lsp_goto_definition'))
+    assert.deepEqual(seen, [])
+  })
+
+  it('同一对象重复注册（幂等路径）不触发上报', () => {
+    const seen: string[] = []
+    const r = new ToolRegistry({ onToolOverwrite: (n) => seen.push(n) })
+    const t = fakeTool('read_file')
+    r.register(t)
+    r.register(t)
+    assert.deepEqual(seen, [])
+  })
+
+  it('默认通道进程级一次/名字（去重），且覆盖行为保持后到者赢', async () => {
+    __resetOverwriteLog()
+    const lines: string[] = []
+    __setOverwriteSink((m) => lines.push(m))
+    try {
+      const r = new ToolRegistry()
+      r.register(fakeTool('squat_tool'))
+      const second: Tool = {
+        ...fakeTool('squat_tool'),
+        execute: async () => ({ content: 'second wins' }),
+      }
+      r.register(second)
+
+      const res = await r.execute('squat_tool', { input: {}, toolUseId: 't', cwd: '/' })
+      assert.equal(res.content, 'second wins', '行为不变：后到者赢')
+
+      r.register(fakeTool('squat_tool'))
+      assert.equal(lines.length, 1, '同名多次覆盖去重为一次')
+      assert.match(lines[0]!, /squat_tool/)
+    } finally {
+      __resetOverwriteLog()
+      __setOverwriteSink(null)
+    }
+  })
+
+  it('覆盖后 get 拿到的是新实例（不静默丢弃）', () => {
+    const r = new ToolRegistry({ onToolOverwrite: () => {} })
+    const first = fakeTool('x_tool')
+    const second = fakeTool('x_tool')
+    r.register(first)
+    r.register(second)
+    assert.equal(r.get('x_tool'), second)
   })
 })

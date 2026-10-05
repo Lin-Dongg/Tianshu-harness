@@ -12,7 +12,10 @@ export const MAX_KNOWLEDGE_CLAIMS = 10
  */
 export function buildWorkerKnowledgeBlock(claims: ContextClaim[]): string {
   const eligible = claims
-    .filter(c => c.kind !== 'worker_finding')
+    .filter(c => ['active', 'durable_candidate', 'durable'].includes(c.status) && (!c.expiresAt || c.expiresAt > Date.now()) && !c.counterevidence.length
+      && ((['user_constraint', 'user_preference'].includes(c.kind) && c.source.actor === 'user')
+        || (['project_rule', 'decision'].includes(c.kind) && ['user', 'tool'].includes(c.source.actor) && c.confidence >= 0.9 && c.evidence.some(e => ['user_message', 'file'].includes(e.kind)))
+        || (['verification_fact', 'file_observation'].includes(c.kind) && c.source.actor === 'tool' && c.evidence.some(e => ['test', 'tool_result', 'file'].includes(e.kind)))))
     .sort((a, b) => b.fitness - a.fitness || b.confidence - a.confidence)
     .slice(0, MAX_KNOWLEDGE_CLAIMS)
 

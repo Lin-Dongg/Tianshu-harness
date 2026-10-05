@@ -1,3 +1,4 @@
+import { observeAuditResponse } from './transport-audit.js'
 /**
  * provider-probe — probe-first onboarding (Wave 3).
  *
@@ -18,9 +19,15 @@
 import { hasModelsListEndpoint, normalizeBaseUrl, resolveProbeEndpoints } from './endpoint-map.js'
 import { resolveProviderWire } from './provider-catalog.js'
 import { providerIdentityHeaders } from './caller-identity.js'
+// Single source of truth for the wire-protocol union — an inline copy here
+// silently rejects any protocol added to PROVIDER_PROTOCOL_VALUES, which is
+// exactly how 'gemini' first broke this file's callers.
+import type { ProviderProtocol } from '../config/schema.js'
 import { type ModelAliasEntry, type ModelAliasMetadata } from './model-aliases.js'
 import { matchModelId } from './model-id-matcher.js'
 import { ENRICHED_ALIAS_TABLE } from './model-meta-kb.js'
+import { beginCallAudit } from './call-audit.js'
+import { randomUUID } from 'node:crypto'
 
 /**
  * 视觉真测内置图：16×16 纯红方块（79 字节 PNG）。选探测模型是视觉档时，
@@ -52,7 +59,7 @@ export function isVisionCapableId(rawId: string, table: readonly ModelAliasEntry
 export interface ProbeOptions {
   baseUrl: string
   apiKey?: string
-  protocol?: 'openai' | 'anthropic' | 'openai-responses'
+  protocol?: ProviderProtocol
   /** Provider/preset name — selects the endpoint-path mapping (unknown → OpenAI-compatible default). */
   providerName?: string
   /** Per-request timeout. Default 15s — cold endpoints should not hang onboarding. */
@@ -88,6 +95,8 @@ export interface ProbedModelInfo {
 }
 
 export interface ProbeReport {
+  operationId?: string
+  testedAt?: number
   models: string[]
   /** GET /models returned a usable list. */
   modelsOk: boolean
@@ -129,6 +138,11 @@ function authHeaders(apiKey?: string, identity: Record<string, string> = {}): Re
   return { ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}), ...identity }
 }
 
+/** Gemini 原生协议：x-goog-api-key 头（无 Bearer）。 */
+function geminiHeaders(apiKey?: string, identity: Record<string, string> = {}): Record<string, string> {
+  return { ...(apiKey ? { 'x-goog-api-key': apiKey } : {}), ...identity }
+}
+
 function anthropicHeaders(apiKey?: string, identity: Record<string, string> = {}, authMode?: 'x-api-key' | 'bearer'): Record<string, string> {
   if (!apiKey) return { ...identity }
   return {
@@ -151,11 +165,19 @@ async function fetchWithProbeTimeout(
   url: string,
   init: RequestInit,
   timeoutMs: number,
+  options?: ProbeOptions & { operationId?: string },
 ): Promise<Response> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
+  let model: string | undefined
+  try { model = typeof init.body === 'string' ? JSON.parse(init.body).model : undefined } catch { /* no body */ }
+  const audit = beginCallAudit({ requestId: options?.operationId, provider: options?.providerName ?? new URL(url).hostname, model, purpose: model ? 'provider_probe' : 'provider_models' })
   try {
-    return await fetch(url, { ...init, signal: controller.signal })
+    const response = await fetch(url, { ...init, signal: controller.signal })
+    return observeAuditResponse(response, {}, audit)
+  } catch (error) {
+    audit.finish({ status: controller.signal.aborted ? 'aborted' : 'failed', errorName: (error as Error).name })
+    throw error
   } finally {
     clearTimeout(timer)
   }
@@ -270,7 +292,7 @@ async function fetchDashscopeNativeModels(options: ProbeOptions): Promise<{ ids:
       const response = await fetchWithProbeTimeout(url, {
         method: 'GET',
         headers: authHeaders(options.apiKey),
-      }, options.timeoutMs ?? DEFAULT_TIMEOUT_MS)
+      }, options.timeoutMs ?? DEFAULT_TIMEOUT_MS, options)
       if (!response.ok) return ids.length > 0 ? { ids, infos } : null
       const parsed = parseDashscopeNative(await response.json() as unknown)
       if (!parsed) return ids.length > 0 ? { ids, infos } : null
@@ -296,6 +318,7 @@ interface FetchedModelList {
 
 async function fetchModelList(options: ProbeOptions, errors: string[]): Promise<FetchedModelList> {
   const anthropic = options.protocol === 'anthropic'
+  const gemini = options.protocol === 'gemini'
   const modelsUnavailable = options.modelsListUnavailable
     ?? !hasModelsListEndpoint(options.providerName, options.baseUrl)
   // 无 /models 的端点直接跳过列表拉取：404 不是 Key/连通性结论，补全探测才是。
@@ -305,16 +328,22 @@ async function fetchModelList(options: ProbeOptions, errors: string[]): Promise<
     const native = await fetchDashscopeNativeModels(options)
     if (native) return { ids: native.ids, infos: Object.keys(native.infos).length > 0 ? native.infos : undefined }
   }
+  // Gemini 原生：GET {base}/models（base 自带 /v1beta 版本段，resolveProbeEndpoints
+  // 的 /v\d+ 版本识别不认 v1beta 会拼错路径——故走原生形状，不经过它）。
   const url = anthropic
     ? `${normalizeBaseUrl(options.baseUrl)}/v1/models`
-    : resolveProbeEndpoints(options.baseUrl, options.providerName).modelsUrl
+    : gemini
+      ? `${normalizeBaseUrl(options.baseUrl)}/models`
+      : resolveProbeEndpoints(options.baseUrl, options.providerName).modelsUrl
   try {
     const response = await fetchWithProbeTimeout(url, {
       method: 'GET',
       headers: anthropic
         ? anthropicHeaders(options.apiKey, probeIdentityHeaders(options), resolveProviderWire(options.providerName ?? '', options.baseUrl)?.anthropicAuthMode)
-        : authHeaders(options.apiKey, probeIdentityHeaders(options)),
-    }, options.timeoutMs ?? DEFAULT_TIMEOUT_MS)
+        : gemini
+          ? geminiHeaders(options.apiKey, probeIdentityHeaders(options))
+          : authHeaders(options.apiKey, probeIdentityHeaders(options)),
+    }, options.timeoutMs ?? DEFAULT_TIMEOUT_MS, options)
     if (!response.ok) {
       const bodyText = await response.text().catch(() => '')
       const message = classifyHttpError(response.status, bodyText, options.baseUrl)
@@ -322,6 +351,25 @@ async function fetchModelList(options: ProbeOptions, errors: string[]): Promise<
       return { ids: [], modelListError: { code: probeErrorCode(response.status, bodyText), status: response.status, message } }
     }
     const payload = await response.json() as unknown
+    // Gemini 原生列表：{ models: [{ name: 'models/<id>', inputTokenLimit, outputTokenLimit }] }
+    if (gemini) {
+      const entries = (payload as { models?: unknown })?.models
+      const ids: string[] = []
+      const infos: Record<string, ProbedModelInfo> = {}
+      if (Array.isArray(entries)) for (const entry of entries) {
+        if (!entry || typeof entry.name !== 'string') continue
+        const id = entry.name.replace(/^models\//, '')
+        if (!id) continue
+        ids.push(id)
+        const e = entry as { inputTokenLimit?: unknown; outputTokenLimit?: unknown }
+        const info: ProbedModelInfo = {}
+        if (Number.isSafeInteger(e.inputTokenLimit) && (e.inputTokenLimit as number) > 0) info.contextWindow = e.inputTokenLimit as number
+        if (Number.isSafeInteger(e.outputTokenLimit) && (e.outputTokenLimit as number) > 0) info.maxOutputTokens = e.outputTokenLimit as number
+        if (Object.keys(info).length) infos[id] = info
+      }
+      if (ids.length === 0) errors.push('GET /models returned no usable model ids.')
+      return { ids, ...(Object.keys(infos).length ? { infos } : {}) }
+    }
     const ids = parseModelIds(payload)
     if (ids.length === 0) errors.push('GET /models returned no usable model ids.')
     const infos: Record<string, ProbedModelInfo> = {}
@@ -413,7 +461,7 @@ async function probeOpenAICompletion(options: ProbeOptions, model: string, visio
         max_tokens: vision ? VISION_PROBE_MAX_TOKENS : 64,
         stream: true,
       }),
-    }, options.timeoutMs ?? DEFAULT_TIMEOUT_MS)
+    }, options.timeoutMs ?? DEFAULT_TIMEOUT_MS, options)
 
     const latencyMs = Date.now() - startedAt
     if (!response.ok) {
@@ -521,7 +569,7 @@ async function probeResponsesCompletion(
         max_output_tokens: vision ? VISION_PROBE_MAX_TOKENS : 64,
         stream: true,
       }),
-    }, options.timeoutMs ?? DEFAULT_TIMEOUT_MS)
+    }, options.timeoutMs ?? DEFAULT_TIMEOUT_MS, options)
 
     const latencyMs = Date.now() - startedAt
     if (!response.ok) {
@@ -581,7 +629,7 @@ async function probeAnthropicCompletion(options: ProbeOptions, model: string): P
         messages: [{ role: 'user', content: 'hi' }],
         stream: true,
       }),
-    }, options.timeoutMs ?? DEFAULT_TIMEOUT_MS)
+    }, options.timeoutMs ?? DEFAULT_TIMEOUT_MS, options)
 
     const latencyMs = Date.now() - startedAt
     if (!response.ok) {
@@ -598,6 +646,57 @@ async function probeAnthropicCompletion(options: ProbeOptions, model: string): P
     const bodyText = await readCappedText(response)
     const hints: CapabilityHints = {}
     if (bodyText.includes('thinking')) hints.reasoningSplit = true
+    return { ok: true, hints, latencyMs }
+  } catch (error) {
+    const aborted = error instanceof Error && error.name === 'AbortError'
+    const reason = aborted
+      ? `completion probe timed out after ${options.timeoutMs ?? DEFAULT_TIMEOUT_MS}ms`
+      : (error instanceof Error ? error.message : String(error))
+    return { ok: false, hints: {}, latencyMs: Date.now() - startedAt, error: reason, errorCode: aborted ? 'timeout' : 'network-error' }
+  }
+}
+
+/**
+ * Gemini 原生补全探测：POST {base}/models/{model}:generateContent（非流式）。
+ * 只验证连通与鉴权——gemini 思考模型可能把输出预算吃在思考通道，故只需 200 +
+ * candidates 在场，不要求文本非空。maxOutputTokens 取 64（对齐 openai 侧注释：
+ * 过小预算在推理系模型上会被思考吃光）。
+ */
+async function probeGeminiCompletion(options: ProbeOptions, model: string): Promise<CompletionProbeOutcome> {
+  const url = `${normalizeBaseUrl(options.baseUrl)}/models/${encodeURIComponent(model)}:generateContent`
+  const startedAt = Date.now()
+  try {
+    const response = await fetchWithProbeTimeout(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...geminiHeaders(options.apiKey, probeIdentityHeaders(options)) },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
+        generationConfig: { maxOutputTokens: 64 },
+      }),
+    }, options.timeoutMs ?? DEFAULT_TIMEOUT_MS, options)
+
+    const latencyMs = Date.now() - startedAt
+    if (!response.ok) {
+      const bodyText = await response.text().catch(() => '')
+      return {
+        ok: false,
+        hints: {},
+        latencyMs,
+        error: classifyHttpError(response.status, bodyText, options.baseUrl),
+        errorCode: probeErrorCode(response.status, bodyText),
+        errorStatus: response.status,
+      }
+    }
+    const payload = await response.json().catch(() => null) as {
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string; thought?: boolean }> } }>
+      usageMetadata?: unknown
+    } | null
+    if (!payload || !Array.isArray(payload.candidates)) {
+      return { ok: false, hints: {}, latencyMs, error: 'Endpoint answered but not with a Gemini generateContent payload — the base URL may be wrong (expected the native v1beta shape).', errorCode: 'unknown' }
+    }
+    const hints: CapabilityHints = {}
+    const parts = payload.candidates[0]?.content?.parts ?? []
+    if (parts.some(p => p.thought === true)) hints.reasoningSplit = true
     return { ok: true, hints, latencyMs }
   } catch (error) {
     const aborted = error instanceof Error && error.name === 'AbortError'
@@ -626,11 +725,13 @@ async function readCappedText(response: Response): Promise<string> {
 }
 
 export async function probeProvider(options: ProbeOptions): Promise<ProbeReport> {
+  options = { ...options, operationId: randomUUID() } as ProbeOptions
   const errors: string[] = []
   const fetched = await fetchModelList(options, errors)
   const models = fetched.ids
 
   const report: ProbeReport = {
+    operationId: (options as ProbeOptions & { operationId: string }).operationId, testedAt: Date.now(),
     models,
     modelsOk: models.length > 0,
     completionOk: false,
@@ -657,7 +758,7 @@ export async function probeProvider(options: ProbeOptions): Promise<ProbeReport>
   const nameHeuristicVision = !!options.probeModel && isVisionCapableId(options.probeModel)
   const wantVision = options.vision === true || (options.vision !== false && nameHeuristicVision)
   let model: string | undefined
-  if (options.probeModel && models.includes(options.probeModel)) {
+  if (options.probeModel) {
     model = options.probeModel
   } else if (wantVision) {
     model = models.find(id => isVisionCapableId(id)) ?? models[0] ?? options.probeModel
@@ -669,13 +770,16 @@ export async function probeProvider(options: ProbeOptions): Promise<ProbeReport>
     return report
   }
 
-  // 视觉真测对 OpenAI 兼容与 Responses 协议生效（anthropic 探测保持纯文本最小请求）。
-  const vision = wantVision && options.protocol !== 'anthropic' && isVisionCapableId(model)
+  // 视觉真测对 OpenAI 兼容与 Responses 协议生效（anthropic/gemini 探测保持纯文本最小请求——
+  // gemini 原生视觉走 inlineData 形态，预设已静态声明 supportsVision，探测不做真测）。
+  const vision = wantVision && options.protocol !== 'anthropic' && options.protocol !== 'gemini' && isVisionCapableId(model)
   const outcome = options.protocol === 'anthropic'
     ? await probeAnthropicCompletion(options, model)
     : options.protocol === 'openai-responses'
       ? await probeResponsesCompletion(options, model, vision)
-      : await probeOpenAICompletion(options, model, vision)
+      : options.protocol === 'gemini'
+        ? await probeGeminiCompletion(options, model)
+        : await probeOpenAICompletion(options, model, vision)
   report.probedModel = model
   if (vision) report.visionTested = true
   report.completionOk = outcome.ok
@@ -713,6 +817,10 @@ export function aliasTableWithProbeInfos(
     if (info.maxOutputTokens !== undefined) metadata.maxTokens = info.maxOutputTokens
     // 端点声明推理 token 上限 → 思考输出走独立通道（百炼实测 reasoning_content）。
     if (info.maxReasoningTokens !== undefined) metadata.capabilities = { reasoningSplit: true }
+    // 端点声明该模型出图（DashScope response_modality 含 Image 而不含 Text）→ 标记随
+    // 合成条目进入别名表。此前只透传规格字段，这个能力位在探测→保存链的首站就被丢掉，
+    // 生图模型因此永远进不了生图槽的可选池（D3）。
+    if (info.supportsImageGen) metadata.supportsImageGen = true
     if (Object.keys(metadata).length === 0) continue
     synthetic.push({ canonicalId: id, aliases: [], metadata })
   }

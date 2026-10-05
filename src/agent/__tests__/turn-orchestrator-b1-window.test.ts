@@ -7,11 +7,12 @@
  * 集成测试：构造真实 AgentLoop + mock client 连续输出 read_file 工具调用，
  * 驱动 consecutiveReadOnlyTurns 越过阈值，检查注入的 system-reminder。
  */
-import { describe, it, mock } from 'node:test'
+import { after, describe, it, mock } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { defaultRivetHome, projectSlug } from '../../config/paths.js'
 import { AgentLoop } from '../loop.js'
 import { SessionContext } from '../context.js'
 import { PromptEngine } from '../../prompt/engine.js'
@@ -23,6 +24,14 @@ import type { ContentBlock } from '../../api/types.js'
 
 const TEST_CWD = mkdtempSync(join(tmpdir(), 'b1-window-test-'))
 writeFileSync(join(TEST_CWD, 'evidence.txt'), 'verified\n')
+// 直接 `node --test` 跑本文件时没有 run-node-tests 的 RIVET_HOME 隔离，loop 会把
+// cache-log / 信息素按 TEST_CWD 的 slug 写进真实 ~/.rivet/sessions。
+process.env.RIVET_SESSION_DIR = mkdtempSync(join(tmpdir(), 'b1-window-sessions-'))
+
+after(() => {
+  assert.equal(existsSync(join(defaultRivetHome(), 'sessions', projectSlug(TEST_CWD))), false,
+    '测试会话不得落进真实 ~/.rivet/sessions')
+})
 
 function makeReadFileBlock(id: string, filePath: string): ContentBlock {
   return {

@@ -2,10 +2,8 @@
  * Document text extraction — turns imported binary office documents
  * (PDF/DOCX/DOC/RTF/ODT/PPTX/ODP) into readable text via system toolchains.
  *
- * Strategy (zero npm dependencies, mirrors office-writer.ts conventions):
- *   - PDF:                pdftotext (poppler)
- *   - DOCX/DOC/RTF/ODT:   textutil (macOS built-in) → soffice/libreoffice → pandoc
- *   - PPTX/ODP:           soffice/libreoffice
+ * Built-in PDF, XLSX and zipped Office readers work without system converters.
+ * Legacy formats fall back to platform tools; LibreOffice exports slides as PDF.
  *
  * Fail-open: when no engine is available (or all fail), callers keep the raw
  * file and surface an install suggestion — extraction never blocks an import.
@@ -14,13 +12,15 @@
  * base negative conclusions on it alone — the EXTRACTION_CAVEAT marker travels
  * with the text so downstream readers see the discipline inline.
  */
+import type { PDFPageProxy } from 'pdfjs-dist/legacy/build/pdf.mjs'
+import { createRequire } from 'node:module'
 import { execFile } from 'node:child_process'
 import { readFile, mkdtemp, readdir, rm } from 'node:fs/promises'
 import { accessSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { basename, extname, join } from 'node:path'
+import { basename, dirname, extname, join } from 'node:path'
 
-export type ExtractEngine = 'pdftotext' | 'textutil' | 'soffice' | 'pandoc' | 'exceljs' | 'pdfjs'
+export type ExtractEngine = 'pdftotext' | 'textutil' | 'soffice' | 'pandoc' | 'exceljs' | 'pdfjs' | 'office-xml'
 
 export interface DocExtractSuccess {
   ok: true
@@ -41,7 +41,7 @@ export const EXTRACTION_CAVEAT =
   '[extracted-text] Converted from a binary document — layout may be lossy (tables, multi-column, figures). Do not base negative conclusions ("X is not in the document") on this text alone; consult the original file.'
 
 /** Extensions the extraction pipeline knows how to handle. */
-const EXTRACTABLE = new Set(['.pdf', '.docx', '.doc', '.rtf', '.odt', '.pptx', '.odp', '.xlsx', '.xls', '.ods'])
+const EXTRACTABLE = new Set(['.pdf', '.docx', '.doc', '.rtf', '.odt', '.ppt', '.pptx', '.odp', '.xlsx', '.xls', '.ods'])
 
 export function isExtractableDocument(filePath: string): boolean {
   return EXTRACTABLE.has(extname(filePath).toLowerCase())
@@ -78,6 +78,14 @@ async function runPandoc(filePath: string, runner: CommandRunner): Promise<strin
   return stdout
 }
 
+/** PDF.js Node factories call fs.readFile with strings, so resources need paths. */
+export function pdfResourcePaths(): { standardFontDataUrl?: string; cMapUrl?: string; cMapPacked?: boolean; wasmUrl?: string } {
+  try {
+    const root = dirname(createRequire(import.meta.url).resolve('pdfjs-dist/package.json'))
+    return { standardFontDataUrl: `${join(root, 'standard_fonts')}/`, cMapUrl: `${join(root, 'cmaps')}/`, cMapPacked: true, wasmUrl: `${join(root, 'wasm')}/` }
+  } catch { return {} }
+}
+
 /** 用 pdfjs-dist 读 .pdf → 逐页文本（纯 JS/ESM 原生，无系统依赖）——
  *  pdftotext 缺失时的兜底引擎（poppler 质量优先故仍排在前）。不抽版面布局
  *  （没有 -layout），按 textContent 条目逐页拼接；standardFontDataUrl 能解析
@@ -90,26 +98,24 @@ async function runPdfjs(filePath: string, _runner?: CommandRunner): Promise<stri
   } catch {
     throw new Error('pdfjs-dist not installed — falling back')
   }
-  let standardFontDataUrl: string | undefined
-  try {
-    const { createRequire } = await import('node:module')
-    const pkgPath = createRequire(import.meta.url).resolve('pdfjs-dist/package.json')
-    standardFontDataUrl = new URL(`file://${pkgPath.replace(/\/package\.json$/, '')}/standard_fonts/`).href
-  } catch { /* 找不到就省略——pdfjs 只发降级警告 */ }
   const data = new Uint8Array(await readFile(filePath))
-  const doc = await getDocument({
+  const task = getDocument({
     data,
     useWorkerFetch: false,
-    ...(standardFontDataUrl ? { standardFontDataUrl } : {}),
-  }).promise
-  const pages: string[] = []
-  for (let n = 1; n <= doc.numPages; n++) {
-    const page = await doc.getPage(n)
-    const tc = await page.getTextContent()
-    const text = tc.items.map((item) => ('str' in item ? item.str : '')).join(' ').trim()
-    if (text) pages.push(text)
-  }
-  return pages.join('\n\n')
+    ...pdfResourcePaths(),
+  })
+  try {
+    const doc = await task.promise
+    const pages: string[] = []
+    for (let n = 1; n <= doc.numPages; n++) {
+      const page = await doc.getPage(n)
+      const tc = await page.getTextContent()
+      const text = tc.items.map((item) => ('str' in item ? item.str : '')).join(' ').trim()
+      if (text) pages.push(text)
+      page.cleanup()
+    }
+    return pages.join('\n\n')
+  } finally { await task.destroy() }
 }
 
 /** soffice writes the converted file into an outdir (no stdout mode). Some
@@ -120,8 +126,16 @@ async function runSoffice(filePath: string, runner: CommandRunner): Promise<stri
     let lastErr: unknown
     for (const binary of ['soffice', 'libreoffice'] as const) {
       try {
-        await runner(binary, ['--headless', '--convert-to', 'txt:Text', '--outdir', outDir, filePath], { timeoutMs: 90_000 })
+        const ext = extname(filePath).toLowerCase()
+        const exportPdf = ['.ppt', '.pptx', '.odp'].includes(ext)
+        const spreadsheet = ['.xls', '.xlsx', '.ods'].includes(ext)
+        const format = exportPdf ? 'pdf' : spreadsheet ? 'xlsx' : 'txt:Text'
+        // A separate profile avoids attaching to an already-running GUI instance.
+        const { pathToFileURL } = await import('node:url')
+        await runner(binary, [`-env:UserInstallation=${pathToFileURL(join(outDir, 'profile')).href}`, '--headless', '--convert-to', format, '--outdir', outDir, filePath], { timeoutMs: 90_000 })
         const stem = basename(filePath).replace(/\.[^.]+$/, '')
+        if (exportPdf) return await runPdfjs(join(outDir, `${stem}.pdf`))
+        if (spreadsheet) return await runExceljs(join(outDir, `${stem}.xlsx`))
         return await readFile(join(outDir, `${stem}.txt`), 'utf-8')
       } catch (err) {
         lastErr = err
@@ -160,13 +174,7 @@ async function runExceljs(filePath: string, _runner?: CommandRunner): Promise<st
     sheet.eachRow({ includeEmpty: true }, (row, rowNum) => {
       if (rowNum > MAX_ROWS) return
       const values = (row.values ?? []) as readonly unknown[]
-      const cells = values.slice(1).map((v: unknown) => {
-        if (v === null || v === undefined) return ''
-        if (typeof v === 'object' && 'result' in v && 'formula' in v) {
-          return `${(v as { result: unknown }).result} (=${(v as { formula: string }).formula})`
-        }
-        return String(v)
-      })
+      const cells = values.slice(1).map(v => excelCellText(v).replace(/\|/g, '\\|').replace(/\r?\n/g, '<br>'))
       rows.push(`| ${cells.join(' | ')} |`)
     })
     if (rows.length > 0) {
@@ -174,6 +182,18 @@ async function runExceljs(filePath: string, _runner?: CommandRunner): Promise<st
     }
   })
   return parts.join('\n\n') || '(empty workbook)'
+}
+
+function excelCellText(value: unknown): string {
+  if (value == null) return ''
+  if (value instanceof Date) return value.toISOString()
+  if (typeof value !== 'object') return String(value)
+  const cell = value as { richText?: { text: string }[]; text?: string; hyperlink?: string; formula?: string; sharedFormula?: string; result?: unknown; error?: string }
+  if (cell.richText) return cell.richText.map(run => run.text).join('')
+  if (cell.hyperlink) return `${cell.text ?? ''} (${cell.hyperlink})`
+  if (cell.formula || cell.sharedFormula) return `${excelCellText(cell.result)} (=${cell.formula ?? `shared:${cell.sharedFormula}`})`
+  if (cell.error) return cell.error
+  return cell.text ?? ''
 }
 
 function textutilAvailable(platform: string): boolean {
@@ -196,25 +216,31 @@ export function buildEngineChain(ext: string, platform: string = process.platfor
   // 有 poppler 则 -layout 排版质量优先。
   const pdfjs: EngineStep = { engine: 'pdfjs', run: runPdfjs }
 
+  const officeXml: EngineStep = { engine: 'office-xml', run: async path => (await import('./office-xml-extract.js')).extractOfficeXml(path) }
+
   switch (ext) {
     case '.pdf':
       return [pdftotext, pdfjs]
     case '.docx':
     case '.odt':
+      return [officeXml, ...(textutilAvailable(platform) ? [textutil] : []), soffice, pandoc]
     case '.rtf':
       return [...(textutilAvailable(platform) ? [textutil] : []), soffice, pandoc]
     case '.doc':
       // pandoc cannot read legacy .doc
       return [...(textutilAvailable(platform) ? [textutil] : []), soffice]
+    case '.ppt':
+      return [soffice]
     case '.pptx':
     case '.odp':
-      return [soffice]
+      return [officeXml, soffice]
     case '.xlsx':
       // exceljs（纯 JS）优先；soffice 兜底（LibreOffice 能读 xlsx）。
       return [{ engine: 'exceljs', run: runExceljs }, soffice]
-    case '.xls':
     case '.ods':
-      // exceljs 不支持 .xls/.ods——只有 soffice。
+      return [officeXml, soffice]
+    case '.xls':
+      // Legacy XLS is converted to XLSX, preserving all worksheet tabs.
       return [soffice]
     default:
       return []
@@ -263,7 +289,9 @@ export async function extractDocumentText(
     }
   }
 
-  const suggestion = INSTALL_SUGGESTIONS[ext] ?? DEFAULT_SUGGESTION
+  const suggestion = ext === '.pdf' && failures.includes('pdfjs: produced empty output')
+    ? 'This PDF has no readable text layer. Use a vision-capable model to inspect the rendered page images, or upload an OCR-processed PDF. Page image rendering is limited to the first pages.'
+    : INSTALL_SUGGESTIONS[ext] ?? DEFAULT_SUGGESTION
   return {
     ok: false,
     suggestion: `Text extraction unavailable (${failures.join('; ')}). ${suggestion}`,
@@ -272,8 +300,8 @@ export async function extractDocumentText(
 
 /**
  * 把 PDF 前 N 页渲染成 PNG dataUrl（poppler `pdftoppm`）——给 vision 模型的
- * 页图通道（issue #300：文本抽取丢图）。与引擎链同款降级语义：poppler 未装 /
- * 渲染失败 / 产出为空一律返回 []，绝不抛出——页图是增强，缺失时退回纯文本。
+ * 页图通道（issue #300：文本抽取丢图）。poppler 缺失时用 PDF.js 内置
+ * canvas 引擎兜底；两者都失败才返回 []，页图缺失不阻断发送。
  *
  * runner 复用 CommandRunner（pdftoppm 不写 stdout，输出落到 outdir 的
  * page-1.png … page-N.png）。调用方负责能力门（supportsVision / 识图桥）。
@@ -288,17 +316,44 @@ export async function renderPdfPageImages(
   const outDir = await mkdtemp(join(tmpdir(), 'rivet-pdfpages-'))
   try {
     await runner('pdftoppm', ['-png', '-r', String(dpi), '-f', '1', '-l', String(maxPages), filePath, join(outDir, 'page')], { timeoutMs: 60_000 })
-    const files = (await readdir(outDir)).filter((f) => f.endsWith('.png')).sort()
+    const files = (await readdir(outDir)).filter((f) => f.endsWith('.png')).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
     const out: string[] = []
     for (const f of files) {
       const bytes = await readFile(join(outDir, f))
       if (bytes.length === 0) continue
       out.push(`data:image/png;base64,${bytes.toString('base64')}`)
     }
-    return out
+    return out.length > 0 ? out : renderPdfjsPageImages(filePath, maxPages, dpi)
   } catch {
-    return []
+    return renderPdfjsPageImages(filePath, maxPages, dpi)
   } finally {
     await rm(outDir, { recursive: true, force: true }).catch(() => {})
   }
+}
+
+async function renderPdfjsPageImages(filePath: string, maxPages: number, dpi: number): Promise<string[]> {
+  try {
+    const { getDocument } = await import('pdfjs-dist/legacy/build/pdf.mjs')
+    const task = getDocument({ data: new Uint8Array(await readFile(filePath)), useWorkerFetch: false, ...pdfResourcePaths() })
+    try {
+      const doc = await task.promise
+      const factory = doc.canvasFactory as {
+        create(width: number, height: number): { canvas: { toBuffer(type: string): Buffer }; context: Parameters<PDFPageProxy['render']>[0]['canvasContext'] }
+        destroy(target: unknown): void
+      }
+      const images: string[] = []
+      for (let n = 1; n <= Math.min(doc.numPages, maxPages); n++) {
+        const page = await doc.getPage(n)
+        const original = page.getViewport({ scale: 1 })
+        const scale = Math.min(Math.max(36, Math.min(dpi, 200)) / 72, 4096 / Math.max(original.width, original.height))
+        const viewport = page.getViewport({ scale })
+        const target = factory.create(Math.ceil(viewport.width), Math.ceil(viewport.height))
+        try {
+          await page.render({ canvas: null, canvasContext: target.context, viewport }).promise
+          images.push(`data:image/png;base64,${target.canvas.toBuffer('image/png').toString('base64')}`)
+        } finally { factory.destroy(target); page.cleanup() }
+      }
+      return images
+    } finally { await task.destroy() }
+  } catch { return [] }
 }

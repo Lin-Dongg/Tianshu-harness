@@ -83,9 +83,11 @@ describe('vision model config', () => {
     const saved = setVisionModelConfig({
       provider: 'minimax',
       model: 'MiniMax-M3',
-      fallback: { provider: 'deepseek', model: 'deepseek-v4-flash' },
+      // 官方 deepseek 预设的 flash 条目自 beeee2a10 起改名 deepseek-flash（V4.1 承接）——
+      // 夹具引用必须跟预设走，deepseek-v4-flash 已不在官方条目里。
+      fallback: { provider: 'deepseek', model: 'deepseek-flash' },
     })
-    assert.deepEqual(saved?.fallback, { provider: 'deepseek', model: 'deepseek-v4-flash' })
+    assert.deepEqual(saved?.fallback, { provider: 'deepseek', model: 'deepseek-flash' })
   })
 
   it('rejects a malformed fallback instead of silently dropping it', () => {

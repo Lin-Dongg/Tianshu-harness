@@ -20,7 +20,7 @@ import { createTurnBudget } from './turn-budget.js'
 import { getGitChangeRate, smoothChangeRate } from './git-freshness.js'
 import { rejectOnAbort } from './turn-boundary-abort.js'
 import { abortableDelay } from '../api/retry-engine.js'
-import { classifyApiError } from '../api/error-classifier.js'
+import { classifyApiError, errorCategoryLabel } from '../api/error-classifier.js'
 import { canRecoverContextRejection } from './context-budget-preparation.js'
 import { RetryBudget } from '../api/retry-budget.js'
 import type { GoalContinuationController } from './goal-continuation.js'
@@ -58,6 +58,10 @@ export interface StreamTurnParams {
     onContextBudget?: AgentCallbacks['onContextBudget']
     /** 网关拒收「历史缺 reasoning_content」，重试已改为保留思考内容重发（issue #258）。 */
     onReasoningEchoRecovered?: () => void
+    /** provider 层（客户端内 withStructuredRetry）发生重试——429/503 退避可能长达
+     *  分钟级，零可见会被读成「卡住」。已按类别 + 次数节流（仅 rate_limit/overloaded，
+     *  第 1 次与之后每 3 次），调用方经相位通道瞬态呈现（不进历史）。 */
+    onRetryNotice?: (info: { category: string; attempt: number; maxAttempts: number; nextDelayMs: number }) => void
   }
 }
 
@@ -107,6 +111,9 @@ export interface CompleteTurnParams {
   callbacks: AgentCallbacks
   /** 中间 turn 的自动续轮原因（若本 turn 结束后系统注入提醒继续跑）。 */
   continuationReason?: string
+  /** 本轮流式停止原因——只在 'max_tokens'（输出被 token 上限截断）时附上，
+   *  随 turn_complete 落事件流，UI 据此渲染截断提醒（dsh 式，不自动续写）。 */
+  stopReason?: string
 }
 
 export interface CacheTurnEndParams {
@@ -338,13 +345,13 @@ export function wrapCallbacksWithHeartbeat(
     onTextDelta: (text) => { resumeIfSilent(); hb.tick('streaming text'); cb.onTextDelta(text) },
     onThinkingDelta: (thinking) => { resumeIfSilent(); hb.tick('thinking'); cb.onThinkingDelta(thinking) },
     onToolUse: (id, name, input) => { resumeIfSilent(); hb.tick(`calling ${name}`); cb.onToolUse(id, name, input) },
-    onToolResult: (id, name, result, isError, rawPath, uiContent) => {
+    onToolResult: (id, name, result, isError, rawPath, uiContent, evidence) => {
       resumeIfSilent(); hb.tick(`${name} returned`)
-      cb.onToolResult(id, name, result, isError, rawPath, uiContent)
+      cb.onToolResult(id, name, result, isError, rawPath, uiContent, evidence)
     },
-    onTurnComplete: (usage, turnNumber, isFinal, evidenceSummary, continuationReason) => {
+    onTurnComplete: (usage, turnNumber, isFinal, evidenceSummary, continuationReason, stopReason) => {
       resumeIfSilent(); hb.tick(`turn ${turnNumber} complete`)
-      cb.onTurnComplete(usage, turnNumber, isFinal, evidenceSummary, continuationReason)
+      cb.onTurnComplete(usage, turnNumber, isFinal, evidenceSummary, continuationReason, stopReason)
     },
     onPhaseChange: (phase, detail) => {
       // Heartbeat-emitted phases must NOT recursively reset the clock.
@@ -793,6 +800,20 @@ export class TurnOrchestrator {
                   + '在该 provider 配置里声明 preservedThinkingProtocol: true 可免去这次重试',
               })
             },
+            onRetryNotice: (info) => {
+              // 走相位通道（瞬态、不进历史，同 body-guard）：429/503 的客户端内退避
+              // 此前完全静默，长退避期间会话像死了。meta 供多语系消费方本地重组文案。
+              callbacks.onPhaseChange?.('model-retry', {
+                reason: `${errorCategoryLabel(info.category)}，${Math.ceil(info.nextDelayMs / 1000)}s 后重试（${info.attempt}/${info.maxAttempts}）`,
+                meta: {
+                  source: 'provider',
+                  category: info.category,
+                  attempt: info.attempt,
+                  maxAttempts: info.maxAttempts,
+                  waitSec: Math.ceil(info.nextDelayMs / 1000),
+                },
+              })
+            },
           },
         })
 
@@ -855,6 +876,10 @@ export class TurnOrchestrator {
               attempt++
               // 共享预算耗尽（provider 侧重试可能已吃掉）→ 停止 agent 重连。
               if (sharedBudget && !sharedBudget.take()) break
+              // 分类器结果透传给 retry 事件/相位：此前载荷只有 {attempt, maxAttempts}，
+              // 429/503 退避期间 UI 只能说「重试中」，读起来像卡住（dsh 式可见性）。
+              const failed = streamResult.streamError as Error
+              const classified = classifyApiError(failed)
               this.deps.state.streamedText = ''
               turnTextPersisted = false
               turnTextAccum = ''
@@ -865,8 +890,14 @@ export class TurnOrchestrator {
               rateLimitRetryMs = 0
               // 失败尝试的 partial 已在上面丢弃（agent 侧 state）；这里再通知消费方
               // 「按尝试替换」——否则 UI/事件流里旧 partial 会与新尝试的输出拼在一起。
-              callbacks.onModelRetry?.({ attempt, maxAttempts })
-              callbacks.onPhaseChange?.('working', { reason: `reconnecting (${attempt}/${maxAttempts})` })
+              callbacks.onModelRetry?.({
+                attempt,
+                maxAttempts,
+                category: classified.category,
+                message: failed.message,
+                nextDelayMs: backoffMs,
+              })
+              callbacks.onPhaseChange?.('working', { reason: `reconnecting (${attempt}/${maxAttempts}) · ${errorCategoryLabel(classified.category)}` })
               try {
                 await abortableDelay(backoffMs, abortSignal)
               } catch {
@@ -1526,6 +1557,10 @@ export class TurnOrchestrator {
             turn,
             isFinal: true,
             callbacks,
+            // 输出被 token 上限截断（finish_reason 'length' → 'max_tokens'）：随
+            // turn_complete 落事件流，桌面/TUI 渲染「发『继续』可续」提醒——截断内容
+            // 本就在历史里，不自动续写（dsh 同款语义）。
+            ...(stopReason === 'max_tokens' ? { stopReason } : {}),
           }),
           signal!,
           'final-complete',

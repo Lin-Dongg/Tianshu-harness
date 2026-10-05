@@ -3,6 +3,29 @@ import assert from 'node:assert/strict'
 import { EvidenceTracker } from '../evidence.js'
 
 describe('EvidenceTracker delivery status', () => {
+  it('keeps targeted npm and run_tests verifications confined to explicit targets', () => {
+    for (const command of ['npm test -- src/cache.test.ts', 'run_tests cache']) {
+      const tracker = new EvidenceTracker()
+      for (const file of ['src/cache.ts', 'src/billing.ts', 'src/permissions.ts']) tracker.trackFileModified(file)
+      for (let i = 0; i < 3; i++) tracker.trackVerification({ command, status: 'passed', scope: 'targeted', targetFiles: ['src/cache.ts'], exitCode: 0 })
+      assert.equal(tracker.getVerificationSummary().verified, 1, command)
+      assert.equal(tracker.getVerificationSummary().pending, 2, command)
+      tracker.trackFileModified('src/cache.ts')
+      assert.equal(tracker.getVerificationSummary().verified, 0, 'editing invalidates coverage')
+    }
+  })
+
+  it('maps targeted test files to their source without substring coverage', () => {
+    const tracker = new EvidenceTracker()
+    for (const file of ['src/cache.ts', 'src/c.ts', 'other/cache.ts']) tracker.trackFileModified(file)
+    tracker.trackVerification({ command: 'node --test src/__tests__/cache.test.ts', status: 'passed', scope: 'targeted', exitCode: 0 })
+    assert.deepEqual(tracker.getVerificationSummary().files, [
+      { path: 'other/cache.ts', level: 'pending' },
+      { path: 'src/c.ts', level: 'pending' },
+      { path: 'src/cache.ts', level: 'tested' },
+    ])
+  })
+
   it('reports failed verification in the summary', () => {
     const tracker = new EvidenceTracker()
     tracker.trackFileModified('src/agent/loop.ts')
@@ -88,7 +111,7 @@ describe('EvidenceTracker delivery status', () => {
     assert.equal(tracker.deliveryReady(), false)
     tracker.trackVerification({ command: 'npm test', status: 'passed', scope: 'full', exitCode: 0, passed: 5, failed: 0, skipped: 0, durationMs: 100 })
     assert.equal(tracker.deliveryReady(), true, '最近一条验证 passed 即就绪——窗口内历史 failed 不挡')
-    assert.equal(tracker.getState().deliveryStatus, 'failed', '对照：deliveryStatus 保持粘滞语义不变')
+    assert.equal(tracker.getState().deliveryStatus, 'verified', '状态与有效验证投影一致，同检查成功取代旧失败')
   })
 
   it('deliveryReady: 绿后编辑代码 → 失效；再验证通过 → 恢复（verified 不反向粘滞）', () => {
@@ -98,7 +121,7 @@ describe('EvidenceTracker delivery status', () => {
     assert.equal(tracker.deliveryReady(), true)
     tracker.trackFileModified('src/b.ts')
     assert.equal(tracker.deliveryReady(), false, '绿后动过代码就不再就绪')
-    assert.equal(tracker.getState().deliveryStatus, 'verified', '对照：deliveryStatus 此时仍是 verified（反向粘滞）')
+    assert.equal(tracker.getState().deliveryStatus, 'unverified', '代码编辑使旧证据过期')
     tracker.trackVerification({ command: 'npm test', status: 'passed', scope: 'full', exitCode: 0, passed: 6, failed: 0, skipped: 0, durationMs: 100 })
     assert.equal(tracker.deliveryReady(), true)
   })
@@ -235,4 +258,12 @@ describe('EvidenceTracker — 反斜杠路径归一化（Windows 回归）', () 
     const levels = tracker.getState().fileVerificationLevels
     assert.equal(levels?.get('src/agent/bar.test.ts'), 'tested')
   })
+})
+
+it('unrelated later success never hides an effective failure in readiness or TDD', () => {
+  const tracker = new EvidenceTracker()
+  tracker.trackFileModified('src/a.ts')
+  tracker.trackVerification({ command: 'npm test -- a', status: 'failed', scope: 'targeted', exitCode: 1, passed: 0, failed: 1, skipped: 0, durationMs: 1 })
+  tracker.trackVerification({ command: 'npm test -- b', status: 'passed', scope: 'targeted', exitCode: 0, passed: 1, failed: 0, skipped: 0, durationMs: 1 })
+  assert.equal(tracker.deliveryReady(), false); assert.equal(tracker.getGateState().hasFailedTests, true)
 })

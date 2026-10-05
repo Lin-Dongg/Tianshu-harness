@@ -27,6 +27,7 @@ export interface CollapsedReadSearchEntry {
   input: Record<string, unknown>
   displayName: string
   kind: CollapsibleKind
+  rawPath?: string
   content?: string
   isError?: boolean
   /** terminal result 已到达 */
@@ -92,7 +93,8 @@ export function entryDisplayName(toolName: string, input: Record<string, unknown
 
   // read 族：file_path > file > path
   if (t === 'read_file' || t === 'read' || t === 'read_policy' || t === 'read_section') {
-    const path = input.file_path ?? input.file ?? input.path ?? '?'
+    const path = input.file_path ?? input.file ?? input.path
+      ?? (Array.isArray(input.file_paths) ? input.file_paths.join(', ') : '?')
     return typeof path === 'string' ? path : '?'
   }
 
@@ -152,9 +154,11 @@ export function attachResult(
   id: string,
   content: string,
   isError?: boolean,
+  rawPath?: string,
 ): CollapsedReadSearchEntry | null {
   const entry = findEntryById(group, id)
   if (!entry) return null
+  entry.rawPath = rawPath
   entry.content = content
   entry.isError = isError ?? false
   entry.completed = true
@@ -265,12 +269,13 @@ export function formatCollapsedGroup(input: FormatCollapsedGroupInput): string[]
   for (const entry of shown) {
     const card = formatToolCard({
       toolName: entry.toolName, toolInput: entry.kind === 'read' && !entry.input.file_path && !entry.input.path ? { ...entry.input, file_path: entry.displayName } : entry.input, content: entry.content ?? '',
-      isError: entry.isError, columns: input.columns, maxLines: 3, expanded,
+      rawPath: entry.rawPath, isError: entry.isError, columns: input.columns, maxLines: 3, expanded,
       expandHint: input.expandHint,
     }, theme)
     if (expanded) lines.push(...card)
     else {
       lines.push(card[0]!)
+      if (entry.rawPath) lines.push(fit(color(`  全文来源: ${entry.rawPath}`, theme.muted)))
       if (entry.isError || completed.length === 1) {
         const rows = (entry.content ?? '').replace(/\n+$/, '').split('\n')
         const preview = entry.isError ? rows.slice(-3) : rows.slice(0, 2)
@@ -352,9 +357,9 @@ export class CollapsedReadSearchBuffer {
   }
 
   /** 绑定 terminal result 到对应 entry（按 toolUseId） */
-  attachResult(id: string, content: string, isError?: boolean): CollapsedReadSearchEntry | null {
+  attachResult(id: string, content: string, isError?: boolean, rawPath?: string): CollapsedReadSearchEntry | null {
     if (!this.group) return null
-    return attachResult(this.group, id, content, isError)
+    return attachResult(this.group, id, content, isError, rawPath)
   }
 
   /** 新到达的 tool 是否应打断当前组 */

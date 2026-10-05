@@ -86,3 +86,17 @@ test('anchored read streak fires plain probe (has evidence, needs kill)', async 
   assert.ok(submitted[0]!.content.includes('探针'), 'anchored reads → probe nudge')
   assert.ok(!submitted[0]!.content.includes('锚点'), 'anchored reads should not nudge evidence collection')
 })
+
+test('锚点判定认 JSON 工具输入：带 context_lines/offset/focus 的只读算锚点 → 走探针分支', async () => {
+  const { submitted, advisoryBus } = makeDeps()
+  const hook = createProbeDisciplineHook({ advisoryBus })
+  // 全部是主力求证工具、且都带锚点参数（input 为对象，经 JSON.stringify → key 带引号）
+  await hook.run({} as never, { ...ev('grep'), input: { pattern: 'x', context_lines: 3 } })
+  await hook.run({} as never, { ...ev('read_file'), input: { file_path: 'a.ts', offset: 10, limit: 20 } })
+  await hook.run({} as never, { ...ev('grep'), input: { pattern: 'y', context_lines: 2 } })
+  await hook.run({} as never, { ...ev('read_file'), input: { file_path: 'b.ts', offset: 1, limit: 5 } })
+  await hook.run({} as never, { ...ev('glob'), input: { pattern: '**/*.ts', focus: 'agent' } })
+  assert.equal(submitted.length, 1)
+  assert.ok(submitted[0]!.content.includes('探针'), '带锚点的读取应走「探针」分支')
+  assert.ok(!submitted[0]!.content.includes('锚点'), '带锚点不应误报「零锚点」取证')
+})

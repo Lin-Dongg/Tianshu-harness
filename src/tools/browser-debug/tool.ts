@@ -1,3 +1,4 @@
+import { browserOperation } from './control.js'
 /**
  * browser_debug — persistent browser for local frontend/backend联调 (CDP route).
  */
@@ -280,7 +281,7 @@ export function createBrowserDebugTool(options: BrowserDebugToolOptions = {}): T
   const lifecycle = createSessionLifecycle({ driverFactory, profileDirFor })
   const { ensureSession, withSessionRecovery } = lifecycle
 
-  return {
+  const tool: Tool = {
     definition: {
       name: 'browser_debug',
       description: `驱动持久浏览器通过 CDP 调试本地 Web 应用（前后端 + API 联调）。
@@ -1037,6 +1038,13 @@ API 联调技巧：
     isEnabled: () => enabled,
     timeoutMs: (params) => (params?.input.action === 'wait' ? 120_000 : 60_000),
   }
+  const execute=tool.execute
+  tool.execute=async params=>{
+    try{return await browserOperation(sessionKeyFrom(params),'agent',()=>execute(params))}
+    catch(err){return {content:`浏览器由用户接管或操作失败：${(err as Error).message}。等待用户交还后继续。`,isError:true,endTurn:true}}
+  }
+  return tool
+
 }
 
 export const BROWSER_DEBUG_TOOL: Tool = createBrowserDebugTool({ enabled: true })

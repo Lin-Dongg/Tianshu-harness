@@ -163,7 +163,7 @@ export const DEFAULT_CONFIG: Config = {
     },
     greeting: {
       enabled: true,
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-flash',
     },
     delivery: {
       autoCommit: true,
@@ -173,7 +173,7 @@ export const DEFAULT_CONFIG: Config = {
     enabled: true,
     autoThreshold: 800_000,
     autoFloor: 500_000,
-    model: 'deepseek-v4-flash',
+    model: 'deepseek-flash',
     qualityCompact: {
       perTokenThreshold: 0.55,
       subscriptionThreshold: 0.45,
@@ -211,7 +211,7 @@ export const DEFAULT_CONFIG: Config = {
   workers: {
     profiles: {
       cheap: { provider: 'minimax', model: 'MiniMax-M2.7' },
-      'cheap-flash': { provider: 'deepseek', model: 'deepseek-v4-flash' },
+      'cheap-flash': { provider: 'deepseek', model: 'deepseek-flash' },
       capable: { provider: 'deepseek', model: 'deepseek-v4-pro' },
       mimo: { provider: 'mimo', model: 'mimo-v2.5' },
       'mimo-pro': { provider: 'mimo', model: 'mimo-v2.5-pro' },
@@ -222,7 +222,7 @@ export const DEFAULT_CONFIG: Config = {
       code_edit: 'cheap-flash',
       test_failure_diagnosis: 'cheap-flash',
       risky_refactor: 'cheap-flash',
-      // 2026-08-02：v4-flash 能力实测已超 v4-pro（去廉价化），planning 同走 flash
+      // planning 走 cheap-flash。2026-10-04 起该档的官方模型是 deepseek-flash（DeepSeek 4.1 Flash）。
       planning: 'cheap-flash',
     },
     patcherTier: 'cheap',

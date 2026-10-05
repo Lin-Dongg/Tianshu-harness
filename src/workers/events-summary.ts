@@ -1,3 +1,5 @@
+// @ts-ignore Native development workers load TypeScript directly.
+import { DelegationStateIndex } from './delegation-state.ts'
 import { open } from 'node:fs/promises'
 import { createHash, randomUUID } from 'node:crypto'
 import { setImmediate as yieldToLoop } from 'node:timers/promises'
@@ -17,7 +19,7 @@ export interface SummaryMetrics {
   validationReason: string; scannedLogBytes: number; parsedLogBytes: number; indexBytes: number; rebuilt: boolean
 }
 export interface IndexedEventsTail { tail: RawEventsTail; metrics: SummaryMetrics }
-export interface SummaryReadOptions { strict?: boolean }
+export interface SummaryReadOptions { strict?: boolean; maxEventBytes?: number }
 const running = new Map<string, Promise<unknown>>()
 const rejected = new Map<string, string>()
 
@@ -108,13 +110,13 @@ function metrics(): SummaryMetrics {
 }
 const reason = (error: unknown): string => error instanceof Error ? error.message : 'Summary unavailable'
 
-async function scanAndBuild(handle: EventFile, file: string, source: SourceStamp, maxEvents: number, m: SummaryMetrics): Promise<RawEventsTail> {
+async function scanAndBuild(handle: EventFile, file: string, source: SourceStamp, maxEvents: number, m: SummaryMetrics, maxEventBytes?: number): Promise<RawEventsTail> {
   m.mode = 'scan'
   clearEventsSummaryCache(file)
   const builder = new SummaryBuilder(file)
   const tail = await readEventsTailSnapshot(handle, Number(source.size), maxEvents,
     (raw, offset, complete, event) => builder.add(raw, offset, complete, event),
-    n => { m.scannedLogBytes += n; m.parsedLogBytes += n })
+    n => { m.scannedLogBytes += n; m.parsedLogBytes += n }, maxEventBytes)
   if (sameSource(source, sourceStamp(await handle.stat({ bigint: true })))) {
     try {
       const published = await builder.publish(source)
@@ -138,9 +140,8 @@ async function readIndexedSnapshot(handle: EventFile, file: string, source: Sour
   if (!warm) for (const b of loaded.blocks) await verifyRawBlock(handle, b, m)
 
   const builder = new SummaryBuilder(file, loaded.blocks)
-  const suffix = new TailAccumulator(maxEvents)
   const suffixArtifacts: ArtifactReference[] = []
-  let suffixTotal = 0, suffixOrdinary = 0, suffixDelegations = 0
+  let suffixTotal = 0
   let suffixFirst: number | null = null
   let last = lastBlockSeq(loaded.blocks)
   await scanEventLines(handle, manifest.coveredBytes, Number(source.size), (raw, offset, complete) => {
@@ -148,22 +149,21 @@ async function readIndexedSnapshot(handle: EventFile, file: string, source: Sour
     const event = parseEventLine(raw.toString('utf8'))
     if (event) {
       check(Number.isSafeInteger(event.seq) && event.seq >= 0 && (last === null || last <= event.seq), 'Active suffix is unordered')
-      suffixFirst ??= event.seq; last = event.seq; suffixTotal++; suffix.addEvent(event)
-      if (event.type === 'delegation') suffixDelegations++
-      else suffixOrdinary++
+      suffixFirst ??= event.seq; last = event.seq; suffixTotal++
       if (event.type === 'artifact') suffixArtifacts.push({ seq: event.seq, offset, id: String(event.data.id) })
     }
     return builder.add(raw, offset, complete, event)
   }, n => { m.scannedLogBytes += n })
 
-  let wanted = Math.max(0, maxEvents - manifest.delegations - suffixDelegations - suffixOrdinary)
+  let wanted = Math.max(0, maxEvents - suffixTotal)
   const selected = new Set<number>()
   for (let i = loaded.blocks.length - 1; i >= 0; i--) {
     const b = loaded.blocks[i]!
-    if (wanted > 0 && b.ordinary > 0) { selected.add(i); wanted -= b.ordinary }
+    if (wanted > 0 && b.total > 0) { selected.add(i); wanted -= b.total }
     if (b.delegations.length) selected.add(i)
   }
-  const tail = new TailAccumulator(maxEvents)
+  const tail = new TailAccumulator(maxEvents, options.maxEventBytes)
+  const lifecycle = new DelegationStateIndex()
   for (const i of [...selected].sort((a, b) => a - b)) {
     const expected = loaded.blocks[i]!
     const collector = new BlockCollector(expected.start)
@@ -172,12 +172,17 @@ async function readIndexedSnapshot(handle: EventFile, file: string, source: Sour
       m.parsedLogBytes += raw.length
       const event = parseEventLine(raw.toString('utf8'))
       collector.add(raw, offset, event)
-      if (event) tail.addEvent(event)
+      if (event) { tail.addEvent(event); lifecycle.add(event) }
     }, n => { m.scannedLogBytes += n })
     check(summaryDigest(collector.finish()) === manifest.blocks[i]!.digest, 'Summary semantics do not match log block')
   }
-  for (const event of suffix.finish().events) tail.addEvent(event)
+  // Feed the suffix in file order, including transitions outside the payload budget.
+  await scanEventLines(handle, manifest.coveredBytes, Number(source.size), (raw) => {
+    m.parsedLogBytes += raw.length
+    const event = parseEventLine(raw.toString('utf8')); if (event) { tail.addEvent(event); lifecycle.add(event) }
+  }, n => { m.scannedLogBytes += n })
   const result = tail.finish()
+  result.delegationState = lifecycle.snapshot()
   result.total = manifest.total + suffixTotal
   result.diskFirstSeq = loaded.blocks.find(b => b.firstSeq !== null)?.firstSeq ?? suffixFirst ?? 0
   result.lastSeq = last ?? 0
@@ -199,10 +204,10 @@ async function readOne(file: string, maxEvents: number, options: SummaryReadOpti
   check(Number.isSafeInteger(maxEvents) && maxEvents >= 0, 'Invalid event tail capacity')
   const m = metrics()
   let handle: EventFile
-  try { handle = await open(file, 'r') } catch { return { tail: new TailAccumulator(maxEvents).finish(), metrics: m } }
+  try { handle = await open(file, 'r') } catch { return { tail: new TailAccumulator(maxEvents, options.maxEventBytes).finish(), metrics: m } }
   try {
     const stat = await handle.stat({ bigint: true })
-    if (!stat.isFile()) return { tail: new TailAccumulator(maxEvents).finish(), metrics: m }
+    if (!stat.isFile()) return { tail: new TailAccumulator(maxEvents, options.maxEventBytes).finish(), metrics: m }
     const source = sourceStamp(stat)
     let tail: RawEventsTail
     try { tail = await readIndexedSnapshot(handle, file, source, maxEvents, options, m) }
@@ -211,7 +216,7 @@ async function readOne(file: string, maxEvents: number, options: SummaryReadOpti
       // Reuse the FD and bound, preserving the generation across a path rename.
       const now = sourceStamp(await handle.stat({ bigint: true }))
       if (!sameSource(source, now)) throw new Error('Log changed during indexed read')
-      tail = await scanAndBuild(handle, file, source, maxEvents, m)
+      tail = await scanAndBuild(handle, file, source, maxEvents, m, options.maxEventBytes)
     }
     return { tail, metrics: m }
   } finally { await handle.close() }
@@ -226,7 +231,7 @@ export async function readEventsTailIndexed(file: string, maxEvents: number, opt
     catch (error) {
       if (reason(error) !== 'Log changed during indexed read') throw error
       // One bounded retry; persistence retains its plain streaming fallback.
-      return readOne(file, maxEvents, { strict: true })
+      return readOne(file, maxEvents, { ...options, strict: true })
     }
   })()
   running.set(file, task)

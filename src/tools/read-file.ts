@@ -1,4 +1,5 @@
 import { existsSync } from 'fs'
+import { createHash } from 'node:crypto'
 import { stat, readFile } from 'node:fs/promises'
 import { extname } from 'path'
 import type { Tool, ToolCallParams } from './types.js'
@@ -15,6 +16,8 @@ import { canUsePrewarmForRead, consumePrewarm } from '../agent/prewarm-file.js'
 import { canonicalPathKey, relativePosix } from '../path-format.js'
 import { OFFICE_EXTENSIONS, readOfficeFile } from './office-reader.js'
 import { buildFocusedReadView } from './focused-read.js'
+import { readExplicitRange, supplyNoRangeContent, headBoundedPayload } from './read-file-range.js'
+import { buildLogPreviewContent, buildFileUiOutput } from './read-file-views.js'
 
 // Cache GitignoreFilter instances by cwd to avoid re-reading .gitignore on every call
 const gitignoreCache = new Map<string, { filter: Promise<GitignoreFilter>; ts: number }>()
@@ -106,6 +109,7 @@ const FILE_READ_HISTORY_MAX = 200
 interface KnownFileState {
   mtimeMs: number
   sizeBytes: number
+  contentHash?: string
 }
 const lastKnownFileState = new Map<string, KnownFileState>()
 const LAST_KNOWN_MAX = 500
@@ -283,9 +287,17 @@ export function getFileReadMtime(canonicalPath: string, sessionId?: string): num
  *  doesn't false-positive on our own write (read-edit-stale loop prevention).
  *  Writes 表2 only — never touches the read-dedup tables, so read-ref can
  *  never be tricked into claiming pre-edit content is current. */
-export function noteFileObserved(canonicalPath: string, mtimeMs: number, sizeBytes: number, sessionId?: string): void {
-  lastKnownFileState.set(fileHistoryKey(sessionId, canonicalPath), { mtimeMs, sizeBytes })
+export function noteFileObserved(canonicalPath: string, mtimeMs: number, sizeBytes: number, sessionId?: string, content?: string): void {
+  const key = fileHistoryKey(sessionId, canonicalPath)
+  const previous = lastKnownFileState.get(key)
+  const contentHash = content !== undefined ? createHash('sha256').update(content).digest('hex')
+    : previous?.mtimeMs === mtimeMs && previous.sizeBytes === sizeBytes ? previous.contentHash : undefined
+  lastKnownFileState.set(key, { mtimeMs, sizeBytes, contentHash })
   trimLastKnown()
+}
+
+export function getFileReadContentHash(canonicalPath: string, sessionId?: string): string | undefined {
+  return lastKnownFileState.get(fileHistoryKey(sessionId, canonicalPath))?.contentHash
 }
 
 /** Drop every read-dedup record (all sessions) for a canonical path. Called
@@ -402,9 +414,6 @@ const MAX_TOOL_INPUT_BYTES = 100 * 1024
 /** Focused reads may scan a larger source file, but never load unbounded data. */
 const MAX_FOCUS_SCAN_BYTES = 2 * 1024 * 1024
 
-
-const LOG_PREVIEW_LINES = 80
-
 /** File extensions known to be binary — read_file rejects them with a clear error
  *  instead of returning garbled UTF-8 to the model. */
 const BINARY_EXTENSIONS = new Set([
@@ -449,49 +458,6 @@ async function readImageFile(filePath: string, ext: string, sizeBytes: number) {
   }
 }
 
-function buildLogPreviewContent(filePath: string, content: string): string {
-  const lines = content.split('\n')
-  const headCount = Math.min(LOG_PREVIEW_LINES, lines.length)
-  const tailCount = Math.min(LOG_PREVIEW_LINES, Math.max(0, lines.length - headCount))
-  const head = lines.slice(0, headCount)
-  const tail = tailCount > 0 ? lines.slice(-tailCount) : []
-  const omitted = Math.max(0, lines.length - head.length - tail.length)
-  const tailStart = tail.length > 0 ? lines.length - tail.length + 1 : 1
-  const parts = [
-    `read_file: ${filePath} looks like a log/JSONL output file (${content.length} chars, ${lines.length} lines).`,
-    `Full first reads of log files waste context; returning a bounded preview only.`,
-    `Preview boundaries: head offset=1 limit=${head.length}${tail.length > 0 ? `; tail offset=${tailStart} limit=${tail.length}` : ''}.`,
-    `Next step: use read_file(file_path=..., offset=<known line>, limit<=200) for a specific range; use grep on this file for keywords/timestamps before reading middle ranges. Do not scan the whole project for this log.`,
-    '',
-    `── head (L1-L${head.length}) ──`,
-    ...head,
-  ]
-  if (omitted > 0) {
-    parts.push('', `... ${omitted} lines omitted ...`, '', `── tail (L${tailStart}-L${lines.length}) ──`, ...tail)
-  }
-  return parts.join('\n')
-}
-
-/** TUI display: head + tail with line numbers, compact for large files. */
-function buildFileUiOutput(raw: string, maxLines: number): string {
-  const lines = raw.split('\n')
-  const totalLines = lines.length
-  if (totalLines <= maxLines) {
-    return lines.map((l, i) => `${String(i + 1).padStart(4, ' ')}│ ${l}`).join('\n')
-  }
-
-  const headLines = Math.ceil(maxLines * 0.6)
-  const tailLines = Math.floor(maxLines * 0.4)
-  const omitted = totalLines - headLines - tailLines
-
-  const head = lines.slice(0, headLines)
-    .map((l, i) => `${String(i + 1).padStart(4, ' ')}│ ${l}`)
-  const tail = lines.slice(-tailLines)
-    .map((l, i) => `${String(totalLines - tailLines + i + 1).padStart(4, ' ')}│ ${l}`)
-
-  return [...head, `  ... ${omitted} lines omitted ...`, ...tail].join('\n')
-}
-
 export interface ReadFilePayloadOptions {
   filePath: string
   offset?: number
@@ -516,6 +482,10 @@ export interface ReadFilePayload {
   rawContent: string
   modelContent: string
   uiContent: string
+  /** Set when the content is a bounded head, not the whole file (see
+   *  headBoundedPayload): dedup/read-ref, raw persistence and artifact views
+   *  must all skip it. */
+  headBounded?: boolean
 }
 
 /**
@@ -597,10 +567,16 @@ export async function readFilePayload(cwd: string, options: ReadFilePayloadOptio
   // 「File too large」兜底自预算门改造（2026-09-23）起已不可达，2026-09-24 移除；
   // 探针覆盖 10 尺寸 × 5 窗口 × 3 文件类共 150 用例，0 命中。
   // 日志类豁免：policy 已为其备好 preview 分支，内存由 MAX_LOG_PREVIEW_BYTES 兜住。
+  // A no-range read of a large file must not materialise the whole file: the
+  // line split, not the read, is what exhausts the heap on a short-line file
+  // (P0). Large files take a bounded head page; see read-file-range.ts.
+  const supplyContent = (): Promise<{ content: string; headNote: string }> =>
+    supplyNoRangeContent(filePath, fileSize, hasFocus, options.prefetchedContent, cap)
+
   if (policy.action === 'partial' && !hasExplicitRange && !hasFocus
       && fileSize > Math.max(MAX_TOOL_INPUT_BYTES, cap.maxChars)) {
-    // cap 装得下就整读——比一个读起来像截断、实际没截断的首页更有用。
-    const content = options.prefetchedContent ?? await readFile(filePath, 'utf-8')
+    const { content, headNote } = await supplyContent()
+    if (headNote) return headBoundedPayload(filePath, headNote, content, cap)
     const partialContent = content.length <= cap.maxChars
       ? content
       : applyFoldThenPartial(content, filePath, cap)
@@ -612,9 +588,37 @@ export async function readFilePayload(cwd: string, options: ReadFilePayloadOptio
     }
   }
 
-  let content = options.prefetchedContent ?? await readFile(filePath, 'utf-8')
   const offset = options.offset ?? 1
   const limit = options.limit
+
+  // Explicit-range reads stream ONLY the requested window — the whole file is
+  // never materialised. Before this, `offset=1&limit=10` on a 48 MiB file read
+  // the entire file and split it into lines just to slice ten of them, so the
+  // peak scaled with the file's line count regardless of the tiny result (P0).
+  let rangeStreamed = false
+  let rangeNote = ''
+  let headNote = ''
+  let content: string
+  if (hasExplicitRange && options.prefetchedContent === undefined) {
+    const range = await readExplicitRange(filePath, offset, limit)
+    if (range.error) {
+      return {
+        canonicalPath: filePath,
+        rawContent: range.error.raw,
+        modelContent: range.error.model,
+        uiContent: '',
+      }
+    }
+    rangeNote = range.note
+    content = range.content
+    rangeStreamed = true
+  } else {
+    const supplied = await supplyContent()
+    content = supplied.content
+    headNote = supplied.headNote
+  }
+
+  if (headNote) return headBoundedPayload(filePath, headNote, content, cap)
 
   if (hasFocus) {
     const focused = buildFocusedReadView({
@@ -653,7 +657,7 @@ export async function readFilePayload(cwd: string, options: ReadFilePayloadOptio
     }
   }
 
-  if (offset > 1 || limit) {
+  if (!rangeStreamed && (offset > 1 || limit)) {
     const lines = content.split('\n')
     const startIdx = offset - 1
     if (startIdx >= lines.length) {
@@ -703,7 +707,7 @@ export async function readFilePayload(cwd: string, options: ReadFilePayloadOptio
   return {
     canonicalPath: filePath,
     rawContent: content,
-    modelContent: modelContent + hint,
+    modelContent: modelContent + hint + rangeNote,
     uiContent: buildFileUiOutput(content, 50),
   }
 }
@@ -939,11 +943,16 @@ export const READ_FILE_TOOL: Tool = {
     // P0-2 trace: verify read_file returns full content, not truncated
     debugLog(`[read-cap] file=${payload.canonicalPath} raw=${payload.rawContent.length} model=${payload.modelContent.length} truncated=${payload.rawContent.length !== payload.modelContent.length} cap=${computedCap.maxChars} ctxWindow=${params.contextWindow ?? 'undefined'}`)
 
+    // A head is not the file: skipping the rest keeps dedup/read-ref, raw
+    // persistence and the artifact outline from presenting the head as the file.
+    if (payload.headBounded) return { content: payload.modelContent, uiContent: payload.uiContent }
+
     const rawPath = await persistRawOutput(params.toolUseId, payload.rawContent)
 
     // 表2: note the observed file state so edit-tool staleness checks work.
     if (canonical && currentMtimeMs !== null && currentSizeBytes !== null) {
-      noteFileObserved(canonical, currentMtimeMs, currentSizeBytes, params.sessionId)
+      noteFileObserved(canonical, currentMtimeMs, currentSizeBytes, params.sessionId,
+        Buffer.byteLength(payload.rawContent) === currentSizeBytes ? payload.rawContent : undefined)
     }
 
     // Helper to write the dedup entry once we know whether an artifact was created.
@@ -1081,16 +1090,20 @@ async function handleMultiRead(
       sections.push(`── ${relPath} ──\n${payload.modelContent}`)
       totalBytes += payload.rawContent.length
 
-      // Record file-level dedup for each file
+      // Record file-level dedup for each file — but never for a bounded head:
+      // its line count is the head's, not the file's (a full-read claim built
+      // on it would be false).
       const currentStat = await stat(payload.canonicalPath)
-      fileReadHistory.set(fileHistoryKey(params.sessionId, payload.canonicalPath), {
-        mtimeMs: currentStat.mtimeMs,
-        sizeBytes: currentStat.size,
-        totalLines: payload.rawContent.split('\n').length,
-        rawBytes: payload.rawContent.length,
-        modelBytes: payload.modelContent.length,
-        recordedAt: Date.now(),
-      })
+      if (!payload.headBounded) {
+        fileReadHistory.set(fileHistoryKey(params.sessionId, payload.canonicalPath), {
+          mtimeMs: currentStat.mtimeMs,
+          sizeBytes: currentStat.size,
+          totalLines: payload.rawContent.split('\n').length,
+          rawBytes: payload.rawContent.length,
+          modelBytes: payload.modelContent.length,
+          recordedAt: Date.now(),
+        })
+      }
       noteFileObserved(payload.canonicalPath, currentStat.mtimeMs, currentStat.size, params.sessionId)
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)

@@ -1,4 +1,5 @@
 import type { SearchBackend, SearchFetch, SearchResult } from './types.js'
+import { SearchHttpError } from './errors.js'
 
 const TAVILY_ENDPOINT = 'https://api.tavily.com/search'
 
@@ -35,7 +36,7 @@ export class TavilyBackend implements SearchBackend {
       body: JSON.stringify({ query, max_results: count }),
     })
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`)
+      throw new SearchHttpError(response.status)
     }
     const data = (await response.json()) as TavilyResponse
     const raw = data.results ?? []

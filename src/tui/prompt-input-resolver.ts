@@ -12,6 +12,7 @@
 import { resolveCustomCommand } from '../commands/loader.js'
 import { skillRegistry, listSkillFiles } from '../skills/skill-loader.js'
 import { resolveEcosystemWorkflowInput } from '../workflows/ecosystem-workflows.js'
+import { workspaceSkillSnapshot } from '../skills/workspace-skill-snapshot.js'
 import { looksLikeFilePath } from './engine/path-like.js'
 
 export interface ResolvedPromptInput {
@@ -60,7 +61,7 @@ export function resolveAppPromptInput(
   // 均未命中后的兜底。必须放在 looksLikeFilePath 之前：单段 /name 在
   // isKnownCommand 谓词下会被判成「路径」原样透传，技能解析永远轮不到
   // （多段路径天然不匹配技能名，/etc 类单段路径无同名技能时仍落回路径分支）。
-  const bareSkill = resolveBareSkillPrompt(input)
+  const bareSkill = resolveBareSkillPrompt(input, cwd)
   if (bareSkill !== null) return { prompt: bareSkill }
   // Linux/WSL path like /etc, /mnt, /usr — not a recognized command, pass through
   // as plain text so the agent can handle it (e.g. "look at /etc/hosts").
@@ -72,8 +73,9 @@ export function resolveAppPromptInput(
 const SKILL_RESERVED_SUBCOMMANDS = new Set(['list', 'ls', 'install', 'import', 'review', 'drafts', 'approve', 'reject', 'off', 'complete'])
 
 /** 技能查找 + prompt 展开（/skill 网关与裸名直调共用）。未命中返回 null。 */
-function buildSkillPrompt(name: string, userTask: string): string | null {
-  const skill = skillRegistry.get(name) ?? skillRegistry.list().find(s => s.name.toLowerCase() === name.toLowerCase())
+function buildSkillPrompt(name: string, userTask: string, cwd?: string): string | null {
+  const registry = cwd ? workspaceSkillSnapshot(cwd).registry : skillRegistry
+  const skill = registry.get(name) ?? registry.list().find(s => s.name.toLowerCase() === name.toLowerCase())
   if (!skill) return null
   let prompt = `[Skill loaded: ${skill.name}]\n<skill name="${skill.name}">\n${skill.body}\n</skill>`
   if (skill.skillDir) {
@@ -98,7 +100,7 @@ function resolveSkillPrompt(input: string, cwd: string): string | null {
   if (!match) return null
   const name = match[1]!
   if (SKILL_RESERVED_SUBCOMMANDS.has(name.toLowerCase())) return null
-  return buildSkillPrompt(name, match[2]?.trim() ?? '')
+  return buildSkillPrompt(name, match[2]?.trim() ?? '', cwd)
 }
 
 /**
@@ -108,10 +110,10 @@ function resolveSkillPrompt(input: string, cwd: string): string | null {
  * 显式唤起。多段路径天然不匹配（技能名不含 /）；单段路径（/etc）只有用户
  * 真建了同名技能才会被接管——那正是用户意图。
  */
-export function resolveBareSkillPrompt(input: string): string | null {
+export function resolveBareSkillPrompt(input: string, cwd?: string): string | null {
   const match = input.trim().match(/^\/([^\s/]+)(?:\s+(.*))?$/s)
   if (!match) return null
   const name = match[1]!
   if (SKILL_RESERVED_SUBCOMMANDS.has(name.toLowerCase())) return null
-  return buildSkillPrompt(name, match[2]?.trim() ?? '')
+  return buildSkillPrompt(name, match[2]?.trim() ?? '', cwd)
 }

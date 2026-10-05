@@ -111,15 +111,12 @@ export class BrowserDebugSession {
 
   /** 取一张当前画面（连接瞬间补首帧，避免静态页黑屏）。无能力时返回 null。 */
   async captureFrame(opts?: ScreencastOptions): Promise<ScreencastFrame | null> {
-    if (typeof this.driver.captureFrame !== 'function') return null
-    return await this.driver.captureFrame(opts).catch(() => null)
+    return await this.frames.captureFrame(opts)
   }
 
   /** 反向注入输入事件。返回是否被驱动接受（无能力时 false）。 */
-  async dispatchInput(evt: BrowserInputEvent): Promise<boolean> {
-    if (typeof this.driver.dispatchInput !== 'function') return false
-    await this.driver.dispatchInput(evt)
-    return true
+  async dispatchInput(evt: BrowserInputEvent, expected?: unknown): Promise<boolean> {
+    return await this.frames.dispatchInput(evt, expected)
   }
 
   static async open(opts: OpenSessionOptions): Promise<BrowserDebugSession> {

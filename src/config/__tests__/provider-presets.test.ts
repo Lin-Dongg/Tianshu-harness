@@ -10,7 +10,7 @@ import { migratePresetModelBackfill } from '../preset-model-backfill.js'
 
 describe('provider presets', () => {
   it('contains required built-in provider modes', () => {
-    assert.deepEqual([...providerPresetKeys].sort(), ['ccswitch', 'codex', 'dashscope', 'deepseek', 'glm', 'grok', 'kimi', 'longcat', 'mimo', 'mimo-api', 'minimax', 'ollama', 'openai', 'opencode-go', 'opencode-go-anthropic', 'openrouter', 'relay', 'siliconflow', 'stepfun', 'volc', 'volc-plan', 'volc-plan-anthropic', 'zhipu-vision'].sort())
+    assert.deepEqual([...providerPresetKeys].sort(), ['agnes', 'ccswitch', 'codex', 'dashscope', 'deepseek', 'gemini', 'glm', 'grok', 'kimi', 'longcat', 'mimo', 'mimo-api', 'minimax', 'ollama', 'openai', 'opencode-go', 'opencode-go-anthropic', 'openrouter', 'relay', 'siliconflow', 'stepfun', 'volc', 'volc-plan', 'volc-plan-anthropic', 'zhipu-vision'].sort())
   })
 
   it('ollama is the only keyless preset (local, no auth)', () => {
@@ -93,12 +93,13 @@ describe('provider presets', () => {
     assert.ok(codex.models.some(m => m.id === 'gpt-5.6-sol'), '上代 5.6-sol 保留在列（codex 后端仍 200，2026-10-02 实测）')
   })
 
-  it('deepseek v4-pro 已恢复（官方 2026-09-13 改口径：继续服务不下线）+ flash 档 reasoningEffort', () => {
+  it('deepseek v4-pro 已恢复（官方 2026-09-13 改口径：继续服务不下线）+ 4.1 Flash reasoningEffort', () => {
     const deepseek = cloneProviderPreset('deepseek')
     const v4pro = deepseek.models.find(m => m.id === 'deepseek-v4-pro')
     assert.ok(v4pro, 'V4-Pro 条目在（官方改口径，撤销 ea8d9c92c 退役）')
     assert.equal(v4pro.tier, 'strong')
-    assert.equal(deepseek.models.find(m => m.id === 'deepseek-v4-flash')?.reasoningEffort, 'medium')
+    assert.equal(deepseek.models.find(m => m.id === 'deepseek-flash')?.reasoningEffort, 'high', '4.1 Flash 默认 high（2026-10-05：max 过度推理，medium 不足以稳定落地 agent 任务）')
+    assert.equal(deepseek.models.some(m => m.id === 'deepseek-v4-flash'), false, '官方已无 deepseek-v4-flash')
   })
 
   it('deepseek 已退役 v4-flash-vision-exp（官方已下线，请求由最新 Flash 承接）', () => {
@@ -115,24 +116,23 @@ describe('provider presets', () => {
     )
   })
 
-  it('deepseek strong 档双卡并存（v4-pro + deepseek-flash）+ 默认档指向 v4-flash', () => {
+  it('deepseek strong 档双卡并存（deepseek-flash + v4-pro）+ 默认档指向 4.1 Flash', () => {
     const deepseek = cloneProviderPreset('deepseek')
     const next = deepseek.models.find(m => m.id === 'deepseek-flash')
     assert.ok(next, 'deepseek-flash 必须在 deepseek 预设模型列表')
+    assert.equal(next.description, 'DeepSeek 4.1 Flash：1M 上下文 + 原生多模态（图像输入）')
     assert.equal(next.contextWindow, 1_000_000)
     assert.equal(next.maxTokens, 256_000, '默认请求输出 256K（对齐官方 harness 的 DEFAULT_MAX_TOKENS；能力上限另由 DEEPSEEK_MAX_OUTPUT 守）')
     assert.equal(next.supportsVision, true, '原生多模态声明视觉')
-    assert.deepEqual(next.pricing, { input: 1, output: 2, cacheRead: 0.02, cacheWrite: 1 })
-    assert.equal(next.reasoningEffort, 'medium')
-    // 2026-09-13：v4-pro 官方改口径继续服务（撤销退役）后，deepseek 有两个 strong 档——
-    // v4-pro（3/6 价、纯文本推理）与 deepseek-flash（1/2 价、视觉多模态）。瑶光门席位
-    // 按 tier 解析时池内两卡都合法，成本差由席位自身预算约束；本卡保持 'strong'——
-    // 否则纯文本强档只剩 v4-pro 一张 3/6 价卡，cheap 回退线失效。
+    assert.deepEqual(next.pricing, { input: 2, output: 8, cacheRead: 0.04, cacheWrite: 2 })
+    assert.equal(next.reasoningEffort, 'high', '4.1 Flash 默认 high（2026-10-05 产品决定）')
+    // 官方 flash 档就是 deepseek-flash（DeepSeek-V4.1-Flash）。tier 保持 strong：
+    // 瑶光门按 tier 取池，与 v4-pro 两张 strong 卡都合法，成本差由席位预算约束。
     assert.equal(next.tier, 'strong')
     const strongTiers = deepseek.models.filter(m => m.tier === 'strong').map(m => m.id)
-    assert.deepEqual(strongTiers, ['deepseek-v4-pro', 'deepseek-flash'], '两个 strong 档并存')
-    assert.equal(PROVIDER_PRESETS.deepseek.defaultModelId, 'deepseek-v4-flash', '默认档指向 v4-flash')
-    assert.equal(deepseek.models[0]?.id, 'deepseek-v4-flash', '首模型（无 defaultModel 时的启动兜底）为 v4-flash——条目顺序复原')
+    assert.deepEqual(strongTiers, ['deepseek-flash', 'deepseek-v4-pro'], '两个 strong 档并存')
+    assert.equal(PROVIDER_PRESETS.deepseek.defaultModelId, 'deepseek-flash', '默认档指向实际模型名 deepseek-flash')
+    assert.equal(deepseek.models[0]?.id, 'deepseek-flash', '首模型（无 defaultModel 时的启动兜底）为 deepseek-flash')
   })
 
   it('deepseek 预设始终留有 strong 卡（瑶光门落点不变量）', () => {
@@ -256,14 +256,13 @@ describe('provider presets', () => {
     assert.equal(mm27.supportsVideo, undefined, 'M2.x 纯文本档不得声明视频')
   })
 
-  // PR-4 收口：DeepSeek 默认档从旗舰（v4-pro）改为快速档（v4-flash），预设表内也把
-  // flash 提到首位。钉住预设内容本身——先前只有 TUI 的 connect-flow 用字面量间接钉着，
-  // 那条改为「跟随预设」的派生断言后，内容层面需要在这里接住（内容归属 config）。
-  it('deepseek 预设默认档为 v4-flash，且默认档必在模型列表内并排首位', () => {
-    assert.equal(PROVIDER_PRESETS.deepseek.defaultModelId, 'deepseek-v4-flash')
+  // 官方默认档是 DeepSeek 4.1 Flash，实际模型名 deepseek-flash，并排在列表首位。
+  it('deepseek 预设默认档为 deepseek-flash，且默认档必在模型列表内并排首位', () => {
+    assert.equal(PROVIDER_PRESETS.deepseek.defaultModelId, 'deepseek-flash')
     const ids = PROVIDER_PRESETS.deepseek.provider.models.map(m => m.id)
     assert.ok(ids.includes(PROVIDER_PRESETS.deepseek.defaultModelId), 'defaultModelId 必须在预设模型列表内')
-    assert.equal(ids[0], 'deepseek-v4-flash', '默认档排首位（连接向导按此顺序展示可勾选模型）')
+    assert.equal(ids[0], 'deepseek-flash', '默认档排首位（连接向导按此顺序展示可勾选模型）')
+    assert.equal(ids.includes('deepseek-v4-flash'), false)
   })
 
   it('DEFAULT_CONFIG.kimi 与 kimi 预设同源（端点/apiKeyEnv/模型 id 序列）', () => {
@@ -513,5 +512,112 @@ describe('opencode-go preset declares the DeepSeek thinking protocol (issue #258
       true,
       '桌面/TUI 档位菜单据此启用（此前该网关的档位是静默丢弃的）',
     )
+  })
+})
+
+// ── Agnes AI（免费多模态：文本 + 生图）──────────────────────────────────────
+// 官方文档（www.agnes-ai.com/zh-Hans/docs/*，2026-10-02 口径）：Base URL
+// apihub.agnes-ai.com/v1（旧域名 api.agnes.ai 已停）；文本档 512K/65K + 图像
+// URL 输入；免费档现价 $0（优惠期，以官方账单为准）；生图走 /v1/images/generations
+// （size 必填，1K–4K 档位）。预设把免费资源做成开箱即用节点——用户注册拿 Key 即用。
+describe('agnes preset (Agnes AI 免费档)', () => {
+  it('固定官方端点与 Key 控制台；label/description 标注免费', () => {
+    const preset = PROVIDER_PRESETS.agnes
+    assert.equal(preset.provider.baseUrl, 'https://apihub.agnes-ai.com/v1')
+    assert.equal(preset.provider.protocol, 'openai')
+    assert.equal(preset.provider.apiKeyEnv, 'AGNES_API_KEY')
+    assert.equal(preset.keyUrl, 'https://platform.agnes-ai.com/')
+    assert.match(preset.label, /免费/, 'label 必须让用户看到免费标注')
+    assert.match(preset.description, /免费/, 'description 同标注')
+  })
+
+  it('免费文本档（3.0-flash / 2.5-flash）：512K / 65K / 图像输入 / pricing 0 + free', () => {
+    for (const id of ['agnes-3.0-flash', 'agnes-2.5-flash']) {
+      const m = PROVIDER_PRESETS.agnes.provider.models.find(x => x.id === id)
+      assert.ok(m, `${id} 必须在 fleet 里`)
+      assert.equal(m.contextWindow, 512_000, '官网 512K')
+      assert.equal(m.maxTokens, 65_536, '官网最大输出 65,536')
+      assert.equal(m.supportsVision, true, '官方：文本 + 图像 URL 输入')
+      assert.deepEqual(m.pricing, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, free: true }, '现价 $0 + free 标记')
+    }
+  })
+
+  it('付费旗舰 2.5-pro：1M 上下文，按刊例价计费，不标 free', () => {
+    const pro = PROVIDER_PRESETS.agnes.provider.models.find(m => m.id === 'agnes-2.5-pro')
+    assert.ok(pro)
+    assert.equal(pro.contextWindow, 1_000_000, '官网 1M')
+    assert.equal(pro.maxTokens, 65_536)
+    assert.equal(pro.supportsVision, true)
+    assert.notEqual(pro.pricing?.free, true, '付费档不得标 free（免费徽章会说谎）')
+    assert.equal(pro.pricing?.input, 0.45)
+    assert.equal(pro.pricing?.output, 0.9)
+    assert.equal(pro.pricing?.cacheRead, 0.045)
+  })
+
+  it('生图档：supportsImageGen + free；绝不标 supportsVision（防泄进识图桥候选池）', () => {
+    const img = PROVIDER_PRESETS.agnes.provider.models.find(m => m.id === 'agnes-image-2.5-flash')
+    assert.ok(img)
+    assert.equal(img.supportsImageGen, true, '生图槽按此标记列出（desktop ImageGenModelSettings）')
+    assert.notEqual(img.supportsVision, true, '生图（文→图）与视觉输入（图→文）方向相反，标记不可混用')
+    assert.equal(img.pricing?.free, true, '官方：所有分辨率档位与输入参考图当前免费')
+  })
+
+  it('默认档首位 + 全模型 ctx/max 齐全（connect-flow 补参的硬前提）', () => {
+    assert.equal(PROVIDER_PRESETS.agnes.defaultModelId, 'agnes-3.0-flash')
+    const ids = PROVIDER_PRESETS.agnes.provider.models.map(m => m.id)
+    assert.equal(ids[0], 'agnes-3.0-flash', '默认档排首位（向导按此顺序展示）')
+    for (const m of PROVIDER_PRESETS.agnes.provider.models) {
+      assert.ok(m.contextWindow !== undefined, `${m.id} 缺 ctx 会被向导拖进补参`)
+      assert.ok(m.maxTokens !== undefined, `${m.id} 缺 max 会被向导拖进补参`)
+    }
+  })
+
+  it('档位诚实：未声明 reasoning_effort 通道（官方走 chat_template_kwargs）', () => {
+    assert.equal(
+      resolveEffortSupported('agnes', PROVIDER_PRESETS.agnes.provider),
+      false,
+      '无通道 → 档位控件禁用（避免静默丢弃后仍报设置成功）',
+    )
+  })
+
+  it('缓存：deepseek-native 策略 + mapUsage（cached_tokens 口径，与 GLM 同型）', () => {
+    const caps = resolveCapabilities('agnes')
+    assert.equal(caps.prefixCacheStrategy, 'deepseek-native', '官方定价页列输入缓存命中计费项')
+    assert.ok(caps.mapUsage, 'agnes must expose a usage mapping to read cached_tokens')
+    assert.equal(caps.effortFormat, 'none', '不发未验证的档位参数')
+  })
+
+  it('别名表吸收预设 fleet：agnes-3.0-flash 回填 512K + 图像输入 + free', () => {
+    const entry = MODEL_ALIAS_TABLE.find(e => e.canonicalId === 'agnes-3.0-flash')
+    assert.ok(entry, 'agnes-3.0-flash 必须在别名表（探测/回填的元数据来源）')
+    assert.equal(entry.metadata.contextWindow, 512_000)
+    assert.equal(entry.metadata.supportsVision, true)
+    assert.equal(entry.metadata.pricing?.free, true, '免费标记随别名表元数据流转')
+  })
+})
+
+// ── issue #339：Google Gemini 原生协议（收编公开仓 PR #340）──────────────────
+// 兼容层（/v1beta/openai/）会丢 Gemini 3 要求回传的 thoughtSignature，多轮工具
+// 第二轮 400——预设必须钉死 protocol: 'gemini'，prefixCache 不假装复用别家策略。
+describe('gemini preset (Google Gemini 原生协议, issue #339)', () => {
+  it('固定官方原生端点 / GEMINI_API_KEY / AI Studio keyUrl / protocol gemini', () => {
+    const preset = PROVIDER_PRESETS.gemini
+    assert.equal(preset.provider.baseUrl, 'https://generativelanguage.googleapis.com/v1beta')
+    assert.equal(preset.provider.protocol, 'gemini')
+    assert.equal(preset.provider.apiKeyEnv, 'GEMINI_API_KEY')
+    assert.equal(preset.keyUrl, 'https://aistudio.google.com/apikey')
+    assert.equal(preset.provider.capabilities?.prefixCache, 'none', '原生协议没有 explicit-breakpoint 缓存，不得假装复用')
+  })
+
+  it('默认档 gemini-3.8-flash 排 fleet 首位，全模型 ctx/max 齐全', () => {
+    const preset = PROVIDER_PRESETS.gemini
+    assert.equal(preset.defaultModelId, 'gemini-3.8-flash')
+    const ids = preset.provider.models.map(m => m.id)
+    assert.equal(ids[0], 'gemini-3.8-flash', '默认档排首位（向导按此顺序展示）')
+    for (const m of preset.provider.models) {
+      assert.ok(m.contextWindow !== undefined, `${m.id} 缺 ctx 会被向导拖进补参`)
+      assert.ok(m.maxTokens !== undefined, `${m.id} 缺 max 会被向导拖进补参`)
+    }
+    assert.ok(preset.provider.models.some(m => m.tier === 'strong'), '必须留有 strong 档落点')
   })
 })

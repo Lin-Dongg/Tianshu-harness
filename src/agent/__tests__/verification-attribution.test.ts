@@ -50,7 +50,7 @@ describe('verification-attribution — classify verification results by ownershi
     const result: VerificationMetadata = {
       command: 'npx tsx --test src/tools/__tests__/git.test.ts',
       status: 'failed',
-      scope: 'targeted',
+      scope: 'targeted', targetFiles: ['src/tools/git.ts'],
       exitCode: 1,
       passed: 5,
       failed: 1,
@@ -115,7 +115,7 @@ describe('verification-attribution — classify verification results by ownershi
     const attr = makeAttribution(['src/a.ts'])
     const results: VerificationMetadata[] = [
       { command: 'typecheck', status: 'passed', scope: 'full', exitCode: 0, passed: 1, failed: 0, skipped: 0, durationMs: 100 },
-      { command: 'tests', status: 'failed', scope: 'targeted', exitCode: 1, passed: 5, failed: 1, skipped: 0, durationMs: 300 },
+      { command: 'tests', status: 'failed', scope: 'targeted', targetFiles: ['src/a.ts'], exitCode: 1, passed: 5, failed: 1, skipped: 0, durationMs: 300 },
     ]
 
     const agg = attr.getAggregateAttribution(results)
@@ -127,7 +127,7 @@ describe('verification-attribution — classify verification results by ownershi
     const attr = makeAttribution(['src/a.ts'])
     const results: VerificationMetadata[] = [
       { command: 'typecheck', status: 'blocked', scope: 'full', exitCode: 2, passed: 0, failed: 0, skipped: 0, durationMs: 50 },
-      { command: 'tests', status: 'passed', scope: 'targeted', exitCode: 0, passed: 3, failed: 0, skipped: 0, durationMs: 200 },
+      { command: 'tests', status: 'passed', scope: 'targeted', targetFiles: ['src/tools/git.ts'], exitCode: 0, passed: 3, failed: 0, skipped: 0, durationMs: 200 },
     ]
 
     const agg = attr.getAggregateAttribution(results)
@@ -139,7 +139,7 @@ describe('verification-attribution — classify verification results by ownershi
     const attr = makeAttribution(['src/a.ts'])
     const results: VerificationMetadata[] = [
       { command: 'typecheck', status: 'blocked', scope: 'full', exitCode: 2, passed: 0, failed: 0, skipped: 0, durationMs: 50 },
-      { command: 'tests', status: 'failed', scope: 'targeted', exitCode: 1, passed: 3, failed: 1, skipped: 0, durationMs: 200 },
+      { command: 'tests', status: 'failed', scope: 'targeted', targetFiles: ['src/a.ts'], exitCode: 1, passed: 3, failed: 1, skipped: 0, durationMs: 200 },
     ]
 
     const agg = attr.getAggregateAttribution(results)
@@ -164,7 +164,7 @@ describe('verification-attribution — classify verification results by ownershi
     const result: VerificationMetadata = {
       command: 'run_tests src/tools/__tests__/git.test.ts',
       status: 'failed',
-      scope: 'targeted',
+      scope: 'targeted', targetFiles: ['src/tools/git.ts'],
       exitCode: 1,
       passed: 0,
       failed: 0,
@@ -183,7 +183,7 @@ describe('verification-attribution — classify verification results by ownershi
     const attr = makeAttribution(['src/a.ts'])
     const results: VerificationMetadata[] = [
       { command: 'typecheck', status: 'passed', scope: 'full', exitCode: 0, passed: 1, failed: 0, skipped: 0, durationMs: 100 },
-      { command: 'run_tests src/a.test.ts', status: 'failed', scope: 'targeted', exitCode: 1, passed: 0, failed: 0, skipped: 0, durationMs: 100, failureKind: 'tool_invocation_failure' },
+      { command: 'run_tests src/a.test.ts', status: 'failed', scope: 'targeted', targetFiles: ['src/tools/git.ts'], exitCode: 1, passed: 0, failed: 0, skipped: 0, durationMs: 100, failureKind: 'tool_invocation_failure' },
     ]
 
     const agg = attr.getAggregateAttribution(results)
@@ -216,7 +216,7 @@ describe('verification-attribution — timeout / no-count verification fidelity'
 
   it('isInvocationFailure: explicit producer stamp wins over the shape heuristic', () => {
     const stamped: VerificationMetadata = {
-      command: 'run_tests foo.test.ts', status: 'failed', scope: 'targeted',
+      command: 'run_tests foo.test.ts', status: 'failed', scope: 'targeted', targetFiles: ['src/tools/git.ts'],
       exitCode: 1, passed: 0, failed: 0, skipped: 0, durationMs: 10,
       failureKind: 'tool_invocation_failure',
     }

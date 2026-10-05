@@ -1,3 +1,7 @@
+export { buildFileOpenRoutes } from './file-open-routes.js'
+import { browserOperation } from '../tools/browser-debug/control.js'
+import { BrowserOperationError, browserErrorResponse } from '../tools/browser-debug/operation-error.js'
+import { validateBrowserInput } from '../tools/browser-debug/input-state.js'
 /**
  * /browser/* routes — chromium 就绪探测与一键安装，供桌面端使用。
  *
@@ -168,7 +172,9 @@ export function buildBrowserRoutes(
       // 会一直吃帧、让「引用计数归零即停播」失效。
       let unsubscribe: (() => void) | undefined
       let keepalive: ReturnType<typeof setInterval> | undefined
+      let closed = false
       const cleanup = () => {
+        closed = true
         if (keepalive) clearInterval(keepalive)
         keepalive = undefined
         unsubscribe?.()
@@ -181,18 +187,19 @@ export function buildBrowserRoutes(
       res.on('close', cleanup)
 
       void session.captureFrame().then((frame) => {
-        if (frame && !sse.isClosed()) sse.send('frame', frame)
+        if (frame && !closed && !sse.isClosed()) sse.send('frame', frame)
       })
 
       try {
         unsubscribe = await session.subscribeFrames((frame) => {
-          sse.send('frame', frame)
+          if (!closed) sse.send('frame', frame)
         })
       } catch (err) {
         sse.send('error', { message: err instanceof Error ? err.message : String(err) })
         sse.close()
         return { status: 200, handled: true }
       }
+      if (closed || sse.isClosed()) { cleanup(); return { status: 200, handled: true } }
       // 心跳：静态页可能长时间不产帧，注释行不打扰客户端但能探活。
       keepalive = setInterval(() => sse.ping(), 15_000)
 
@@ -201,18 +208,29 @@ export function buildBrowserRoutes(
 
     // 反向输入回传：面板里的鼠标/键盘 → CDP Input 域。
     'POST /browser/input': withAuth(async (body) => {
-      const payload = (body ?? {}) as { sessionKey?: unknown; event?: unknown }
+      const payload = (body ?? {}) as { sessionKey?: unknown; event?: unknown; expectedInteractionId?: unknown }
       const key = typeof payload.sessionKey === 'string' ? payload.sessionKey : ''
       const session = key ? resolveSession(key) : null
-      if (!session) return { status: 404, body: { error: 'Browser session not found' } }
+      if (!session) return { status: 404, body: { code: 'browser_disconnected', error: 'Browser session not found' } }
       const event = payload.event as BrowserInputEvent | undefined
       if (!event || typeof event.type !== 'string') {
-        return { status: 400, body: { error: 'Missing input event' } }
+        return { status: 400, body: { code: 'invalid_input', error: 'Missing input event' } }
       }
-      const accepted = await session.dispatchInput(event)
+      let accepted:boolean
+      try {
+        accepted = await browserOperation(key, 'user', async () => {
+          const current = resolveSession(key)
+          if (!current) throw new BrowserOperationError('browser_disconnected', 'Browser session not found')
+          if (payload.expectedInteractionId !== undefined) {
+            if (!current.frames) throw new BrowserOperationError('capability_unsupported', 'Update runtime to use guarded browser input')
+            current.frames.assertInteraction(payload.expectedInteractionId)
+          }
+          return current.dispatchInput(validateBrowserInput(event), payload.expectedInteractionId)
+        })
+      } catch (error) { return browserErrorResponse(error) }
       return accepted
         ? { status: 200, body: { ok: true } }
-        : { status: 501, body: { error: 'This driver does not support input injection' } }
+        : { status: 501, body: { code: 'capability_unsupported', error: 'This driver does not support input injection' } }
     }, apiToken),
 
     'GET /browser/readiness': withAuth(async () => {

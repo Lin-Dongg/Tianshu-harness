@@ -4,17 +4,21 @@ import http from 'node:http'
 import { inflateSync } from 'node:zlib'
 import { probeProvider, VISION_PROBE_IMAGE_DATA_URI } from '../provider-probe.js'
 
+const liveServers = new Set<http.Server>()
+after(async () => { await Promise.all([...liveServers].map(server => new Promise<void>(resolve => { server.closeAllConnections(); server.close(() => resolve()) }))) })
+
 type Handler = (req: http.IncomingMessage, res: http.ServerResponse) => void
 
 function startServer(handler: Handler): Promise<{ baseUrl: string; close: () => Promise<void> }> {
   return new Promise(resolve => {
     const server = http.createServer(handler)
+    liveServers.add(server)
     server.listen(0, '127.0.0.1', () => {
       const address = server.address()
       const port = typeof address === 'object' && address ? address.port : 0
       resolve({
         baseUrl: `http://127.0.0.1:${port}/v1`,
-        close: () => new Promise(done => server.close(() => done())),
+        close: () => new Promise(done => server.close(() => { liveServers.delete(server); done() })),
       })
     })
   })
@@ -202,7 +206,7 @@ describe('probeProvider', () => {
     server = undefined
   })
 
-  it('prefers a discovered model over the suggested probeModel for completion', async () => {
+  it('honors an explicit model even when it is absent from the discovered list', async () => {
     let probedModel = ''
     server = await startServer((req, res) => {
       if (req.url === '/v1/models') {
@@ -221,7 +225,7 @@ describe('probeProvider', () => {
 
     const report = await probeProvider({ baseUrl: server.baseUrl, probeModel: 'template-default' })
     assert.equal(report.completionOk, true)
-    assert.equal(probedModel, 'workspace-model')
+    assert.equal(probedModel, 'template-default')
     await server.close()
     server = undefined
   })
@@ -348,6 +352,58 @@ describe('probeProvider', () => {
     const report = await probeProvider({ baseUrl, apiKey: 'sk-ant', protocol: 'anthropic' })
     assert.equal(report.completionOk, true)
     assert.equal(sawApiKey, true)
+    await server.close()
+    server = undefined
+  })
+
+  it('gemini 原生协议：GET {base}/models（不拼 /v1）+ generateContent 最小补全', async () => {
+    let sawGoogKey = false
+    const hitPaths: string[] = []
+    server = await startServer((req, res) => {
+      hitPaths.push(req.url ?? '')
+      if (req.url === '/v1beta/models') {
+        sawGoogKey = req.headers['x-goog-api-key'] === 'sk-gem'
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ models: [
+          { name: 'models/gemini-3.8-flash', inputTokenLimit: 1_048_576, outputTokenLimit: 65_536 },
+          { name: 'models/gemini-3.1-pro-preview', inputTokenLimit: 1_048_576, outputTokenLimit: 65_536 },
+        ] }))
+        return
+      }
+      if (req.url === '/v1beta/models/gemini-3.8-flash:generateContent') {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ candidates: [{ content: { parts: [{ text: 'ok' }] } }] }))
+        return
+      }
+      res.writeHead(404).end()
+    })
+
+    // gemini 原生 baseUrl 自带 /v1beta 版本段（startServer 的 baseUrl 带 /v1，剥掉再拼）
+    const geminiBase = server.baseUrl.replace(/\/v1$/, '') + '/v1beta'
+    const report = await probeProvider({ baseUrl: geminiBase, apiKey: 'sk-gem', protocol: 'gemini' })
+    assert.equal(report.modelsOk, true)
+    assert.equal(report.completionOk, true)
+    assert.equal(sawGoogKey, true, 'Gemini 原生鉴权走 x-goog-api-key 头')
+    assert.ok(hitPaths.every(p => !p.includes('/v1beta/v1')), `不得在 v1beta 上再拼 /v1（实际路径：${hitPaths.join(', ')}）`)
+    assert.deepEqual(report.models, ['gemini-3.8-flash', 'gemini-3.1-pro-preview'], 'models/ 前缀应剥离')
+    assert.equal(report.modelInfos?.['gemini-3.8-flash']?.contextWindow, 1_048_576, 'inputTokenLimit 应映射为 contextWindow')
+    await server.close()
+    server = undefined
+  })
+
+  it('gemini 补全探测：非 generateContent 载荷判失败（baseUrl 形态错误）', async () => {
+    server = await startServer((req, res) => {
+      if (req.url === '/v1beta/models') {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ models: [{ name: 'models/gemini-3.8-flash' }] }))
+        return
+      }
+      // 模拟 OpenAI 兼容端点误配成 gemini 协议：返回 chat.completion 形状
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ choices: [{ message: { content: 'ok' } }] }))
+    })
+    const report = await probeProvider({ baseUrl: `${server.baseUrl.replace(/\/v1$/, '')}/v1beta`, apiKey: 'sk-gem', protocol: 'gemini' })
+    assert.equal(report.completionOk, false, '非 Gemini 原生载荷不得判 ok')
     await server.close()
     server = undefined
   })
@@ -581,13 +637,13 @@ describe('vision real-test (视觉真测)', () => {
     }
   })
 
-  it('falls back to a discovered vision-capable model when the suggested one is absent', async () => {
+  it('never silently replaces the explicitly selected vision model', async () => {
     const capture: { model?: string } = {}
     // 聚合站没有 glm-4v-flash；列表里第一个是纯文本模型，glm-5.2 是别名表认识的视觉档。
     server = await visionServer(['some-text-model', 'glm-5.2'], '红色方块', capture)
     const report = await probeProvider({ baseUrl: server.baseUrl, apiKey: 'sk-x', probeModel: 'glm-4v-flash' })
     assert.equal(report.completionOk, true)
-    assert.equal(report.probedModel, 'glm-5.2', '必须优先挑别名表认识的视觉档，而非 models[0]')
+    assert.equal(report.probedModel, 'glm-4v-flash', '实际调用必须绑定用户显式选择')
     assert.equal(report.visionTested, true)
     assert.equal(report.visionAnswer, '红色方块')
     await server.close()
@@ -802,6 +858,24 @@ describe('aliasTableWithProbeInfos', () => {
 
     const empty = matchModelId('no-metadata-model', table)
     assert.equal(empty.entry, undefined, '无元数据的 id 不合成条目，仍走 L4')
+  })
+
+  it('carries supportsImageGen into synthesized entries (D3)', async () => {
+    const { aliasTableWithProbeInfos } = await import('../provider-probe.js')
+    const { matchModelId } = await import('../model-id-matcher.js')
+
+    const table = aliasTableWithProbeInfos({
+      'brand-new-image-model': { supportsImageGen: true },
+      'brand-new-text-model': { contextWindow: 128_000 },
+    })
+
+    const image = matchModelId('brand-new-image-model', table)
+    assert.equal(image.tier, 'exact')
+    assert.equal(image.entry?.metadata.supportsImageGen, true, '端点声明的生图标记必须随合成条目落地')
+
+    // 端点未声明出图 → 不得凭空生成生图标记（否则文本模型会混进生图槽）。
+    const text = matchModelId('brand-new-text-model', table)
+    assert.equal(text.entry?.metadata.supportsImageGen, undefined, '未声明的模型不带生图标记')
   })
 
   it('returns the enriched base table (别名表 + 官网知识库) without infos', async () => {

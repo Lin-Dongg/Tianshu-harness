@@ -58,6 +58,19 @@ describe('SessionStateManager', () => {
     assert.equal(state.verification[0]!.status, 'passed')
   })
 
+  it('陈旧 failed 不入 volatile：只呈现 STALE_VERIFICATION_MS 内的失败', () => {
+    const mgr = new SessionStateManager('test-sid')
+    mgr.recordVerification('old-fail', 'failed')
+    mgr.recordVerification('recent-fail', 'failed')
+    // 把 old-fail 时间戳拨回 10 分钟前（> 5 min 窗口），模拟陈旧失败
+    const internal = mgr as unknown as { state: { verification: { target: string; verifiedAt: number }[] } }
+    internal.state.verification.find(v => v.target === 'old-fail')!.verifiedAt = Date.now() - 10 * 60_000
+
+    const rendered = mgr.renderForVolatile()
+    assert.ok(rendered.includes('Failed: recent-fail'), '窗口内的失败应呈现')
+    assert.ok(!rendered.includes('old-fail'), '陈旧失败不得进入 volatile（不误导模型）')
+  })
+
   it('renders volatile block under 500 chars', () => {
     const mgr = new SessionStateManager('test-sid')
     mgr.trackFileRead('/src/foo.ts', 'read:tu-1')

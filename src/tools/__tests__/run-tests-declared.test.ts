@@ -60,7 +60,7 @@ describe('run_tests declared verify.test (A2)', () => {
     assert.match(result.verification?.command ?? '', /from declaration/)
   })
 
-  it('C3: retries in a snapshot on in-place failure and attributes pollution', async () => {
+  it('C3: retries in a snapshot on in-place failure without attributing pollution', async () => {
     // Live dir fails (no marker file); snapshot dir passes (marker present).
     const liveDir = setupDeclaredProject('node -e "require(\'node:fs\').accessSync(\'marker.txt\')"')
     const snapDir = makeTestDir('run-tests-snapshot-')
@@ -76,7 +76,11 @@ describe('run_tests declared verify.test (A2)', () => {
     const result = await RUN_TESTS_TOOL.execute(params as never)
     assert.equal(result.isError, false, 'snapshot-pass should override live-fail')
     assert.match(String(result.content), /C3 归因重试/)
-    assert.match(String(result.content), /工作区污染/)
+    // 归因文案纪律（设计 §5.2 / §6.2）：未经基线或隔离证明，不得把 A/B 结果不一致
+    // 断言成“工作区污染 / 其他会话引入”的因果结论。哨兵钉住当前的中性措辞与留存语义。
+    assert.match(String(result.content), /保留失败记录并检查失败位置或隔离对照/)
+    assert.match(String(result.content), /不能仅据此认定由其他会话引入/)
+    assert.doesNotMatch(String(result.content), /工作区污染/)
   })
 
   it('C3: both-fail keeps the failure and confirms code attribution', async () => {

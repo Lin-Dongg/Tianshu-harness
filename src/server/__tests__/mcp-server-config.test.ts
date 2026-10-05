@@ -71,7 +71,9 @@ test('GET /mcp/servers/:id is auth-gated (fail-closed)', async () => {
   })
 })
 
-// ── 项目信任门剥离的可见性（终端用户反馈「MCP 全都没了」但 UI 无解释）──────
+// ── 项目 MCP 在桌面端不可见的解释（终端用户反馈「MCP 全都没了」但 UI 无解释）──
+// 桌面端不加载项目级 MCP（与授信无关）：未授信是「被信任门剥离」，已授信是
+// 「同样不加载」——两种情形都要报出，面板才能解释空列表（2026-10-05 修订）。
 
 /** 在临时目录造一个带 mcp.servers 的项目配置，并在给定信任态下回调。 */
 async function withProjectConfig(
@@ -110,12 +112,14 @@ test('detectStrippedProjectMcp：未授信项目 + 项目级 MCP → 报出实�
   )
 })
 
-test('detectStrippedProjectMcp：已授信项目 → null（配置正常生效，无需提示）', async () => {
+test('detectStrippedProjectMcp：已授信项目 → 依然报出（桌面端不加载项目级 MCP，与授信无关）', async () => {
   await withProjectConfig(
     { local: { command: 'npx' } },
     true,
     (projectDir) => {
-      assert.equal(detectStrippedProjectMcp(projectDir), null)
+      const hit = detectStrippedProjectMcp(projectDir)
+      assert.ok(hit, '已授信同样要报——桌面端无论授信与否都不从项目层加载 MCP，空列表需要解释')
+      assert.equal(hit.serverCount, 1)
     },
   )
 })

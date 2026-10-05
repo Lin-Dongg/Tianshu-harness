@@ -29,6 +29,8 @@ export interface TestKeyResult {
   /** 别名表回填后的模型描述符（contextWindow/maxTokens/supportsVision/pricing 等）——
    *  无回填（unknown 模型）时该条为 { id } 骨架。与 models 一一对应。 */
   descriptors?: Array<Partial<ModelConfig> & { id: string }>
+  /** Models whose supplied defaults are fuzzy inference, not measured metadata. */
+  inferredIds?: string[]
   /** 本次探测无凭据发起（keyless：Ollama/vLLM 等本地端点）时为 true。前端据此
    *  区分空模型列表的语义——keyless 的空（如尚未 pull 模型）不提示权限问题。 */
   keyless?: boolean
@@ -119,16 +121,16 @@ export async function probeForTestKey(opts: {
     return mapError(report)
   }
   const models = report.models
-  const { models: descriptors, notes } = toModelDescriptors(
-    matchModelIds(models, aliasTableWithProbeInfos(report.modelInfos)),
-  )
+  const matched = matchModelIds(models, aliasTableWithProbeInfos(report.modelInfos))
+  const { models: descriptors, notes } = toModelDescriptors(matched)
   if (notes.length > 0) {
     // 低置信/未知模型的 notes 仅供诊断；契约字段不带 notes，避免前端消费负担。
     // 需要展示时由路由层决定是否透传（当前不透传——同 CLI 的 stderr 提示语义
     // 不同，桌面端回填失败静默回退界面默认值）。
     void notes
   }
-  return { ok: true, models, descriptors, ...(keyless ? { keyless: true } : {}) }
+  const inferredIds = matched.filter(r => r.tier === 'fuzzy' && r.entry).map(r => r.rawId)
+  return { ok: true, models, descriptors, inferredIds, ...(keyless ? { keyless: true } : {}) }
 }
 
 /**

@@ -122,14 +122,14 @@ export function analyzeDistClosure(entry: string): DistClosure {
     if (!files.has(abs)) {
       const needle = target.split('\\').join('/')
       for (const candidate of files.keys()) {
-        if (relative(entryAbs, candidate).split('\\').join('/') === needle || candidate.endsWith(`/${needle}`)) { abs = candidate; break }
+        if (relative(dirname(entryAbs), candidate).split('\\').join('/') === needle || candidate.split('\\').join('/').endsWith(`/${needle}`)) { abs = candidate; break }
       }
     }
     if (!files.has(abs)) return []
     const chain: string[] = []
     let cursor: string | null | undefined = abs
     while (cursor) {
-      chain.push(relative(entryAbs, cursor).split('\\').join('/'))
+      chain.push(relative(dirname(entryAbs), cursor).split('\\').join('/'))
       cursor = parentOf.get(cursor) ?? null
     }
     return chain.reverse()

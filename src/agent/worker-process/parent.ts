@@ -1,3 +1,4 @@
+import { currentWorkspaceRoots } from '../../tools/workspace-context.js'
 /**
  * worker-process parent — OOP（out-of-process）运行器，worker 子进程隔离 v1。
  *
@@ -105,17 +106,13 @@ export function createModeAwareRunner(
 
 /** 子进程 entry 解析：dist 形态（tsup 镜像源码树）优先，dev 回退 tsx 直跑 .ts。
  *  两者都不存在 → null（公开仓裁剪/tsx 不可用等）。 */
-export function resolveChildEntry(): { execArgs: string[]; script: string } | null {
-  const distUrl = new URL('./child.js', import.meta.url)
-  try {
-    const distPath = fileURLToPath(distUrl)
-    if (existsSync(distPath)) return { execArgs: [], script: distPath }
-  } catch { /* fall through */ }
-  const devUrl = new URL('./child.ts', import.meta.url)
-  try {
-    const devPath = fileURLToPath(devUrl)
-    if (existsSync(devPath)) return { execArgs: ['--import', 'tsx'], script: devPath }
-  } catch { /* fall through */ }
+export function resolveChildEntry(baseUrl = import.meta.url): { execArgs: string[]; script: string } | null {
+  for (const ext of ['js', 'ts']) for (const relative of [`./child.${ext}`, `./agent/worker-process/child.${ext}`, `../agent/worker-process/child.${ext}`]) {
+    try {
+      const script = fileURLToPath(new URL(relative, baseUrl))
+      if (existsSync(script)) return { execArgs: ext === 'js' ? [] : ['--import', 'tsx'], script }
+    } catch { /* unavailable layout */ }
+  }
   return null
 }
 
@@ -146,6 +143,7 @@ export async function runWorkerSessionOop(
     config: {
       order: config.order,
       cwd: config.cwd,
+      workspaceRoots: config.workspaceRoots ?? [...currentWorkspaceRoots(config.cwd)],
       maxTurns: config.maxTurns,
       contextWindow: config.contextWindow,
       compact: config.compact,
@@ -160,6 +158,9 @@ export async function runWorkerSessionOop(
       priorMessages: config.priorMessages ? [...config.priorMessages] : undefined,
       priorUsage: config.priorUsage,
       priorFrozenSnapshot: config.priorFrozenSnapshot,
+      priorPrefixProof: config.priorPrefixProof,
+      continuationSource: config.continuationSource,
+      routeReason: config.routeReason,
       sessionNonce: config.sessionNonce,
       checkpoint: config.checkpoint,
     },
@@ -290,6 +291,7 @@ export async function runWorkerSessionOop(
       usage: run.usage,
       checkpoint: run.checkpoint,
       frozenSnapshot: run.frozenSnapshot,
+      prefixProof: run.prefixProof,
     })
 
     const decoder = createFrameDecoder()

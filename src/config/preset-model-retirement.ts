@@ -68,3 +68,120 @@ export function migrateDeepseekVisionExpRetirement(raw: Record<string, unknown>)
 
   return changed
 }
+
+/**
+ * One-shot migration: 官方 deepseek 供应商退役 deepseek-v4-flash（2026-10-04）。
+ * 定价表只剩 deepseek-flash（版本 DeepSeek-V4.1-Flash）与 deepseek-v4-pro。旧名仍可
+ * 调用，但模型已下线，请求由 V4.1 Flash 按 Flash 价格承接。
+ *
+ * 只动 provider 名恰好是 `deepseek` 的条目。火山方舟 / OpenCode Go / 硅基流动上的
+ * 同名 id 是那些网关自己的模型名，不在这里改。
+ *
+ * 快照里已有 deepseek-flash 时删掉旧条目；没有则把旧 id 改名（保留用户调过的窗口）。
+ * 缺的视觉/定价由随后的 preset backfill 按新 id 补。同时改写官方 provider 上指向
+ * 旧 id 或短名 v4-flash 的 defaultModel / visionModel / worker / review / greeting / compact。
+ *
+ * 幂等。Mutates `raw` in place. Returns true if any value was changed.
+ */
+export function migrateDeepseekV4FlashRetirement(raw: Record<string, unknown>): boolean {
+  const RETIRED = 'deepseek-v4-flash'
+  const RETIRED_ALIAS = 'v4-flash'
+  const REPLACEMENT = 'deepseek-flash'
+  let changed = false
+
+  const isRetired = (name: unknown): boolean => name === RETIRED || name === RETIRED_ALIAS
+
+  const rewriteModels = (models: unknown): unknown[] | undefined => {
+    if (!Array.isArray(models)) return undefined
+    const hasReplacement = models.some(m =>
+      !!m && typeof m === 'object' && (m as { id?: unknown }).id === REPLACEMENT,
+    )
+    let local = false
+    const next: unknown[] = []
+    for (const item of models) {
+      if (!item || typeof item !== 'object') { next.push(item); continue }
+      const m = item as Record<string, unknown>
+      if (m.id !== RETIRED) { next.push(item); continue }
+      local = true
+      if (hasReplacement) continue
+      next.push({ ...m, id: REPLACEMENT })
+    }
+    if (!local || next.length === 0) return undefined
+    changed = true
+    return next
+  }
+
+  const provider = raw.provider as Record<string, unknown> | undefined
+  const providers = provider?.providers as Record<string, unknown> | undefined
+  const ds = providers?.['deepseek'] as Record<string, unknown> | undefined
+  if (ds) {
+    const rewritten = rewriteModels(ds.models)
+    if (rewritten) ds.models = rewritten
+    const keys = ds.keys
+    if (Array.isArray(keys)) {
+      for (const key of keys) {
+        if (!key || typeof key !== 'object') continue
+        const slot = key as Record<string, unknown>
+        const keyModels = rewriteModels(slot.models)
+        if (keyModels) slot.models = keyModels
+      }
+    }
+  }
+
+  const redirectRef = (value: string): string | undefined => {
+    const parts = value.split(':')
+    if (parts.length < 2 || parts[0] !== 'deepseek') return undefined
+    if (!isRetired(parts[parts.length - 1])) return undefined
+    parts[parts.length - 1] = REPLACEMENT
+    return parts.join(':')
+  }
+
+  const redirectProfile = (profile: unknown): void => {
+    if (!profile || typeof profile !== 'object') return
+    const p = profile as Record<string, unknown>
+    if (p.provider === 'deepseek' && isRetired(p.model)) {
+      p.model = REPLACEMENT
+      changed = true
+    }
+  }
+
+  const agent = raw.agent as Record<string, unknown> | undefined
+  if (agent) {
+    const vm = agent.visionModel as Record<string, unknown> | undefined
+    if (vm && vm.provider === 'deepseek' && isRetired(vm.model)) {
+      agent.visionModel = { ...vm, model: REPLACEMENT }
+      changed = true
+    }
+    if (typeof agent.defaultModel === 'string') {
+      const next = redirectRef(agent.defaultModel)
+      if (next) {
+        agent.defaultModel = next
+        changed = true
+      }
+    }
+    const greeting = agent.greeting as Record<string, unknown> | undefined
+    if (greeting && greeting.model === RETIRED) {
+      greeting.model = REPLACEMENT
+      changed = true
+    }
+    const review = agent.review as Record<string, unknown> | undefined
+    const reviewProfiles = review?.profiles as Record<string, unknown> | undefined
+    if (reviewProfiles) {
+      for (const profile of Object.values(reviewProfiles)) redirectProfile(profile)
+    }
+  }
+
+  const compact = raw.compact as Record<string, unknown> | undefined
+  if (compact && compact.model === RETIRED) {
+    compact.model = REPLACEMENT
+    changed = true
+  }
+
+  const workers = raw.workers as Record<string, unknown> | undefined
+  const profiles = workers?.profiles as Record<string, unknown> | undefined
+  if (profiles) {
+    for (const profile of Object.values(profiles)) redirectProfile(profile)
+  }
+
+  return changed
+}

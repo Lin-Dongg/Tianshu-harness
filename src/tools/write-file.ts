@@ -235,17 +235,28 @@ export const WRITE_FILE_TOOL: Tool = {
       await trackFileChange(params.cwd, { filePath: relPath, action: 'write', toolCallId: params.toolUseId ?? 'write_file' })
     }
 
-    // Staleness check: warn if file was read earlier and has since been modified
-    // by another process/tool (prevents silent overwrite of external changes).
-    try {
-      const currentStat = await stat(filePath)
-      const currentMtime = currentStat.mtimeMs
+    // Staleness fence (fail-closed) — W1 of the file-claim lease design
+    // (docs/design/2026-10-05-file-claim-lease-lifecycle.md §5.2)。
+    // 本会话读过、但此后磁盘已变的文件，整文件覆盖会把**整份陈旧视图**盖回
+    // 他方成果上——这正是会话期 claim 一直在挡的那类丢失；一旦租约被缩短，
+    // 它就会重新敞开。edit_file / hash_edit 已是 fail-closed，只有 write_file
+    // 从前是 console.warn 后照写。计划草稿（系统会重建空文件）、字节相同重写
+    // （无信息损失）、RIVET_WRITE_OVERWRITE_GUARD=0（与盲覆盖守卫共用开关）豁免。
+    if (fileExists && !isActivePlanDraft && process.env.RIVET_WRITE_OVERWRITE_GUARD !== '0') {
+      const currentMtime = (await stat(filePath)).mtimeMs
       const lastReadMtime = getFileReadMtime(filePath, params.sessionId)
-      if (lastReadMtime !== null && currentMtime !== lastReadMtime) {
-        console.warn(`⚠ write_file: ${filePath} was modified externally since last read. Overwriting.`)
+      if (
+        lastReadMtime !== null
+        && currentMtime !== lastReadMtime
+        && !(haveOldContentForDiff && oldContentForDiff === toLf(content))
+      ) {
+        return {
+          content: `错误：${filePath} 自本会话上次读取后已被外部修改。`
+            + `基于旧内容整文件覆盖会抹掉他方改动（本会话未见该版本，覆盖不可逆）。`
+            + `请先 read_file 获取当前内容，再基于新内容重写；或用 edit_file 做定向修改。`,
+          isError: true,
+        }
       }
-    } catch {
-      // File doesn't exist yet — skip staleness check
     }
 
     // Line-ending policy: force CRLF for Windows batch files, preserve an

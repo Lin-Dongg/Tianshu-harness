@@ -17,6 +17,8 @@ import {
   dismissProjectTrustPrompt,
   isTrustPromptDismissed,
   stripUntrustedProjectKeys,
+  hasProjectStateInjectionFiles,
+  projectStateAllowed,
 } from '../project-trust.js'
 import { interpretTrustKey, buildTrustPromptText } from '../../cli/project-trust-prompt.js'
 
@@ -136,6 +138,36 @@ describe('project-trust', () => {
       process.env.RIVET_TRUST_PROJECT = '0'
       trustProject(proj)
       assert.equal(isProjectTrusted(proj), false)
+    })
+  })
+
+  describe('project state gate (.rivet/knowledge 注入面，2026-10-03 安全报告)', () => {
+    it('untrusted project with state files is not allowed; trusting flips it', () => {
+      mkdirSync(join(proj, '.rivet', 'knowledge'), { recursive: true })
+      writeFileSync(join(proj, '.rivet', 'knowledge', 'memory.jsonl'), '')
+      assert.equal(hasProjectStateInjectionFiles(proj), true)
+      assert.equal(projectStateAllowed(proj), false)
+      trustProject(proj)
+      assert.equal(projectStateAllowed(proj), true)
+    })
+
+    it('untrusted project without state files is still not allowed (fail-closed, no notification)', () => {
+      assert.equal(hasProjectStateInjectionFiles(proj), false)
+      assert.equal(projectStateAllowed(proj), false)
+    })
+
+    it('manifest.md alone counts as a state injection file', () => {
+      mkdirSync(join(proj, '.rivet', 'knowledge'), { recursive: true })
+      writeFileSync(join(proj, '.rivet', 'knowledge', 'manifest.md'), '')
+      assert.equal(hasProjectStateInjectionFiles(proj), true)
+    })
+
+    it('env override RIVET_TRUST_PROJECT=0 beats a trusted store entry', () => {
+      mkdirSync(join(proj, '.rivet', 'knowledge'), { recursive: true })
+      writeFileSync(join(proj, '.rivet', 'knowledge', 'memory.jsonl'), '')
+      trustProject(proj)
+      process.env.RIVET_TRUST_PROJECT = '0'
+      assert.equal(projectStateAllowed(proj), false)
     })
   })
 

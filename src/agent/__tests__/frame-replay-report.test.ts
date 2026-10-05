@@ -36,7 +36,7 @@ function consistentRecord(
   const frame = assembleCognitiveFrame(frameInput(overrides))
   const inputs = projectStructureFlowInputs(frame)
   const sf = inputs ? computeStructureFlowControl(inputs) : null
-  return JSON.parse(JSON.stringify(buildCognitiveFrameRecord(frame, sf, convergence))) as CognitiveFrameRecord
+  return JSON.parse(JSON.stringify(buildCognitiveFrameRecord(frame, sf, { ...convergence, messageVariant: null }))) as CognitiveFrameRecord
 }
 
 describe('classifyFrameRecord — 六类反例映射（非互斥）', () => {

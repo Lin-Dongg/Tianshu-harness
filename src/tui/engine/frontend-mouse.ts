@@ -52,6 +52,7 @@ export async function openFrontendTarget(target: string): Promise<void> {
 export class FrontendMouse {
   private pressed?: { overlay: string; hit: OverlayMenuHit; field: string; x: number; y: number }
   private composerPress?: { x: number; y: number }
+  private copyPress?: { x: number; y: number; moved: boolean }
   handle(event: MousePress, host: {
     session: FrontendSession; line: InputLine; overlay: OverlayEngine; controller: OverlayController; columns: number
     render: () => void; key: (name: string) => void; copy: () => void; copyOnSelect: boolean; message: (text: string) => void
@@ -74,12 +75,25 @@ export class FrontendMouse {
       }
       return
     }
+    if (event.type === 'press' && (event.button & 3) === 0 && host.session.copyButtonHit(event.x, event.y)) {
+      this.copyPress = { x: event.x, y: event.y, moved: false }
+      return
+    }
+    if (this.copyPress && (event.type === 'move' || event.type === 'release')) {
+      if (event.type === 'move') { this.copyPress.moved = true; return }
+      if (event.type === 'release') {
+        if (!this.copyPress.moved && (event.button & 3) === 0 && event.x === this.copyPress.x && event.y === this.copyPress.y && host.session.copyButtonHit(event.x, event.y)) host.copy()
+        this.copyPress = undefined
+      }
+      return
+    }
     const target = host.session.linkTargetAt(event)
     if (target) { void openFrontendTarget(target).catch(error => host.message(`打开失败：${error.message}`)); return }
     const hit = !id ? host.session.composerHit(event.x, event.y) : null
     if (event.type === 'press') this.composerPress = hit ? { x: event.x, y: event.y } : undefined
     if (event.type === 'move') this.composerPress = undefined
     if (hit && event.type === 'release' && this.composerPress?.x === event.x && this.composerPress.y === event.y) {
+      host.session.closeHistory()
       host.line.placeVisibleCaret(hit.line, hit.column, Math.max(1, boxInnerWidth(host.columns)), 12)
       host.render()
     } else {

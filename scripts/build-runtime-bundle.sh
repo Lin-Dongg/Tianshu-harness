@@ -6,7 +6,7 @@
 #   tianshu-runtime-<ver>-<platform>-<arch>/
 #     bin/rivet[.cmd]   启动 shim（exec node dist/cli/entry.js；内置 V8 编译缓存
 #                        与 CLI 早期路由，未命中子命令才加载 main.js）
-#     node/             自带 Node 运行时（复用 desktop/scripts/fetch-node-runtime.js，含 npm）
+#     node/             自带 Node 运行时（scripts/fetch-node-runtime.js，含 npm）
 #     dist/             内核 bundle（含 dist/node_modules 不可内联依赖 + dist/native）
 #     version.txt
 #
@@ -46,8 +46,8 @@ echo "--- 暂存不可内联依赖（dist/node_modules）---"
 node scripts/stage-runtime-deps.js
 
 echo "--- 拉取自带 Node 运行时 ---"
-node desktop/scripts/fetch-node-runtime.js
-NODE_RES_DIR="$ROOT/desktop/src-tauri/resources/node"
+NODE_RES_DIR="$OUT_DIR/node-runtime"
+node scripts/fetch-node-runtime.js "$NODE_RES_DIR"
 # fetch-node-runtime 落在 <platform-token>-<arch>/（win32 → win）
 NODE_TOKEN="$PLATFORM"
 [[ "$PLATFORM" == "win32" ]] && NODE_TOKEN="win"

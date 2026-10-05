@@ -1,3 +1,5 @@
+import type { McpTransportType } from './types.js'
+
 export type McpErrorClass =
   | 'config'
   | 'auth'
@@ -104,6 +106,24 @@ export function classifyMcpError(error: unknown, context?: McpErrorContext): Cla
     return { class: 'auth', retryable: false, suggestion: 'Check API key or OAuth configuration for this MCP server.' }
   }
 
+  // stdio 连接超时：本地管道不存在"网络"。子进程被拉起但始终没有完成 MCP 握手
+  // （initialize 已发出、timeoutMs 内无协议有效响应）。实测最常见根因：服务器实现了
+  // 传输层但应答不是合法 JSON-RPC（例如缺 `jsonrpc:"2.0"` 字段时客户端静默丢弃，
+  // 表现就是干等到超时）；其次是首次冷启动（npx 拉包）超出 timeoutMs。两者重试都
+  // 无济于事——与 remote 的瞬时网络超时严格分开（后者才 retryable）。
+  if (context?.transport === 'stdio' && /mcp connect .+timed out/i.test(msg)) {
+    return {
+      class: 'protocol',
+      retryable: false,
+      suggestion: 'The server process started but never completed the MCP handshake (initialize '
+        + 'sent, no protocol-valid response arrived before the timeout). Common causes: the server '
+        + 'does not answer with valid JSON-RPC (every response must carry the `jsonrpc:"2.0"` field — '
+        + 'malformed responses are silently dropped), or the first start is slow (e.g. npx fetching '
+        + 'packages) and exceeds `mcp.timeoutMs`. Retrying will not fix either — fix the server '
+        + 'implementation or raise the timeout.',
+    }
+  }
+
   // Network errors
   if (/econnrefused|etimedout|timed out|socket hang up|econnreset|fetch failed|transport.*close|disconnected|connection closed|-32000/i.test(msg)) {
     return { class: 'network', retryable: true, suggestion: 'Transient network error. Retry may succeed.' }
@@ -116,4 +136,24 @@ export function classifyMcpError(error: unknown, context?: McpErrorContext): Cla
 
   // Default: tool error
   return { class: 'tool_error', retryable: false, suggestion: 'Read the error output for details.' }
+}
+
+/**
+ * 断连/崩溃的一句话诊断（issue #148 建议 2；自 manager.ts 迁入——沿接缝拆分，
+ * 守 manager 行数红线）。
+ *
+ * stdio 走分类器：stderr 决定它是环境问题、包问题还是未知，用户据此知道该改配置
+ * 还是该报 bug。remote 是网络语义，不套 stderr。**空 stderr 不硬凑**——不知道就
+ * 说不知道，编一个「可能是网络问题」只会把人带偏。
+ */
+export function describeTransportLoss(transport: McpTransportType, stderrTail: string): string {
+  if (transport !== 'stdio') return 'connection lost'
+  const tail = stderrTail.trim()
+  if (!tail) return 'server process exited (no stderr captured)'
+  const classified = classifyMcpError(new Error('MCP server process exited'), {
+    transport: 'stdio',
+    stderr: tail,
+  })
+  const compact = tail.replace(/\n+/g, ' | ').slice(0, 300)
+  return `server process exited; stderr: ${compact} — ${classified.suggestion}`
 }

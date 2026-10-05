@@ -281,8 +281,9 @@ describe('runHandsSession', () => {
     assert.equal(wtCoordinator.getActiveCount(), 0, 'worktree must be cleaned up even on failure')
   })
 
-  it('handles worker returning blocked status (schema repair failure)', async () => {
+  it('degrades malformed reports without re-entering execution', async () => {
     const order = testOrder({ id: 'wo-blocked' })
+    let calls = 0
     const config: HandsSessionConfig = {
       order,
       wtCoordinator,
@@ -291,6 +292,7 @@ describe('runHandsSession', () => {
       contextWindow: 128_000,
       compact: { enabled: false, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash' },
       runAgent: async () => {
+        calls++
         return 'not valid json {{{'
       },
     }
@@ -298,6 +300,7 @@ describe('runHandsSession', () => {
     const run = await runHandsSession(config)
     // Should be blocked due to unparseable result
     assert.equal(run.result.status, 'blocked')
+    assert.equal(calls, 1, 'report failure cannot restart the worker')
     assert.equal(wtCoordinator.getActiveCount(), 0)
   })
 })

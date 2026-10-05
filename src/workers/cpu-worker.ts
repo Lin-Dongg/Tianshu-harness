@@ -14,6 +14,8 @@ import { parentPort } from 'node:worker_threads'
 // @ts-ignore — tsx dev worker uses .ts extension; tsup bundles this file separately
 import { diffUnifiedRaw, diffStructuredRaw, diffLinesRaw, parseEventsJsonlRaw, parseEventsTailRaw, esbuildTransformRaw, esbuildStopRaw, astScanRaw, astEditComputeRaw } from './cpu-tasks.ts'
 // @ts-ignore — worker source runs with Node's native type stripping.
+import { grepScanRaw } from './grep-scan-task.ts'
+// @ts-ignore — worker source runs with Node's native type stripping.
 import { readEventsTailRaw } from './events-tail.ts'
 // @ts-ignore — worker source runs with Node's native type stripping.
 import { readEventsTailIndexed } from './events-summary.ts'
@@ -32,6 +34,7 @@ const tasks: Record<string, TaskFn> = {
   esbuildStopRaw: esbuildStopRaw as TaskFn,
   astScanRaw: astScanRaw as TaskFn,
   astEditComputeRaw: astEditComputeRaw as TaskFn,
+  grepScanRaw: grepScanRaw as TaskFn,
 }
 
 parentPort?.on('message', (msg: { id: number; task: string; args: unknown[] }) => {

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { buildContextBudget } from '../context/request-budget.js'
+import { buildContextBudget, ContextBudgetExceededError } from '../context/request-budget.js'
 import type { AgentLoop } from './loop.js'
 import type { AgentCallbacks } from './loop-types.js'
 import type { OaiChatRequest, OaiMessage } from '../api/oai-types.js'
@@ -10,12 +10,26 @@ import { archiveContextImages } from './context-image-archive.js'
 import { COMPACT_HISTORY_TOOL } from '../compact/recall-marker.js'
 import { invalidateSessionReadDedup } from '../tools/read-file.js'
 
+/** 把压缩的拒绝原因翻译成用户能读的中文（供 compact-blocked 相位）。 */
+function describeCompactBlock(reason?: string): string {
+  if (!reason) return '压缩未执行（压缩模型 / 持久化 / 开关不可用）'
+  const r = reason
+  if (r === 'insufficient_reclaim_or_summary_coverage') return '压缩未能回收足够上下文（保留下限已占满，可压缩部分不足）'
+  if (r.startsWith('summary_stop:')) return '摘要模型未正常结束（输出被截断）'
+  if (r === 'summary_schema_or_budget_rejected') return '摘要格式或预算被拒'
+  if (r === 'aborted') return '压缩被中断'
+  if (r === 'summary_or_persistence_failed') return '摘要生成或落盘失败'
+  return `压缩未生效（${r}）`
+}
+
 /** One request budget owner; ordinary observations never mutate the prompt. */
 export class RequestContextController {
   snapshot?: ContextBudgetSnapshot
   private revision = 0
   activeUserMessage?: OaiMessage
   private failedAt?: { input: number; model: string; budget: number }
+  /** 上一次压缩的拒绝原因——仅在预算闸门最终拒绝时用于向 UI 透出（见 describeCompactBlock）。 */
+  private lastCompactReason?: string
   constructor(private readonly agent: AgentLoop) {}
 
   record(budget: ContextBudgetSnapshot, beginRequest = false): ContextBudgetSnapshot {
@@ -25,13 +39,31 @@ export class RequestContextController {
   }
 
   async prepare(build: () => OaiChatRequest, callbacks: AgentCallbacks): Promise<OaiChatRequest> {
+    const recovering = this.agent.reasoningRecoveryPending
+    const buildRequest = () => {
+      const request = build()
+      if (recovering) request.diagnostics = { ...request.diagnostics, purpose: 'reasoning_recovery' }
+      return request
+    }
     const policy = this.agent.config.promptEngine.getRequestBudgetPolicy()
-    if (!policy) return build()
-    return prepareContextRequest({ build, policy, signal: this.agent.abortController?.signal,
-      preview: request => (this.agent.config.primaryClient ?? this.agent.config.client)?.previewContextRequest?.(request) ?? request,
-      publish: budget => { const current = this.record(budget, true); callbacks.onContextBudget?.(current) },
-      compact: () => this.compact(),
-    })
+    if (!policy) { this.agent.reasoningRecoveryPending = false; return buildRequest() }
+    try {
+      const request = await prepareContextRequest({ build: buildRequest, policy, signal: this.agent.abortController?.signal,
+        preview: request => (this.agent.config.primaryClient ?? this.agent.config.client)?.previewContextRequest?.(request) ?? request,
+        publish: budget => { const current = this.record(budget, true); callbacks.onContextBudget?.(current) },
+        compact: () => this.compact(),
+      })
+      this.agent.reasoningRecoveryPending = false
+      return request
+    } catch (error) {
+      // 预算闸门最终拒绝 = 压缩没能救回上下文。原因此前只落 session 台账、无消费方，
+      // 用户只看到「超限」而不知压缩为何无效。经相位通道 surface（瞬态、不进历史/缓存，
+      // 同 body-guard / image-stripped 先例）：TUI 状态行 + 桌面 toast。
+      if (error instanceof ContextBudgetExceededError) {
+        callbacks.onPhaseChange?.('compact-blocked', { reason: describeCompactBlock(this.lastCompactReason) })
+      }
+      throw error
+    }
   }
 
   refreshSnapshot(): void {
@@ -44,7 +76,7 @@ export class RequestContextController {
 
   async compact(force = false): Promise<boolean> {
     const self = this.agent, budget = this.snapshot
-    if (!self.persist || !self.artifactStore || self.config.compact?.enabled === false) return false
+    if (!self.config.budgetSummaryClient || !self.persist || !self.artifactStore || self.config.compact?.enabled === false) return false
     if (!force && budget && this.failedAt?.model === budget.model && this.failedAt.budget === budget.inputBudget
       && budget.inputTokens < this.failedAt.input + 32_768) return false
     const signal = self.abortController?.signal
@@ -58,11 +90,16 @@ export class RequestContextController {
     // unidentified boundary blocks rewriting rather than protecting a tool by index.
     if (originalUser && !activeUser) return false
     const changed = await compactBudgetHistory(source, {
-      client: self.config.primaryClient ?? self.config.client,
+      client: self.config.budgetSummaryClient(),
       model: self.config.promptEngine.getModel(), signal, protectedUser: activeUser,
       targetTokens: budget ? Math.floor(budget.inputBudget * 0.7) - 16_384 : undefined,
       minReclaimTokens: 32_768,
       recordUsage: usage => self.recordSidePathUsage('compact-summary', usage, self.config.promptEngine.getModel()),
+      recordEvent: event => { this.lastCompactReason = event.reason; self.session.recordCompactEvent({ turn: self.session.getTurnCount(), tier: 4, createdAt: Date.now(), ...event }) },
+      archiveRejectedReport: async (text, reason) => {
+        try { return await self.artifactStore!.saveDurable({ tool: 'compact-summary-failure', target: reason, rawContent: text, summary: reason, sections: [] }) }
+        catch { return undefined }
+      },
       archive: async messages => {
         const images = await archiveContextImages(self.artifactStore!, messages)
         const id = await self.artifactStore!.saveDurable({

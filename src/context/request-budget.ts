@@ -18,6 +18,19 @@ export const DEEPSEEK_WINDOW = 1_048_576
  * 仅当请求未携带 `max_tokens` 时，本常量才作为 `outputReserve` 的兜底。
  */
 export const DEEPSEEK_MAX_OUTPUT = 393_216
+/**
+ * 现实单次输出预留 —— 与能力上限 `DEEPSEEK_MAX_OUTPUT`(384K) 是两回事。拿 384K（能力天花板）
+ * 当 `outputReserve` 会把可输入压到窗口的 ~57%（1M 窗口只剩 566K），等于用「最坏情况」堵死常态。
+ *
+ * 取值 256K = provider preset 的 `maxTokens`（与官方 harness 的 DEFAULT_MAX_TOKENS 同语义）。
+ * **不取更小值**：preset 注释在案「2026-07-01 误改为 6.4 万导致 reasoning_effort=max 时推理未完
+ * 即被 length 截断、loop 收到空响应判死停止——硬下限教训」，且失效方向是**调高**。故本值只用于
+ * **封顶吸收旧快照漂移**（久 config 的 384K → 256K），不额外削减预设的输出能力。
+ *
+ * 它同时是 wire `max_tokens` 的封顶，保证 `input + max_tokens ≤ window` 这条硬约束不被破坏
+ *（两者必须同源，否则大输入时上游 400）。
+ */
+export const DEEPSEEK_OUTPUT_RESERVE = 256_000
 export const DEEPSEEK_BODY_LIMIT = 48 * 1024 * 1024
 
 /** Only verified official models opt in. Unknown endpoints keep their contract. */
@@ -68,7 +81,8 @@ export function estimateBudgetInput(messages: OaiMessage[], tools?: unknown): Pi
 }
 
 export function buildContextBudget(request: Pick<OaiChatRequest, 'messages' | 'tools' | 'model' | 'max_tokens'>, policy: RequestBudgetPolicy, identity: { requestId: string; revision: number }): ContextBudgetSnapshot {
-  const outputReserve = request.max_tokens ?? policy.maxOutputTokens
+  // outputReserve 封顶到「现实输出预留」而非能力上限——见 DEEPSEEK_OUTPUT_RESERVE 注释。
+  const outputReserve = Math.min(request.max_tokens ?? policy.maxOutputTokens, DEEPSEEK_OUTPUT_RESERVE)
   const budget = inputBudgetFor(policy.windowTokens, outputReserve)
   const counts = estimateBudgetInput(request.messages, request.tools)
   const ratio = budget.inputBudget > 0 ? counts.inputTokens / budget.inputBudget : Infinity

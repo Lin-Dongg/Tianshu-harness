@@ -250,21 +250,34 @@ describe('裸技能名直调（issue #100 建议②：/name [task]，Claude Code
   const PROBE = 'probe-bare-skill-xyz'
   // 全局单例注册一次即可——名字带 xyz 后缀，不与任何真实技能/命令碰撞。
   skillRegistry.register({ name: PROBE, description: 'bare probe', triggers: [], body: 'PROBE-BODY-0128' })
+  // 另需一份真实工作区技能：79ab7b582（收编 PR #353「项目技能快照」）之后，带 cwd
+  // 的解析改走 workspaceSkillSnapshot（内置 + plugin + 目录加载），全局 register 的
+  // 技能不在其中；而 TUI 的实际调用都带 cwd，所以这条路径必须被真实文件覆盖。
+  let cwd = ''
+  before(() => {
+    cwd = makeTestDir('rivet-bare-skill')
+    mkdirSync(join(cwd, '.rivet', 'skills'), { recursive: true })
+    writeFileSync(
+      join(cwd, '.rivet', 'skills', `${PROBE}.md`),
+      `---\nname: ${PROBE}\ndescription: bare probe\n---\n\nPROBE-BODY-0128\n`,
+    )
+  })
+  after(() => cleanupTestDir(cwd))
 
   it('裸名命中技能注册表 → 展开 skill prompt', () => {
-    const resolved = resolveAppPromptInput(`/${PROBE}`, '/cwd')
+    const resolved = resolveAppPromptInput(`/${PROBE}`, cwd)
     assert.ok(resolved !== null)
     assert.match(resolved!.prompt, /\[Skill loaded: probe-bare-skill-xyz\]/)
     assert.match(resolved!.prompt, /PROBE-BODY-0128/)
   })
 
   it('参数透传为 User task（与 /skill 网关同形态）', () => {
-    const resolved = resolveAppPromptInput(`/${PROBE} 帮我检查内存`, '/cwd')
+    const resolved = resolveAppPromptInput(`/${PROBE} 帮我检查内存`, cwd)
     assert.match(resolved!.prompt, /User task: 帮我检查内存/)
   })
 
   it('大小写不敏感兜底', () => {
-    const resolved = resolveAppPromptInput(`/${PROBE.toUpperCase()}`, '/cwd')
+    const resolved = resolveAppPromptInput(`/${PROBE.toUpperCase()}`, cwd)
     assert.ok(resolved !== null)
     assert.match(resolved!.prompt, /PROBE-BODY-0128/)
   })

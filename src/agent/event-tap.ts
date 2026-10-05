@@ -97,7 +97,7 @@ export function tapAgentCallbacks(
       emit('tool_use', { id, name, input: redactValue(input) })
       inner.onToolUse(id, name, input)
     },
-    onToolResult: (id, name, result, isError, rawPath, uiContent) => {
+    onToolResult: (id, name, result, isError, rawPath, uiContent, evidence) => {
       // isError === undefined marks a streaming chunk rather than the tool's
       // verdict; only terminal results become events (same filter the sidecar
       // applies, otherwise one chatty tool floods the stream).
@@ -109,11 +109,11 @@ export function tapAgentCallbacks(
           result: truncateUtf16Safe(redactText(result), RESULT_CAP),
         })
       }
-      inner.onToolResult(id, name, result, isError, rawPath, uiContent)
+      inner.onToolResult(id, name, result, isError, rawPath, uiContent, evidence)
     },
-    onTurnComplete: (usage, turnNumber, isFinal, evidenceSummary) => {
+    onTurnComplete: (usage, turnNumber, isFinal, evidenceSummary, continuationReason, stopReason) => {
       emit('turn_complete', { usage, turnNumber, isFinal: !!isFinal })
-      inner.onTurnComplete(usage, turnNumber, isFinal, evidenceSummary)
+      inner.onTurnComplete(usage, turnNumber, isFinal, evidenceSummary, continuationReason, stopReason)
     },
     onError: (error) => {
       emit('error', { error: redactText(error.message) })

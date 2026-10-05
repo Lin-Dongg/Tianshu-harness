@@ -35,7 +35,7 @@ export function determineTier(charCount: number): TierLevel {
  * Convention shared with read-file.ts / prune.ts / stale-round.ts:
  * [artifact:X] is always the LAST token of an artifact-wrapped content string.
  */
-const TRAILING_ARTIFACT_REF = /\[artifact:([A-Za-z0-9_-]+)]\s*$/
+const TRAILING_ARTIFACT_REF = /\[artifact:([A-Za-z0-9_:%.-]+)]\s*$/
 
 /** Extract an existing trailing artifact reference from tool result content. */
 export function extractTrailingArtifactId(content: string): string | undefined {
@@ -77,16 +77,14 @@ export async function tierToolResult(
   let artifactId: string | undefined = existingArtifactId
   if (!artifactId && store) {
     try {
-      artifactId = await store.save({
+      artifactId = await store.saveDurable({
         tool: toolName,
         target,
         rawContent: content,
         summary: buildTierSummary(toolName, content, tier),
         sections: [],
       })
-    } catch {
-      return { content, tier: 0, originalChars: content.length }
-    }
+    } catch { /* still bound the model view; no false recovery reference */ }
   }
 
   if (tier === 1) {
@@ -133,7 +131,7 @@ function compressByToolType(toolName: string, content: string): string | null {
 function buildTier1Inline(toolName: string, content: string, artifactId?: string): string {
   // 1. Try content-type-aware compression
   const compressed = compressByToolType(toolName, content)
-  if (compressed && compressed.length < content.length * 0.8) {
+  if (compressed && compressed.length <= 6000 && compressed.length < content.length * 0.8) {
     const ref = artifactId ? ` [artifact:${artifactId}]` : ''
     return `${compressed}${ref}`
   }
@@ -141,14 +139,16 @@ function buildTier1Inline(toolName: string, content: string, artifactId?: string
   // 2. Fallback: head + tail
   const lines = content.split('\n')
   const lineCount = lines.length
-  const head = lines.slice(0, 30).join('\n')
-  const tail = lines.slice(-10).join('\n')
+  const headCount = Math.min(30, lines.length)
+  const tailCount = Math.min(10, lines.length - headCount)
+  const head = lines.slice(0, headCount).join('\n').slice(0, 4000)
+  const tail = tailCount ? lines.slice(-tailCount).join('\n').slice(-2000) : ''
   const ref = artifactId ? ` [artifact:${artifactId}]` : ''
 
   return [
     `[tiered-summary: ${toolName}, ${lineCount} lines, ${content.length} chars${ref}]`,
     head,
-    `... ${Math.max(0, lineCount - 40)} lines omitted (full content on disk) ...`,
+    `... ${Math.max(0, lineCount - headCount - tailCount)} whole lines omitted; at least ${Math.max(0, content.length - head.length - tail.length - 2)} chars omitted; preview bounded${artifactId ? ' (full content on disk)' : ' (full content not saved)'} ...`,
     tail,
   ].join('\n')
 }
@@ -156,5 +156,5 @@ function buildTier1Inline(toolName: string, content: string, artifactId?: string
 function buildTier2Inline(toolName: string, content: string, target: string, artifactId?: string): string {
   const lines = content.split('\n')
   const ref = artifactId ? ` [artifact:${artifactId}]` : ''
-  return `[tiered-minimal: ${toolName} → ${target}, ${lines.length} lines, ${content.length} chars${ref}. Use read_section to access specific parts.]`
+  return `[tiered-minimal: ${toolName} → ${target.slice(0, 100)}, ${lines.length} lines, ${content.length} chars${ref}. ${artifactId ? 'Use read_section to access specific parts.' : 'Full content not saved; repeat a narrower query if needed.'}]`
 }

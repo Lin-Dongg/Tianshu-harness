@@ -6,7 +6,7 @@
  */
 import * as vscode from 'vscode'
 import { spawn } from 'node:child_process'
-import * as os from 'node:os'
+import { resolveCliCommand } from '../sidecar/cli-command.js'
 
 /** vscode.git 扩展 API 的最小结构面（避免引 git 扩展的 d.ts 依赖）。 */
 interface GitRepository {
@@ -38,7 +38,7 @@ function getGitApi(): GitApi | null {
 function runGitDiff(cwd: string, staged: boolean): Promise<string> {
   return new Promise((resolve) => {
     const args = ['-c', 'core.quotePath=false', 'diff', '--no-color', ...(staged ? ['--cached'] : [])]
-    const child = spawn('git', args, { cwd, stdio: ['ignore', 'pipe', 'ignore'] })
+    const child = spawn('git', args, { cwd, stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true })
     let out = ''
     child.stdout.on('data', (c: Buffer) => { out += c.toString() })
     child.on('close', () => resolve(out))
@@ -48,11 +48,12 @@ function runGitDiff(cwd: string, staged: boolean): Promise<string> {
 
 function runHeadless(cli: string, cwd: string, prompt: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    const child = spawn(cli, ['-p', prompt, '--json'], {
+    const command = resolveCliCommand(cli, ['-p', prompt, '--json'], cwd)
+    const child = spawn(command.command, command.args, {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
-      // Windows 上 npm 全局命令是 .cmd shim（与 launcher.ts 同款经验）
-      shell: os.platform() === 'win32',
+      shell: false,
+      windowsHide: true,
     })
     let out = ''
     let err = ''
@@ -82,7 +83,7 @@ function runHeadless(cli: string, cwd: string, prompt: string): Promise<string> 
   })
 }
 
-export function registerCommitMessageCommand(context: vscode.ExtensionContext): void {
+export function registerCommitMessageCommand(context: vscode.ExtensionContext, getCliPath: () => Promise<string>): void {
   context.subscriptions.push(
     vscode.commands.registerCommand('tianshu.generateCommitMessage', async () => {
       const git = getGitApi()
@@ -114,11 +115,11 @@ export function registerCommitMessageCommand(context: vscode.ExtensionContext): 
         diff,
       ].join('\n')
 
-      const cli = vscode.workspace.getConfiguration('tianshu').get<string>('cliPath')?.trim() || 'rivet'
       await vscode.window.withProgress(
         { location: vscode.ProgressLocation.SourceControl, title: '天枢生成提交语…' },
         async () => {
           try {
+            const cli = await getCliPath()
             const message = await runHeadless(cli, cwd, prompt)
             repo.inputBox.value = message
           } catch (err) {

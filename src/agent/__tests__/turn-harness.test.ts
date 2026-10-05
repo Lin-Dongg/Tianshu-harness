@@ -11,6 +11,34 @@ function makeConfig(overrides?: Partial<TurnHarnessConfig>): TurnHarnessConfig {
   }
 }
 
+for (const nextClass of [undefined, 'flaky'] as const) {
+  it(`stops retrying when the new failure class is ${nextClass ?? 'absent'} or outside the allowlist`, async () => {
+    const harness = new TurnHarness(makeConfig({ maxRetries: 2, retryableClasses: ['timeout'] }), new TrajectoryRecorder())
+    let calls = 0
+    const result = await harness.executeTool({
+      id: 'changed-failure', name: 'web_search', input: { query: 'q' }, turn: 1, isConcurrencySafe: true,
+      execute: async () => ({ content: ++calls === 1 ? 'first' : 'second', isError: true }),
+      classify: content => content === 'first' ? 'timeout' : nextClass,
+    })
+    assert.equal(calls, 2)
+    assert.equal(result.errorClass, nextClass)
+    assert.doesNotMatch(result.content, /All \d+ retries failed/)
+  })
+}
+
+it('retry exhaustion reports the latest failure class', async () => {
+  const harness = new TurnHarness(makeConfig({ retryableClasses: ['timeout', 'flaky'] }), new TrajectoryRecorder())
+  let calls = 0
+  const result = await harness.executeTool({
+    id: 'changed-transient', name: 'web_search', input: { query: 'q' }, turn: 1, isConcurrencySafe: true,
+    execute: async () => ({ content: ++calls === 1 ? 'first' : 'second', isError: true }),
+    classify: content => content === 'first' ? 'timeout' : 'flaky',
+  })
+  assert.equal(calls, 2)
+  assert.equal(result.errorClass, 'flaky')
+  assert.match(result.content, /All 1 retries failed\. Error class: flaky/)
+})
+
 describe('TurnHarness', () => {
   it('executes a tool and records trajectory', async () => {
     const trajectory = new TrajectoryRecorder()

@@ -128,12 +128,15 @@ test('createSidePathUsageRecorder books usage and appends a side_path cache-log 
     } as unknown as AgentLoop
 
     const record = createSidePathUsageRecorder(self)
+    // 实现侧已把 model/provider 改为显式形参（T3：spark 与官方 deepseek 的 wire
+    // 模型 id 相同，side_path 行不带 provider 就无法对照）；全部生产调用点均已传参。
+    // 此处只传 model，provider 留空以继续覆盖 `?? self.config.providerName` 回退分支。
     record('llm-speculation', {
       input_tokens: 95_000,
       output_tokens: 320,
       cache_read_input_tokens: 94_000,
       cache_creation_input_tokens: 500,
-    })
+    }, 'deepseek-v4')
 
     assert.equal(booked.length, 1)
     assert.equal(booked[0]!.input_tokens, 95_000)

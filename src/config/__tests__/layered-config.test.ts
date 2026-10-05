@@ -300,11 +300,11 @@ describe('migrateDeepseekMaxTokens — one-shot bump 64000 → 384000', () => {
       assert.ok(ds)
       assert.equal(ds.maxTokens, 384_000)
       const models = ds.models
-      assert.equal(models[0]?.maxTokens, 384_000, 'vision-exp（已退役、不在 preset）保留迁移值')
-      // v4-flash 是 preset 现存模型：加载时 preset 的 maxTokens 接管（现为 256K，
-      // 对齐官方 harness 的 DEFAULT_MAX_TOKENS），迁移写下的 384K 被覆盖。
-      // 即：已知 id 由 preset 兜底，本迁移只对 preset 不认识的 id 有效。
-      assert.equal(models[1]?.maxTokens, 256_000, 'v4-flash（preset 现存）由 preset 的 maxTokens 接管')
+      const flash = models.find(m => m.id === 'deepseek-flash')
+      assert.ok(flash, '官方 v4-flash 退役后改名为 deepseek-flash')
+      assert.equal(flash.maxTokens, 384_000, '64K 回归迁移先把窗口抬到 384K，改名保留该值')
+      assert.equal(models.some(m => m.id === 'deepseek-v4-flash'), false)
+      assert.equal(models.some(m => m.id === 'deepseek-v4-flash-vision-exp'), false)
     })
   })
 
@@ -384,14 +384,14 @@ describe('migrateDeepseekMaxTokens — one-shot bump 64000 → 384000', () => {
             // 与当前预设 models 全集一致——预设新增模型回流（migratePresetModelBackfill）
             // 与退役迁移（migrateDeepseekVisionExpRetirement 等）都会改写快照，那是有意
             // 行为；本测试钉的是「无需迁移时零写入」，故快照必须已同步：既不能缺条目，
-            // 也不能留着已退役的 deepseek-v4-flash-vision-exp。2026-09-13 起 v4-pro
-            // 恢复（官方改口径继续服务），快照须含它，否则回流迁移会补写它。
+            // 也不能留着已退役的 deepseek-v4-flash-vision-exp / deepseek-v4-flash。
+            // 2026-09-13 起 v4-pro 恢复；2026-10-04 起官方 flash 档是 deepseek-flash。
+            // 快照须含这两条，否则回流或退役迁移会改写。
             // 2026-09 起 alias 弃用——快照还须无 alias 字段，否则 migrateStripModelAlias
             // 会剥除并回写，同样打破零写入断言。
             models: [
-              { id: 'deepseek-v4-flash', contextWindow: 1_000_000, maxTokens: 384_000 },
-              { id: 'deepseek-v4-pro', contextWindow: 1_000_000, maxTokens: 384_000 },
               { id: 'deepseek-flash', contextWindow: 1_000_000, maxTokens: 384_000 },
+              { id: 'deepseek-v4-pro', contextWindow: 1_000_000, maxTokens: 384_000 },
             ],
           },
         },

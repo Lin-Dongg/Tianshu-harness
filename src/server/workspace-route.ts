@@ -1,3 +1,4 @@
+import { validateWorkspaceRoots } from './workspace-roots.js'
 /**
  * /config/workspace — 工作区策略（默认工作区 + 临时会话隔离根，issue #147）。
  * All routes are Bearer-gated (fail-closed), mirroring buildConfigRoutes.
@@ -14,6 +15,7 @@ import { rivetHome } from '../config/paths.js'
 import { getWorkspaceConfig, setWorkspaceConfig } from '../config/workspace-config.js'
 import { sessionScratchRoot } from './workspace.js'
 import { buildFileContextRoutes } from './file-context-routes.js'
+import { buildWorkspaceSkillsRoutes } from './workspace-skills-route.js'
 
 function withAuth(handler: RouteHandler, apiToken?: string): RouteHandler {
   return async (body, params, headers, res) => {
@@ -33,6 +35,11 @@ function workspaceSnapshot(): { defaultDir: string | null; scratchDir: string | 
 export function buildWorkspaceRoutes(apiToken?: string): Record<string, RouteHandler> {
   return {
     ...buildFileContextRoutes(apiToken),
+    ...buildWorkspaceSkillsRoutes(apiToken),
+    'POST /workspace/validate-roots': withAuth(body => {
+      try { return { status: 200, body: { roots: validateWorkspaceRoots((body as { roots?: unknown })?.roots) } } }
+      catch (error) { return { status: 400, body: { error: (error as Error).message } } }
+    }, apiToken),
     'GET /config/workspace': withAuth(() => {
       return { status: 200, body: workspaceSnapshot() }
     }, apiToken),

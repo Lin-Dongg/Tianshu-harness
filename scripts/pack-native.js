@@ -4,7 +4,7 @@
  * Called after `npm run build` and before `tauri:build`.
  *
  * 跨平台版（替代 pack-native.sh）：纯 Node 实现，不依赖 bash，Windows 原生
- * CMD/PowerShell 也能跑。与 desktop/scripts/fetch-node-runtime.js 同口径。
+ * CMD/PowerShell 也能跑。与 scripts/fetch-node-runtime.js 同口径。
  *
  * Idempotent: safe to run multiple times. Skips silently (exit 0) if
  * better-sqlite3 is not installed — the nullDb fallback handles it.
@@ -36,12 +36,12 @@ const SOURCE = join(repoRoot, 'node_modules', 'better-sqlite3', 'build', 'Releas
 const TARGET_DIR = join(repoRoot, 'dist', 'native')
 const TARGET = join(TARGET_DIR, 'better_sqlite3.node')
 
-// 目标运行时版本与 desktop/scripts/fetch-node-runtime.js 单一同源：直接 import 其
+// 目标运行时版本与 scripts/fetch-node-runtime.js 单一同源：直接 import 其
 // DEFAULT_NODE_VERSION，杜绝两处常量漂移（漂移会让本断言失去意义）。import 失败
 // （脚本被移动/单独取用）时退回硬编码兜底，并打一行提示。
 let DEFAULT_TARGET_NODE_VERSION = '24.18.0'
 try {
-  const mod = await import('../desktop/scripts/fetch-node-runtime.js')
+  const mod = await import('./fetch-node-runtime.js')
   if (mod && typeof mod.DEFAULT_NODE_VERSION === 'string') {
     DEFAULT_TARGET_NODE_VERSION = mod.DEFAULT_NODE_VERSION
   }

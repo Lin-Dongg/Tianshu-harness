@@ -114,11 +114,25 @@ export function registerImageGenModelConfig(
   if (options.apiKeyEnv !== undefined && !apiKeyEnv) throw new Error('Image-gen provider apiKeyEnv must not be blank.')
   assertValidUrl(options.baseUrl)
 
+  const cfg = loadConfig()
+  // 槽写入是合并而非整体替换（D2a）：兼容重注册不抹掉用户配好的通用生成参数。
+  // sizeField 是线上 wire name，跟 provider 绑定——跨 provider 继承旧值会把
+  // 『image_size』发给只认『size』的端点，故仅当 previous.provider === providerName
+  // 时继承；prompt/size/timeoutMs 与 provider 无关，存在即保留（存在才带，不留
+  // 显式 undefined 键）。
+  const previous = cfg.agent.imageGenModel
   const model = modelConfigSchema.parse({ id: modelId, supportsImageGen: true })
   const imageGen = imageGenModelSchema.parse({
     provider: providerName,
     model: modelId,
-    ...(options.sizeField ? { sizeField: options.sizeField } : {}),
+    ...(options.sizeField
+      ? { sizeField: options.sizeField }
+      : previous?.provider === providerName && previous.sizeField
+        ? { sizeField: previous.sizeField }
+        : {}),
+    ...(previous?.prompt ? { prompt: previous.prompt } : {}),
+    ...(previous?.size ? { size: previous.size } : {}),
+    ...(previous?.timeoutMs ? { timeoutMs: previous.timeoutMs } : {}),
   })
   const provider: ProviderConfig = {
     name: providerName,
@@ -135,7 +149,6 @@ export function registerImageGenModelConfig(
     userSaved: true,
   }
 
-  const cfg = loadConfig()
   const existing = cfg.provider.providers[providerName]
   if (providerName === cfg.provider.default) {
     throw new Error(`Image-gen provider "${providerName}" cannot replace the default provider.`)

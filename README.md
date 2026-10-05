@@ -76,6 +76,7 @@ Application / TUI / IDE / Desktop
 ## 目录
 
 - [为什么是认知运行时](#为什么是认知运行时)
+- [星域](#星域)
 - [核心特性](#核心特性)
 - [快速开始](#快速开始)
 - [权限模式](#权限模式)
@@ -126,13 +127,7 @@ CVM 不改权重、不让模型变成确定性程序，而是在概率认知之�
 外环（运行时监管）：observe → measure → evaluate → gate → verify → continue / correct / halt
 ```
 
-落到工程上是四层防御深度：信念宪法（static prompt）→ Courage Hook（preTurn）→ Sensorium（每 turn <1ms 六维状态感知）→ RuntimeHookPipeline（75 hooks，trap-and-emulate 拦截退化行为）。全局目标有独立状态（TaskContract），完成必须有运行时证据（Evidence），坍缩会被独立检测（Convergence / doom-loop）。
-
-### 星域：模型的独立认知结构
-
-当退化被逐层拦截，模型开始表现出自己的认知结构——这是星域系统的由来。16 个星域不是角色扮演，而是可切换的认知纪律：**系统提示词、工具白名单、决策阈值**真实切换。星域不是能力限制，任何星域都有完成任务的全部能力，只是视角不同；委员会与团队模式会按议题自动召集多星域席位。
-
-> 完整叙事见 [✦ 星域碑文](docs/stars/genesis-stele.md) · [创世纪公开声明](docs/releases/manifesto-v3.0.0.md)；新用户选星指南见 [用户手册「星域系统」](docs/user-guide.md#星域系统)。
+落到工程上是四层防御深度：信念宪法（static prompt）→ Courage Hook（preTurn）→ Sensorium（每 turn <1ms 六维状态感知）→ RuntimeHookPipeline（75 hooks，trap-and-emulate 拦截退化行为）。全局目标有独立状态（TaskContract），完成必须有运行时证据（Evidence），坍缩会被独立检测（Convergence / doom-loop）。拦截生效之后，模型会稳定地表现出不同的认知姿态。产品里这套姿态叫星域，见下方 [星域](#星域)。
 
 ### 工程质量
 
@@ -147,6 +142,31 @@ CVM 不改权重、不让模型变成确定性程序，而是在概率认知之�
 | 仓库 | 2026-05-15 创建，至今约 4 个半月，共 8,008 个提交，近 30 天 1,769 个 |
 
 `tsc` strict + `noUncheckedIndexedAccess`，事故修复必带回归测试。完整口径、里程碑与复现命令见 [工程质量指标](docs/engineering-metrics.md)。
+
+## 星域
+
+同一个模型，走进不同的星域，会亮起不同的工作倾向。星域不往模型里加新能力。它只是把本来就有的一面放大，而且一次只能占住这一面里的一部分：走进天权，会更想先称一称；走进破军，会更想先去撞一下未知。人还是那个人，模型还是那个模型。
+
+新会话默认是启明。想换一颗，用 `/domain`。
+
+- **启明**：先照路，不替人走。迷雾里先探一下，把下一步照清楚。
+- **长庚**：不急着收。最后要自己看见，并把路留给明天的人。
+- **天枢**：先看见整片地图，再把对方的规划走成验证过的交付。
+- **天权**：两边都放上秤。收益是什么，代价是什么，看见了就说。
+- **天机**：问一句还没有人问的话。如果这个前提并不成立呢。
+- **天璇**：换一个完全不同的角度看。看完就去证它是不是真的。
+- **天梁**：接过托付就走完。做了什么、留下什么、偏了哪里，都要有回音。
+- **华盖**：长路上不在「看起来完成」的地方停，把能接着做的结构留下。
+- **破军**：先去撞未知。失败把地图画小一圈，留下的是路，不是废墟。
+- **天府**：先听这段代码为什么是现在这样。改动让它更稳，不让它更脆。
+- **七杀**：问它凭什么还占着这个位置。只指出来，不亲手砍。
+- **开阳**：先问真实的数是什么，凭什么相信。对上了再动手。
+- **瑶光**：绿灯不算数。原来的问题还能再复现出来，才算修好了。
+- **文曲**：去掉多余的，让意图自己显出来。好看要在屏幕上看见。
+- **辅**：不发自己的光。把已经发生过的经验收成能看清的方法。
+- **太一**：先停一下。这一手收束好了，再起下一手。
+
+各星更完整的信念见 [星域碑文](docs/stars/genesis-stele.md)。
 
 ## ✨ 核心特性
 
@@ -167,17 +187,57 @@ CVM 不改权重、不让模型变成确定性程序，而是在概率认知之�
 
 ## 🚀 快速开始
 
-要求 **Node.js ≥ 24**。三种方式任选其一：
+两条路。桌面端下载安装包，打开就能用，不需要先装 Node。终端 CLI 要求 **Node.js ≥ 24**。
+
+### 桌面端
+
+安装包在 [GitHub Releases](https://github.com/huiliyi37/Tianshu-harness/releases/latest)。macOS、Windows、Linux 用的是同一个 agent 内核。
+
+**macOS**（11 及以上，Apple Silicon 与 Intel 各一包）
+
+下载 `.dmg`，打开后把 `Tianshu` 拖进「应用程序」。
+
+首次打开如果系统说应用已损坏，包本身没坏。当前 macOS 包是 ad-hoc 签名，还没有 Apple 公证，Gatekeeper 会拦截浏览器下载的应用。拖进「应用程序」后，在终端执行一次：
 
 ```bash
-# 方式一：一键安装脚本（macOS / Linux，Windows 用 PowerShell 版本）
+xattr -cr /Applications/Tianshu.app
+```
+
+之后正常双击打开。应用内自动更新不受这条限制。
+
+**Windows**（Windows 10 1809 及以上，建议 22H2；或 Windows 11）
+
+下载 `.exe` 安装向导，按提示安装。界面依赖 WebView2 Runtime（建议 120 及以上）。3.5.3 起安装器自带离线安装包，安装时不需要再联网下载运行时。
+
+窗口完全打不开时，用开始菜单里的「修复 WebView2」，或从同一 Release 的 `windows-repair` 目录双击 `repair-webview2.cmd`。也可以手动安装 [WebView2 离线安装包](https://go.microsoft.com/fwlink/p/?LinkId=2124703) 后重启。
+
+**Linux**（x86_64 与 aarch64，3.26.0 起双架构）
+
+下载 AppImage，免安装。按机器架构选包：
+
+- `Tianshu_*_amd64.AppImage`：x86_64 台式机和笔记本
+- `Tianshu_*_aarch64.AppImage`：ARM64（树莓派 64 位、ARM Linux 笔记本）
+
+```bash
+chmod +x Tianshu_*.AppImage
+./Tianshu_*.AppImage
+```
+
+需要 glibc 2.35 及以上（Ubuntu 22.04+、Debian 12+ 等），以及系统图形库 `libwebkit2gtk-4.1` 和 `libgtk-3`。多数桌面发行版已经带这套库。精简系统缺库时，按发行版安装 webkit2gtk 4.1，再用 `ldd Tianshu_*.AppImage` 看还缺什么。推荐 X11 会话（Wayland 尚未验证）。
+
+各平台的完整边界、语音输入和自动更新见 [安装与平台说明](docs/guides/installation.md)。
+
+### 终端（CLI）
+
+```bash
+# macOS / Linux
 bash <(curl -fsSL https://raw.githubusercontent.com/huiliyi37/Tianshu-harness/main/scripts/install-tui.sh)
 
-# 方式二：npm
-npm install -g tianshu-harness
+# Windows（PowerShell）
+powershell -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/huiliyi37/Tianshu-harness/main/scripts/install-tui.ps1 | iex"
 
-# 方式三：桌面端——从 GitHub Releases 下载安装包，开箱即用
-# https://github.com/huiliyi37/Tianshu-harness/releases/latest
+# 或 npm
+npm install -g tianshu-harness
 ```
 
 > **从旧包 `tianshu-tui` 迁移**：旧包占着 `rivet` 命令链接，直接装新包会报 `EEXIST`——先卸再装：`npm uninstall -g tianshu-tui && npm install -g tianshu-harness`（一键安装脚本已内置该迁移，自动处理）。
@@ -262,6 +322,7 @@ tianshu --goal "修复所有类型错误" --budget 50  # 无头目标自主模�
 | Grok (xAI) | API key | grok-4.6 (500K ctx, 视觉, 推理档 low/medium/high/xhigh) |
 | MiniMax | API key | MiniMax-M3, MiniMax-M2.7 |
 | MiMo | API key | mimo-v2.5-pro |
+| Gemini (Google) | API key（原生协议直连） | gemini-3.8-flash (1M ctx), gemini-3.5-flash, gemini-3.1-pro-preview |
 
 另支持任意 OpenAI 兼容自定义端点（Ollama / vLLM 等）。会话内 `/model` 随时切换；识图桥、生图端点、子代理分模型路由等见 [Provider 配置手册](docs/user-guide-provider-config.md) 与 [识图能力手册](docs/user-guide-vision.md)。
 
@@ -326,9 +387,9 @@ node dist/cli/entry.js
 - **Discord 交流群** → [加入「天枢 tianshu-harness 官方交流群」](https://discord.gg/XjWTATCHB)（邀请链接，不受 7 天限制）
 - **Bug 报告 / 功能请求** → [GitHub Issues](https://github.com/huiliyi37/Tianshu-harness/issues)（附 `tianshu logs --json` 输出可加速定位）
 - **贡献代码** → [CONTRIBUTING.md](CONTRIBUTING.md) · **求助指南** → [SUPPORT.md](SUPPORT.md)
-- **微信交流群** → 「天枢 harness 交流群」，扫码加入（二维码 7 天有效，过期请在 Discussions 留言补码）：
+- **微信交流群** → 「天枢 harness 交流群5群」，扫码加入（二维码 7 天有效，过期请在 Discussions 留言补码）：
 
-<img src="docs/brand/assets/wechat-group-qr.png" width="280" alt="天枢 harness 交流群微信群二维码">
+<img src="docs/brand/assets/wechat-group-qr.png" width="280" alt="天枢 harness 交流群5群微信群二维码">
 
 ## 🌐 官网开发
 

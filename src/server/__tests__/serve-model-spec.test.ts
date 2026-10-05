@@ -190,9 +190,11 @@ describe('first-run flow: preset provider + a key set from the UI', () => {
     const provider = cfg.provider.providers.deepseek!
     assert.equal(provider.keyRef, 'deepseek')
 
+    // 用预设当前的模型 id，别再钉旧名：`deepseek-v4-flash` 已下线、由 V4.1 Flash
+    // 承接（preset 的 id 会随版本演进），钉死旧名会周期性把「key 生效」这条断言拖红。
     const spec = resolveModelSpec(
       { config: cfg, provider, model: provider.models[0]!, apiKey: '', auth: undefined, configured: true },
-      'deepseek-v4-flash',
+      provider.models[0]!.id,
     )
     assert.ok(spec, '设置 key 后模型必须可解析')
     assert.equal(spec.apiKey, 'sk-user-just-set')

@@ -1,6 +1,6 @@
 /**
- * 端到端冒烟（手动运行，不进 CI）：
- *   node tests/smoke.e2e.ts [cliPath]
+ * 端到端冒烟（CI 与手动运行）：
+ *   node --import tsx tests/smoke.e2e.mts [cliPath]
  *
  * launcher 起真实 sidecar → health → 建会话 → SSE 订阅（重放 + 存活）→
  * steer 幂等校验（idle 应 409）→ 归档清理。不触发模型调用（零 token 成本）。
@@ -16,15 +16,24 @@ import { SidecarClient } from '../src/sidecar/client.ts'
 const siblingMain = join(fileURLToPath(new URL('.', import.meta.url)), '../../dist/main.js')
 const cliPath = process.argv[2] || (existsSync(siblingMain) ? siblingMain : 'rivet')
 const cwd = mkdtempSync(join(tmpdir(), 'tianshu-ext-smoke-'))
+const configPath = join(cwd, '.rivet-config.json')
+const previousConfigPath = process.env.RIVET_CONFIG_PATH
+writeFileSync(configPath, JSON.stringify({
+  provider: { default: 'smoke', providers: { smoke: {
+    name: 'Smoke', baseUrl: 'http://127.0.0.1:1/v1', apiKey: 'smoke-not-a-real-key',
+    userSaved: true, models: [{ id: 'smoke-model', alias: 'smoke-model', contextWindow: 128000 }],
+  } } },
+  agent: { defaultModel: 'smoke:smoke-model' },
+}))
+process.env.RIVET_CONFIG_PATH = configPath
 
 // P1 变更审查面需要 git 仓 + 基线提交
-execSync('git init && git config user.email t@t && git config user.name T', { cwd })
+execSync('git init && git config user.email t@t && git config user.name T', { cwd, windowsHide: true })
 writeFileSync(join(cwd, 'hello.txt'), 'v1\n')
-execSync('git add . && git commit -m init', { cwd })
+execSync('git add . && git commit -m init', { cwd, windowsHide: true })
 
 function fail(msg: string): never {
-  console.error(`✗ ${msg}`)
-  process.exit(1)
+  throw new Error(`✗ ${msg}`)
 }
 
 const sidecar = await launchSidecar({
@@ -116,13 +125,12 @@ try {
   console.log('✓ delegate result for missing rid → 409')
 
   // idle 会话 steer 应 409（契约校验）。
-  let steered409 = false
-  try {
-    await client.steer(rec.id, 'noop')
-  } catch (err) {
-    steered409 = String((err as Error).message).includes('409')
-  }
-  if (!steered409) fail('steer on idle session should return 409')
+  if (await client.steer(rec.id, 'noop') !== 'idle') fail('client steer on idle session should return idle')
+  const steerResponse = await fetch(`${sidecar.baseUrl}/sessions/${rec.id}/steer`, {
+    method: 'POST', headers: { authorization: `Bearer ${sidecar.token}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ text: 'noop' }),
+  })
+  if (steerResponse.status !== 409) fail('steer on idle session should return 409')
   console.log('✓ steer-on-idle → 409 (契约一致)')
 
   const res = await fetch(`${sidecar.baseUrl}/sessions/${rec.id}`, {
@@ -134,6 +142,8 @@ try {
 
   console.log('\nSMOKE PASS')
 } finally {
-  sidecar.dispose()
+  await sidecar.dispose()
+  if (previousConfigPath === undefined) delete process.env.RIVET_CONFIG_PATH
+  else process.env.RIVET_CONFIG_PATH = previousConfigPath
   rmSync(cwd, { recursive: true, force: true })
 }

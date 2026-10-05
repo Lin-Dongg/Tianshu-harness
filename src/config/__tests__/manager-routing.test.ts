@@ -29,19 +29,19 @@ describe('sub-agent / review routing config', () => {
     assert.equal(review.mechanicalFastPath, true)
     // workers has built-in defaults (default.ts)
     assert.equal(workers.routing.code_edit, 'cheap-flash')
-    assert.deepEqual(workers.profiles['cheap-flash'], { provider: 'deepseek', model: 'deepseek-v4-flash' })
+    assert.deepEqual(workers.profiles['cheap-flash'], { provider: 'deepseek', model: 'deepseek-flash' })
   })
 
   it('persists review profile overrides to config.json', () => {
     setRoutingConfig({
       review: {
-        profiles: { reviewer: { provider: 'deepseek', model: 'deepseek-v4-flash' } },
+        profiles: { reviewer: { provider: 'deepseek', model: 'deepseek-v4-pro' } },
         skipAuto: false,
         mechanicalFastPath: true,
       },
     })
     const review = loadConfig().agent.review
-    assert.deepEqual(review.profiles.reviewer, { provider: 'deepseek', model: 'deepseek-v4-flash' })
+    assert.deepEqual(review.profiles.reviewer, { provider: 'deepseek', model: 'deepseek-v4-pro' })
   })
 
   it('persists skipAuto toggle', () => {
@@ -52,19 +52,19 @@ describe('sub-agent / review routing config', () => {
   it('updating only workers leaves review untouched', () => {
     setRoutingConfig({
       review: {
-        profiles: { reviewer: { provider: 'deepseek', model: 'deepseek-v4-flash' } },
+        profiles: { reviewer: { provider: 'deepseek', model: 'deepseek-v4-pro' } },
         skipAuto: false,
         mechanicalFastPath: true,
       },
     })
     setRoutingConfig({
       workers: {
-        profiles: { 'cheap-flash': { provider: 'deepseek', model: 'deepseek-v4-flash' } },
+        profiles: { 'cheap-flash': { provider: 'deepseek', model: 'deepseek-v4-pro' } },
         routing: { code_edit: 'cheap-flash' },
       },
     })
     const cfg = loadConfig()
-    assert.deepEqual(cfg.agent.review.profiles.reviewer, { provider: 'deepseek', model: 'deepseek-v4-flash' })
+    assert.deepEqual(cfg.agent.review.profiles.reviewer, { provider: 'deepseek', model: 'deepseek-v4-pro' })
     assert.equal(cfg.workers.routing.code_edit, 'cheap-flash')
   })
 
@@ -130,9 +130,9 @@ describe('sub-agent / review routing config', () => {
   })
 
   it('updating only council leaves review/workers untouched', () => {
-    setRoutingConfig({ review: { profiles: { reviewer: { provider: 'deepseek', model: 'deepseek-v4-flash' } }, skipAuto: false, mechanicalFastPath: true } })
+    setRoutingConfig({ review: { profiles: { reviewer: { provider: 'deepseek', model: 'deepseek-v4-pro' } }, skipAuto: false, mechanicalFastPath: true } })
     setRoutingConfig({ council: { seats: [{ authority: 'tianquan', provider: 'glm', model: 'glm-4.6' }] } })
-    assert.deepEqual(loadConfig().agent.review.profiles.reviewer, { provider: 'deepseek', model: 'deepseek-v4-flash' })
+    assert.deepEqual(loadConfig().agent.review.profiles.reviewer, { provider: 'deepseek', model: 'deepseek-v4-pro' })
     assert.equal(loadConfig().agent.council.seats.length, 1)
   })
 })

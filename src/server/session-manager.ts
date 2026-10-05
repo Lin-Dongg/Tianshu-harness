@@ -1,3 +1,8 @@
+import { hasLiveDelegation } from './session-delegation-state.js'
+import { DelegationStateIndex } from '../workers/delegation-state.js'
+import { withWorkspaceRoots } from '../tools/workspace-context.js'
+import { validateWorkspaceRoots } from './workspace-roots.js'
+import { createHash } from 'node:crypto'
 /**
  * RuntimeSessionManager — desktop-facing multi-session layer (M0.5).
  *
@@ -23,6 +28,7 @@ import type { AgentCallbacks, ApprovalMode } from '../agent/loop-types.js'
 import { touchActivity, setActivityPhase, beginRun as beginActivityRun, finishRun as finishActivityRun, withActivityRun } from '../agent/stall-observer.js'
 import { randomUUID } from 'node:crypto'
 import { describeFailure } from '../api/failure-scope.js'
+import { errorRecoveryGuidance } from '../api/error-classifier.js'
 import { debugLog } from '../utils/debug.js'
 import { collectPostBoundaryEditIds, type BlockedRewindFile } from '../agent/file-history.js'
 import { makeOwnershipGuard } from '../agent/checkpoint.js'
@@ -54,6 +60,8 @@ import {
   readPlan as storeReadPlan,
   rejectPlan as storeRejectPlan,
   writePlan as storeWritePlan,
+  PlanConflictError,
+  parsePlanStatus,
   resolvePlanOptionLabel,
   parsePlanOptions,
   slugify,
@@ -73,23 +81,24 @@ import { starDomainRegistry } from '../agent/star-domain-registry.js'
 import type { ActiveStarDomain } from '../agent/star-domain.js'
 import type { StarDomainId } from '../agent/star-domain.js'
 import { skillRegistry, loadProjectSkills, listInstallableSkills, importSkillsIntoRivet, countInstalledSkills, readSkillContent, writeSkill, uninstallSkill, type InstallableSkill } from '../skills/skill-loader.js'
+import { resolveBareSkillPrompt } from '../tui/prompt-input-resolver.js'
 import { getSkillLoadErrorsForSession } from './skill-load-errors.js'
 import type { MissionStore } from './mission-store.js'
 import { join, resolve, dirname } from 'node:path'
-import { readFile, mkdtemp, writeFile, rm } from 'node:fs/promises'
-import { existsSync, copyFileSync, statSync, mkdirSync } from 'node:fs'
+import { readFile, mkdtemp, writeFile, rm, realpath, stat } from 'node:fs/promises'
+import { existsSync, copyFileSync, createReadStream, statSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { renderPdfPageImages } from '../tools/doc-extract.js'
 import { resolveSessionWorkspaceForSession, type SessionWorkspaceMode } from './workspace.js'
-import { stripTerminalEscapes } from '../utils/safe-path.js'
-import { createWorktree, removeWorktree, listWorktrees, hasUnlandedWork, commitAll, revParseHead, squashMergeBranch, pushBranch, type WorktreeEntry } from '../agent/worktree.js'
+import { stripTerminalEscapes, sanitizeArchiveDisplayName } from '../utils/safe-path.js'
+import { createWorktree, removeWorktree, listWorktrees, hasUnlandedWork, commitAll, commitIndex, revParseHead, squashMergeBranch, pushBranch, type WorktreeEntry } from '../agent/worktree.js'
 import { createPr } from './gh-cli.js'
 import { getGitGraph, getWorkingTreeFiles, getFileDiff, getFileAtBase, listGitBranches } from '../tools/git.js'
 import type { WorkingTreeFile } from '../tools/git.js'
 import { SessionJobs, type JobEvent } from '../tools/job-store.js'
-import { parseAskUserQuestions } from '../tools/ask-user-question.js'
+import { buildUserQuestionEvent } from './user-question-event.js'
 import { grantApp as grantComputerUseApp, resolveRememberedComputerUseApp } from '../tools/computer-use/app-grants.js'
-import { outOfWorkspaceFilePaths } from '../agent/tool-pipeline.js'
+import { approvalPathGrant, buildApprovalSnapshot } from './approval-snapshot.js'
 import { applySandboxPolicyForApprovalMode } from '../tools/sandbox-profile.js'
 import {
   DELEGATE_CAPABILITY_TTL_MS,
@@ -101,6 +110,7 @@ import {
 } from './delegation-protocol.js'
 import type {
   ApprovalMode as WireApprovalMode,
+  ApprovalSnapshot,
   PlanModeState as WirePlanModeState,
   AskModeState as WireAskModeState,
   SessionStatus,
@@ -113,7 +123,9 @@ import type {
   ForkDestination,
 } from './protocol.js'
 import { redactValue, redactText, truncateUtf16Safe } from './redact.js'
-import { MAX_DOCUMENTS, MAX_IMAGES } from './attachment-limits.js'
+import { MAX_ARCHIVES, MAX_ARCHIVE_BYTES, MAX_DOCUMENTS, MAX_IMAGES } from './attachment-limits.js'
+import type { SessionArchivePayload } from './attachment-validation.js'
+import { applyRingLimits } from './session-ring-limits.js'
 import { assertDefaultModelRef, contractModels } from '../config/contract-models.js'
 
 // The session wire contract (event types, records, statuses) lives in
@@ -152,7 +164,7 @@ export type PlanUpdateOutcome =
   | { ok: true }
   | {
       ok: false
-      code: 'session-missing' | 'plan-not-found' | 'not-editable' | 'empty-content'
+      code: 'session-missing' | 'plan-not-found' | 'not-editable' | 'empty-content' | 'conflict'
       reason: string
     }
 
@@ -194,6 +206,22 @@ export interface ModelEntry extends ModelOption {
   current: boolean
 }
 
+/** 记录形态匹配：三段式 provider:keyId:modelId（多 key 切换产物）精确到 key；
+ *  两段式 / 裸 id（旧会话、未迁移 provider）兜底。listModels 的 current 判定与
+ *  enrichRecord 的 contextWindow 回落共用同一判据（调用方保证首个命中胜出）。 */
+function modelOptionMatches(current: string | undefined, m: ModelOption): boolean {
+  if (!current) return false
+  const keyedRef = m.keyId ? `${m.provider}:${m.keyId}:${m.id}` : null
+  const keyedAlias = m.keyId ? `${m.provider}:${m.keyId}:${m.alias}` : null
+  return (
+    (keyedRef !== null && (current === keyedRef || current === keyedAlias))
+    || current === `${m.provider}:${m.id}`
+    || current === `${m.provider}:${m.alias}`
+    || current === m.id
+    || current === m.alias
+  )
+}
+
 /** PlusMenu — a skill's per-session enablement status. */
 export interface SkillStatus {
   name: string
@@ -207,6 +235,7 @@ export interface SkillStatus {
 /** Minimal agent surface the manager needs — decoupled from AgentLoop for tests. */
 /** User-dispatched background worker request (from POST /sessions/:id/delegate). */
 export interface DelegateWorkerInput {
+  budget?: { timeoutMs: number }
   objective: string
   /** Worker role profile (code_scout / reviewer / patcher …). Defaults applied downstream. */
   profile?: string
@@ -220,6 +249,7 @@ export interface DelegateWorkerInput {
 
 /** Structured progress/terminal update emitted by a user-dispatched worker. */
 export interface DelegateActivityUpdate {
+  resultWorkOrderId?: string
   workOrderId: string
   parentToolId?: string
   /** Runtime execution identity; absent on legacy background updates. */
@@ -270,7 +300,7 @@ export interface ManagedAgent {
    * 它在类型上抹成 void，否则调用方失去「这次到底跑没跑」的判据。
    * 错误预检等本地短路路径仍返回 void。
    */
-  run(prompt: string, callbacks: AgentCallbacks, images?: string[]): Promise<void | import('../agent/loop.js').AgentRunOutcome>
+  run(prompt: string, callbacks: AgentCallbacks, images?: string[], options?: import('../agent/input-origin.js').InputOptions): Promise<void | import('../agent/loop.js').AgentRunOutcome>
   abort(): void
   listArtifacts(): Artifact[]
   readArtifact(id: string): Promise<string | null>
@@ -552,6 +582,7 @@ export interface GoalSnapshot {
 }
 
 export interface CreateSessionInput {
+  workspaceRoots?: string[]
   cwd?: string
   /**
    * P1-1 fork：显式指定会话 id。缺省由 idGenerator 生成（改造前行为不变）。
@@ -563,6 +594,8 @@ export interface CreateSessionInput {
   workspaceMode?: SessionWorkspaceMode
   title?: string
   prompt?: string
+  /** Resolve initial input using the actual normalized workspace, before registering the session. */
+  preparePrompt?: (cwd: string) => void
   /** 新建即携带的图片附件（dataUrl 数组）——首轮 run 经 run(id, prompt, images)
    *  进 persistImages + agent.run，与会话内 /prompt 粘图同管线。 */
   images?: string[]
@@ -654,6 +687,7 @@ export interface StorageReport {
  * 仍然需要的信息，让调用方不必为了它们索取全量。
  */
 export interface EventsTail {
+  delegationState?: import('../workers/delegation-state.js').DelegationSnapshot
   /** 尾部 maxEvents 条（日志更短时即全部）。 */
   events: SessionEvent[]
   /** 磁盘日志最早 seq（空日志为 0）。 */
@@ -711,7 +745,7 @@ export interface SessionPersistenceAdapter {
    * 被截头部里仍需带出的两样：`diskFirstSeq`（前端判断有无更早历史）与
    * `artifactIds`（全量去重集，缺了会让旧 artifact 重放时被重新公告）。
    */
-  loadEventsTailAsync?(sessionId: string, maxEvents: number): Promise<EventsTail>
+  loadEventsTailAsync?(sessionId: string, maxEvents: number, maxEventBytes?: number): Promise<EventsTail>
   /**
    * 事件日志文件的轻量 stat（optional）——跨进程增量同步（issue #274 残留）的
    * 漂移探针：扫描循环对每个已加载会话只做这一次 syscall，size/mtime 与上次
@@ -744,6 +778,8 @@ export interface SessionPersistenceAdapter {
    * predate vision attachments may omit it. `base64` is the raw payload (no
    * data: prefix). Returns nothing; the caller already owns `imgId`.
    */
+  saveToolOutput?(sessionId: string, outputId: string, text: string): void
+  readToolOutput?(sessionId: string, outputId: string): string | undefined
   saveImage?(sessionId: string, imgId: string, base64: string, mime: string): void
   /** Read back a persisted image by id. Returns undefined if missing. */
   readImage?(sessionId: string, imgId: string): { bytes: Buffer; mime: string } | undefined
@@ -755,6 +791,13 @@ export interface SessionPersistenceAdapter {
   saveDocument?(sessionId: string, docId: string, base64: string, fileName: string): void
   /** Read back a persisted document by id. Returns undefined if missing. */
   readDocument?(sessionId: string, docId: string): { bytes: Buffer; mime: string; ext: string } | undefined
+  /**
+   * 压缩包附件原样落盘（句柄式，2026-10-05）：srcPath 形态 copyFile（绝不动
+   *  用户原文件），base64 形态解码写入；副本只读。返回落盘绝对路径——
+   *  它要进 prompt 句柄文本，调用方必须拿得到。Optional — 缺省时
+   *  persistArchives 直接报错（压缩包没有句柄就没有注入形态，不能降级）。
+   */
+  saveArchive?(sessionId: string, docId: string, source: { base64: string } | { srcPath: string }, fileName: string): string
 }
 
 export interface RuntimeSessionManagerOptions {
@@ -766,6 +809,8 @@ export interface RuntimeSessionManagerOptions {
   idGenerator?: () => string
   /** Cap on retained events per session (ring buffer). Default 5000. */
   maxEvents?: number
+  /** 内存环字节预算（issue #315）：超限最旧条目退化投影（seq/type/ts + 空 data）。Default 64 MiB；0 = 关闭。 */
+  maxEventBytes?: number
   /**
    * Cap on how many sessions keep their event log resident at once. Lazy-loaded
    * sessions beyond this (LRU, and only ones with no live agent / not running /
@@ -937,6 +982,9 @@ export interface QueueLaneEntry {
   /** issue #300 — 入队时已持久化的文档引用（原文在入队时落盘，条目只留引用）。
    *  归并时并入下轮 run 的 user 事件 documents 字段，卡片不随归并消失。 */
   documents?: SessionDocumentRef[]
+  /** 压缩包附件的小引用（入队时已落盘，句柄文本已拼进 attachmentText）。
+   *  归并时并入下轮 run 的 user 事件 archives 字段。 */
+  archives?: SessionArchiveEventRef[]
 }
 
 /** issue #300 — 入站文档附件（dataUrl 携原始字节；size/mime 客户端可选报，
@@ -954,21 +1002,36 @@ export interface SessionDocumentRef {
   mime: string
 }
 
+/** 压缩包附件的完整引用（persistArchives 返回值）：savedPath/sha256 只进
+ *  prompt 句柄文本与路由层，**不进事件流**（事件只留下面的 EventRef 形态）。 */
+export interface SessionArchiveRef {
+  id: string
+  name: string
+  bytes: number
+  sha256short: string
+  savedPath: string
+}
+
+/** user 事件元数据里的压缩包引用——与 documents 同款：{id,name,bytes} 小对象。 */
+export type SessionArchiveEventRef = Pick<SessionArchiveRef, 'id' | 'name' | 'bytes'>
+
 /**
  * #238 — lane 中仍 queued 条目的附件累计（入队配额判定的单一来源）。
  * 判定点必须与提交点同处一个同步块：/queue 路由侧校验与提交之间隔着
  * `await extractDocumentsToText`，并发的两条请求能双双通过校验再把 lane 顶过
  * 上限（实测复现）；这里没有让出点，判定即原子。
  */
-function countLaneAttachments(lane: QueueLaneEntry[]): { images: number; documents: number } {
+function countLaneAttachments(lane: QueueLaneEntry[]): { images: number; documents: number; archives: number } {
   let images = 0
   let documents = 0
+  let archives = 0
   for (const entry of lane) {
     if (entry.status !== 'queued') continue
     images += entry.images?.length ?? 0
     documents += entry.documentNames?.length ?? 0
+    archives += entry.archives?.length ?? 0
   }
-  return { images, documents }
+  return { images, documents, archives }
 }
 
 /**
@@ -1311,27 +1374,6 @@ function extractTodoState(input: Record<string, unknown>): TodoStateItem[] | nul
   return items
 }
 
-/**
- * 内存环截尾（M1 修复）：保留尾部窗口，但 delegation 事件豁免——stale 对账
- * （sweepStaleDelegationNodes）与回放依赖它们完整；被截尾的早期 running
- * 节点对账不可见，回放会永久卡「运行中」。delegation 事件量级小（每 worker
- * 2-4 条），豁免增长可控。
- */
-function trimEventRing(events: SessionEvent[], maxEvents: number): SessionEvent[] {
-  if (events.length <= maxEvents) return events
-  const overflow = events.length - maxEvents
-  const kept: SessionEvent[] = []
-  let dropped = 0
-  for (const e of events) {
-    if (dropped < overflow && e.type !== 'delegation') {
-      dropped++
-      continue
-    }
-    kept.push(e)
-  }
-  return kept
-}
-
 export class RuntimeSessionManager {
   private readonly sessions = new Map<string, InternalSession>()
   /** In-flight lazy agent builds (per session id) — ensureAgent is not
@@ -1347,6 +1389,10 @@ export class RuntimeSessionManager {
   private readonly now: () => number
   private readonly idGenerator: () => string
   private readonly maxEvents: number
+  private readonly delegationStates = new WeakMap<InternalSession, DelegationStateIndex>()
+  private readonly delegationSeen = new WeakMap<InternalSession, number>()
+  /** 内存环字节预算（issue #315 泄漏点 B）。0 = 关闭。 */
+  private readonly maxEventBytes: number
   private readonly maxLoadedSessions: number
   /** LRU of session ids whose event log is currently resident (oldest first). */
   private readonly loadedOrder: string[] = []
@@ -1404,6 +1450,7 @@ export class RuntimeSessionManager {
     const envMaxEvents = Number(process.env.RIVET_MAX_EVENTS)
     this.maxEvents = opts.maxEvents
       ?? (Number.isFinite(envMaxEvents) && envMaxEvents >= 100 ? Math.floor(envMaxEvents) : 5000)
+    this.maxEventBytes = opts.maxEventBytes ?? 64 * 1024 * 1024
     this.maxLoadedSessions = opts.maxLoadedSessions ?? 16
     // 审批等待超时：0（默认）= 永不超时——审批卡持久化可回放，无限等优于长
     // 自主任务被误拒；部署侧（无人值守/CI）可用 RIVET_APPROVAL_TIMEOUT_MS
@@ -1684,8 +1731,10 @@ export class RuntimeSessionManager {
     let candidates: SessionEvent[]
     let artifactIds: string[] | undefined
     let diskFirst: number | undefined
+    let loadedTail: EventsTail | undefined
     if (p.loadEventsTailAsync) {
-      const tail = await p.loadEventsTailAsync.call(p, id, this.maxEvents)
+      const tail = await p.loadEventsTailAsync.call(p, id, this.maxEvents, this.maxEventBytes)
+      loadedTail = tail
       candidates = tail.events
       artifactIds = tail.artifactIds
       diskFirst = tail.diskFirstSeq
@@ -1704,21 +1753,28 @@ export class RuntimeSessionManager {
     if (artifactIds) for (const a of artifactIds) session.knownArtifacts.add(a)
     if (diskFirst !== undefined && diskFirst > (session.diskFirstSeq ?? 1)) session.diskFirstSeq = diskFirst
     const novel = candidates.filter((e) => e.seq > session.seq).sort((a, b) => a.seq - b.seq)
-    if (novel.length === 0) return
+    if (loadedTail?.delegationState && loadedTail.lastSeq >= session.seq) {
+      const index = new DelegationStateIndex(); index.restore(loadedTail.delegationState)
+      this.delegationStates.set(session, index); this.delegationSeen.set(session, loadedTail.lastSeq)
+      if (loadedTail.events.length === 0 && loadedTail.lastSeq > session.seq) session.events = []
+    }
+    if (novel.length === 0 && (!loadedTail || loadedTail.lastSeq <= session.seq)) return
     for (const e of novel) {
       session.events.push(e)
       session.seq = Math.max(session.seq, e.seq)
       if (e.type === 'artifact') session.knownArtifacts.add(String(e.data.id))
       session.record.updatedAt = Math.max(session.record.updatedAt, e.ts)
     }
-    if (session.events.length > this.maxEvents) {
-      session.events = trimEventRing(session.events, this.maxEvents)
-    }
+    session.seq = Math.max(session.seq, loadedTail?.lastSeq ?? 0)
+    this.enforceRingLimits(session)
     session.record.lastSeq = session.seq
     for (const e of novel) {
       for (const listener of session.listeners) {
         try { listener(e) } catch { /* 异常 viewer 不得打断同步 */ }
       }
+    }
+    if (loadedTail?.delegationState) for (const listener of session.listeners) {
+      try { listener({ seq: 0, ts: this.now(), type: 'delegation_snapshot', data: { ...this.getDelegationSnapshot(id)! } }) } catch { /* isolated viewer */ }
     }
     // 外部进度同时意味着列表该重取（status/updatedAt 已在上面的 record 层合并，
     // 但「只有事件没有 record 变化」的场景——record 落盘本就滞后于事件流——靠这里补）
@@ -1860,8 +1916,8 @@ export class RuntimeSessionManager {
           pendingApprovals: 0,
         },
         agent: null,
-        // 内存环上限与懒加载路径一致：只保留尾部 maxEvents 进内存。
-        events: events.length > this.maxEvents ? trimEventRing(events, this.maxEvents) : events,
+        // 内存环上限与懒加载路径一致：装填后由 enforceRingLimits 收敛（条数 + 字节）。
+        events,
         diskFirstSeq: events[0]?.seq,
         eventsLoaded: true,
         seq: maxSeq,
@@ -1884,6 +1940,7 @@ export class RuntimeSessionManager {
         planAutoApproveUi: ps.record.planAutoApproveUi === true,
       }
       this.sessions.set(session.record.id, session)
+      this.enforceRingLimits(session)
       if (wasRunning) {
         session.seq += CRASH_RECOVERY_SEQ_GAP
         // Close out approvals the crash left dangling (see lazy path above) —
@@ -1962,7 +2019,8 @@ export class RuntimeSessionManager {
     // 保留尾部进内存——与活跃会话超过环容量后的行为一致（append 已截尾），
     // 客户端 since=0 重放本来就只拿得到环内尾部。磁盘 events.jsonl 不动，
     // 仍是完整历史的 source of truth。
-    session.events = evs.length > this.maxEvents ? trimEventRing(evs, this.maxEvents) : evs
+    session.events = evs
+    this.enforceRingLimits(session)
   }
 
   /** adoptLoadedEvents 的尾部版：截断已在读取侧完成，被截头部的信息由
@@ -1972,8 +2030,13 @@ export class RuntimeSessionManager {
     if (tail.total > 0) session.diskFirstSeq = tail.diskFirstSeq
     const maxSeq = tail.total > 0 ? tail.lastSeq : session.record.lastSeq
     session.seq = Math.max(session.seq, maxSeq)
-    // 兜底（M1）：tail 实现返回超限普通事件时再压一次；delegation 两处都豁免。
-    session.events = trimEventRing(tail.events, this.maxEvents)
+    // Tail reads carry the bounded replay suffix plus independent lifecycle state.
+    session.events = tail.events
+    if (tail.delegationState) {
+      const index = new DelegationStateIndex(); index.restore(tail.delegationState)
+      this.delegationStates.set(session, index); this.delegationSeen.set(session, tail.lastSeq)
+    }
+    this.enforceRingLimits(session)
   }
 
   /**
@@ -2002,7 +2065,7 @@ export class RuntimeSessionManager {
           let loadError: string | undefined
           try {
             if (tailLoader) {
-              tail = await tailLoader.call(this.persistence, session.record.id, this.maxEvents)
+              tail = await tailLoader.call(this.persistence, session.record.id, this.maxEvents, this.maxEventBytes)
             } else {
               evs = await asyncLoader!.call(this.persistence, session.record.id)
             }
@@ -2048,6 +2111,16 @@ export class RuntimeSessionManager {
    * 合成事件：diskFirstSeq < floorSeq ⇔ 内存环截掉了头部，前端据此显示
    * 「加载更早的历史」入口。须在 getEventsAsync 之后调用（events 已加载）。
    */
+  getDelegationSnapshot(id: string) {
+    const session = this.sessions.get(id)
+    return session ? this.delegationStates.get(session)?.snapshot() ?? { events: [], complete: false } : undefined
+  }
+
+  getApprovalSnapshot(id: string): ApprovalSnapshot | undefined {
+    const session = this.sessions.get(id)
+    return session ? buildApprovalSnapshot(session.record.cwd, session.seq, session.pending.values()) : undefined
+  }
+
   getReplayWindow(id: string): { floorSeq: number; diskFirstSeq: number; diskLastSeq: number } | undefined {
     const s = this.sessions.get(id)
     if (!s) return undefined
@@ -2127,7 +2200,7 @@ export class RuntimeSessionManager {
    * 类型过滤全流（稀疏索引帮不上忙），直接走 loadEventsAsync 的 off-thread
    * parse。ephemeral（无持久化）与磁盘读失败降级为环内容（可用性优先）。
    */
-  async getAllEventsAsync(id: string): Promise<{ events: SessionEvent[]; lastSeq: number } | undefined> {
+  async getAllEventsAsync(id: string): Promise<{ events: SessionEvent[]; lastSeq: number; incomplete?: boolean } | undefined> {
     const s = this.sessions.get(id)
     if (!s) return undefined
     // 先冲掉 manager 级合并缓冲（delta/tool_result），保证磁盘含全部已 append。
@@ -2143,7 +2216,8 @@ export class RuntimeSessionManager {
         return { events: p.loadEvents.call(p, id), lastSeq: s.seq }
       } catch { /* fall back to ring */ }
     }
-    return this.getEventsAsync(id, 0)
+    const fallback = await this.getEventsAsync(id, 0)
+    return fallback ? { ...fallback, incomplete: Boolean(p) } : undefined
   }
 
   /**
@@ -2404,27 +2478,8 @@ export class RuntimeSessionManager {
   }
 
   private hasLiveCoordinatorDelegation(session: InternalSession): boolean {
-    const latest = new Map<string, { workerId: string; status: string }>()
-    for (const ev of session.events) {
-      if (ev.type !== 'delegation') continue
-      const workerId = typeof ev.data.workerId === 'string' ? ev.data.workerId : undefined
-      const status = typeof ev.data.status === 'string' ? ev.data.status : undefined
-      if (!workerId || !status) continue
-      const attemptId = typeof ev.data.attemptId === 'string' ? ev.data.attemptId : undefined
-      const dispatchId = typeof ev.data.dispatchId === 'string' ? ev.data.dispatchId : undefined
-      const key = attemptId ?? (dispatchId ? `${dispatchId}:${workerId}` : workerId)
-      latest.set(key, { workerId, status })
-    }
-    for (const { workerId, status } of latest.values()) {
-      if (status !== 'running' || session.backgroundAborts?.has(workerId)) continue
-      try {
-        if (this.isWorkerRunning(session.record.id, workerId)) return true
-      } catch {
-        // Unknown ground truth must not be converted into a fabricated failure.
-        return true
-      }
-    }
-    return false
+    return hasLiveDelegation(this.delegationStates.get(session)?.snapshot().events ?? session.events,
+      session.backgroundAborts, workerId => this.isWorkerRunning(session.record.id, workerId))
   }
 
   private scheduleAbortStaleDelegationSweep(
@@ -2532,12 +2587,17 @@ export class RuntimeSessionManager {
     const requestedId = input.id?.trim()
     const id = requestedId && !this.sessions.has(requestedId) ? requestedId : this.idGenerator()
     // issue #147 — 判定/落盘主体在 ./workspace.ts，此处只传依赖（守行数棘轮）。
+    let workspaceRoots = input.workspaceRoots ? validateWorkspaceRoots(input.workspaceRoots, input.cwd) : undefined
+    if (workspaceRoots && input.workspaceMode && input.workspaceMode !== 'explicit') throw new Error('Project folders require an explicit workspace')
     let workspace = resolveSessionWorkspaceForSession({
-      requested: input.cwd, mode: input.workspaceMode, processCwd: this.defaultCwd,
+      requested: input.cwd ?? workspaceRoots?.[0], mode: input.workspaceMode, processCwd: this.defaultCwd,
       sessionId: id, rivetHome: rivetHome(), readConfig: loadConfig })
     let cwd = workspace.path
+    if (workspaceRoots) cwd = workspaceRoots[0]!
+    if (input.isolatedWorktree && workspaceRoots && workspaceRoots.length > 1) throw new Error('Isolated Worktree supports a single folder only')
     let worktreeBranch: string | undefined
     let worktreePath: string | undefined
+    const worktreeOriginCwd = cwd
     let baselineHead: string | undefined
 
     if (input.isolatedWorktree) {
@@ -2546,6 +2606,7 @@ export class RuntimeSessionManager {
         worktreeBranch = wt.branch
         worktreePath = wt.path
         cwd = wt.path
+        if (workspaceRoots) workspaceRoots = [cwd]
         // worktree 由显式 cwd 派生——来源保持 'explicit'（不因目录改写而变）。
         workspace = { path: wt.path, source: 'explicit', managed: false }
         // Diff baseline for the Changes tab: task delta stays visible even
@@ -2556,6 +2617,7 @@ export class RuntimeSessionManager {
       }
     }
 
+    input.preparePrompt?.(cwd)
     const ts = this.now()
 
     // Per-project defaults: load .rivet-config.json from the session cwd so
@@ -2600,6 +2662,7 @@ export class RuntimeSessionManager {
         updatedAt: ts,
         cwd,
         workspaceSource: workspace.source,
+        ...(workspaceRoots ? { workspaceRoots } : {}),
         // 标题来自 HTTP body、不经消息消毒链——落盘前剥终端转义（标题会经
         // /sessions、Chronicle、退出摘要三条路径反复回放终端，OSC 52 驻留）。
         title: input.title === undefined ? undefined : stripTerminalEscapes(input.title),
@@ -2610,6 +2673,7 @@ export class RuntimeSessionManager {
         domain: sessionDomain,
         worktreeBranch,
         worktreePath,
+        ...(worktreePath ? { worktreeOriginCwd } : {}),
         baselineHead,
         ...(input.planMode ? { planMode: input.planMode } : {}),
         ...(input.askMode ? { askMode: input.askMode } : {}),
@@ -2674,15 +2738,17 @@ export class RuntimeSessionManager {
     // attributed and reaped on crash. Best-effort: registry may be disabled.
     try { this.getRegistry?.()?.register(id, cwd, 'standalone') } catch { /* non-fatal */ }
     if (input.prompt && input.prompt.trim()) {
-      this.run(id, input.prompt, input.images, false, undefined, { documents: input.documents, promptText: input.promptText })
+      // 创建首轮不经过 /prompt 路由，技能加载后展开直调词。
+      const prompt = resolveBareSkillPrompt(input.prompt.trim()) ?? input.prompt
+      this.run(id, prompt, input.images, false, undefined, { documents: input.documents, promptText: input.promptText ?? (prompt !== input.prompt ? input.prompt : undefined) })
     }
     return { ...session.record }
   }
 
-  async submitRun(id: string, prompt: string, images: string[] | undefined, requestId: string, opts?: { documents?: SessionDocumentInput[]; promptText?: string }) {
+  async submitRun(id: string, prompt: string, images: string[] | undefined, requestId: string, opts?: { documents?: SessionDocumentInput[]; archiveRefs?: SessionArchiveEventRef[]; promptText?: string }) {
     if (!this.sessions.has(id)) return { ok: false as const, code: 'not_found' }
     if (!this.runLedger) return { ok: this.run(id, prompt, images, false, undefined, opts), code: 'busy' }
-    const receipt = await this.runLedger.accept(id, requestId, { prompt, images, documents: opts?.documents?.map((d) => d.name), promptText: opts?.promptText }, receipt => this.run(id, prompt, images, false, receipt, opts))
+    const receipt = await this.runLedger.accept(id, requestId, { prompt, images, documents: opts?.documents?.map((d) => d.name), archives: opts?.archiveRefs?.map((a) => a.name), promptText: opts?.promptText }, receipt => this.run(id, prompt, images, false, receipt, opts))
     return { ok: receipt.state !== 'rejected', code: 'busy', receipt }
   }
 
@@ -2704,11 +2770,19 @@ export class RuntimeSessionManager {
   /**
    * 失败呈现字段（PLAN §3）：能判定时才附 scope/kind，未知类别不假装知道。
    * 供 error 事件携带，桌面据此按「断网 / DNS-代理-TLS / 鉴权 / 限流 / 服务端」呈现。
+   * guidance = errorRecoveryGuidance 的「下一步」指引（此前只有 TUI 消费，
+   * 桌面 error 块只有类别标签 + 原文）；AbortError 是用户动作不是故障，不给指引。
    */
-  private failureFields(err: unknown): { scope?: 'local' | 'provider'; kind?: string } {
+  private failureFields(err: unknown): { scope?: 'local' | 'provider'; kind?: string; guidance?: string } {
     try {
       const f = describeFailure(err)
-      return f.category === 'unknown' && f.kind === 'other' ? {} : { scope: f.scope, kind: f.kind }
+      const guidance = err instanceof Error && err.name === 'AbortError'
+        ? undefined
+        : errorRecoveryGuidance(err)
+      return {
+        ...(f.category === 'unknown' && f.kind === 'other' ? {} : { scope: f.scope, kind: f.kind }),
+        ...(guidance ? { guidance } : {}),
+      }
     } catch { return {} }
   }
 
@@ -2729,7 +2803,7 @@ export class RuntimeSessionManager {
     images?: string[],
     recovery = false,
     receipt?: import('./run-ledger.js').RunReceipt,
-    opts?: { documents?: SessionDocumentInput[]; documentRefs?: SessionDocumentRef[]; promptText?: string },
+    opts?: { documents?: SessionDocumentInput[]; documentRefs?: SessionDocumentRef[]; archiveRefs?: SessionArchiveEventRef[]; promptText?: string; origin?: import('../agent/input-origin.js').InputOrigin },
   ): boolean {
     const session = this.sessions.get(id)
     if (!session || session.running) return false
@@ -2781,6 +2855,8 @@ export class RuntimeSessionManager {
     if (mergedQueue.images.length > 0) images = [...mergedQueue.images, ...(images ?? [])]
     // issue #300 — 排队条目的文档引用并入本轮 user 事件（原文入队时已落盘）。
     const queuedDocuments = mergedQueue.documents
+    // 排队条目的压缩包引用同构并入（句柄文本入队时已拼进 attachmentText）。
+    const queuedArchives = mergedQueue.archives
     session.record.status = 'running'
     session.record.error = undefined
     // R1 — keep the registry heartbeat fresh while this session is active.
@@ -2861,6 +2937,11 @@ export class RuntimeSessionManager {
       const documentRefs = recovery
         ? []
         : [...queuedDocuments, ...(opts?.documentRefs ?? []), ...this.persistDocuments(id, docInputs)]
+      // 压缩包引用两路来源：排队归并 + 路由层 persistArchives 后透传（原文均已落盘，
+      // 句柄文本已前置进 prompt；事件只留 {id,name,bytes} 小对象）。
+      const archiveRefs = recovery
+        ? []
+        : [...queuedArchives, ...(opts?.archiveRefs ?? [])]
       // Snapshot "first user message" BEFORE appending — the auto-title hook
       // below needs to know whether this run is the conversation opener.
       if (this.getSessionGoalTracker(id)?.getRollover()) rememberGoalInputs(session.record, imageIds, documentRefs)
@@ -2874,6 +2955,7 @@ export class RuntimeSessionManager {
           ? { imageCount: images.length, ...(imageIds.length ? { imageIds } : {}) }
           : {}),
         ...(documentRefs.length > 0 ? { documents: documentRefs } : {}),
+        ...(archiveRefs.length > 0 ? { archives: archiveRefs } : {}),
       })
       this.append(session, 'status', { status: 'running' })
       // P2-B: emit a goal_state baseline snapshot on the first user message so
@@ -2893,6 +2975,13 @@ export class RuntimeSessionManager {
       }
       this.bindPlanModeChange(session, agent, runGeneration)
       const callbacks = this.buildCallbacks(session, journalWrite)
+      let domainRecorded = session.events.some(e => e.type === 'domain_usage' && e.runId === runId)
+      callbacks.onDomainUsed = key => {
+        if (domainRecorded || recovery || wasAutoResubmit || id.startsWith('worker-') || !ownsDurability() || session.activeRunSettlement !== runSettlement || runSettlement.settled) return
+        if (!starDomainRegistry.get(key)) return
+        domainRecorded = true
+        this.append(session, 'domain_usage', { key, sourceSessionId: id })
+      }
       callbacks.beforeToolExecute = async (toolId, name, input) => {
         if (!ownsDurability() || session.activeRunSettlement !== runSettlement || storageFailed || session.record.status !== 'running') throw new Error('Execution cancelled')
         try {
@@ -2904,7 +2993,7 @@ export class RuntimeSessionManager {
           if (!ownsDurability() || storageFailed || session.record.status !== 'running') throw new Error('Execution cancelled')
         } catch (error) { storageFailure(); throw error }
       }
-      void withActivityRun(id, attemptId, () => agent.run(prompt, callbacks, images))
+      void withActivityRun(id, attemptId, () => withWorkspaceRoots(session.record.workspaceRoots ?? [session.record.cwd], () => agent.run(prompt, callbacks, images, { origin: opts?.origin ?? (recovery || wasAutoResubmit ? 'runtime_command' : 'human') }), id))
         .catch((err: unknown) => {
           if (!ownsDurability()) return
           if (session.record.status === 'running') {
@@ -3063,7 +3152,7 @@ export class RuntimeSessionManager {
     const src = join(session.record.cwd, '.rivet', 'HANDOFF.md')
     const dest = join(getSessionDir(session.record.cwd), `${session.record.id}.handoff.md`)
     session.pendingHandoff = { src, dest, sinceMs: Date.now() }
-    if (!this.run(id, buildHandoffPrompt(src, note))) {
+    if (!this.run(id, buildHandoffPrompt(src, note), undefined, false, undefined, { origin: 'runtime_command' })) {
       session.pendingHandoff = undefined
       return { ok: false, error: 'Session is already running' }
     }
@@ -3290,14 +3379,14 @@ export class RuntimeSessionManager {
     // 档位：per-session override（含 rehydrate 回读，见下方 approvalMode）优先；
     // 无 override 时用 serve 传入的快照档——PUT /config/approval 的广播回调
     // 会就地更新该快照并对存活 agent 广播（2026-09-05 跨盘审批链修复）。
-    const created = this.createAgent(
+    const created = withWorkspaceRoots(session.record.workspaceRoots ?? [session.record.cwd], () => this.createAgent(
       session.record.cwd,
       session.record.id,
       session.approvalMode,
       session.record.model,
       session.record.allowedTools,
       session.preparationController?.signal,
-    )
+    ), session.record.id)
     const finish = (agent: ManagedAgent): ManagedAgent => {
       session.agent = agent
       this.applySelections(session)
@@ -3565,15 +3654,7 @@ export class RuntimeSessionManager {
     // 动、无法再换 key（resume 也会静默用首个账号）。
     let claimed = false
     return all.map((m) => {
-      const keyedRef = m.keyId ? `${m.provider}:${m.keyId}:${m.id}` : null
-      const keyedAlias = m.keyId ? `${m.provider}:${m.keyId}:${m.alias}` : null
-      const hit = !!current && !claimed && (
-        (keyedRef !== null && (current === keyedRef || current === keyedAlias))
-        || current === `${m.provider}:${m.id}`
-        || current === `${m.provider}:${m.alias}`
-        || current === m.id
-        || current === m.alias
-      )
+      const hit = !claimed && modelOptionMatches(current, m)
       if (hit) claimed = true
       return { ...m, current: hit }
     })
@@ -4158,7 +4239,7 @@ export class RuntimeSessionManager {
    * plans are editable; approved/executed are historical records and rejected
    * are archived. Emits `plan_submitted` so viewers re-fetch the body.
    */
-  async updatePlan(id: string, slug: string, content: string): Promise<PlanUpdateOutcome> {
+  async updatePlan(id: string, slug: string, content: string, expectedVersion?: string): Promise<PlanUpdateOutcome> {
     const session = this.sessions.get(id)
     if (!session) return { ok: false, code: 'session-missing', reason: 'Session not found' }
     // 编辑计划 = 用户参与——取消倒计时自动批准
@@ -4167,15 +4248,19 @@ export class RuntimeSessionManager {
     if (!trimmed) return { ok: false, code: 'empty-content', reason: 'Plan content must not be empty' }
     const existing = await storeReadPlan(session.record.cwd, slug)
     if (!existing) return { ok: false, code: 'plan-not-found', reason: `Plan not found: "${slug}"` }
-    if (existing.status !== 'submitted') {
+    if (expectedVersion !== undefined && createHash('sha256').update(existing.content).digest('hex') !== expectedVersion) {
+      return { ok: false, code: 'conflict', reason: 'Plan changed; reload before saving' }
+    }
+    if (parsePlanStatus(content) !== existing.status || existing.status !== 'submitted') {
       return { ok: false, code: 'not-editable', reason: `Only submitted plans can be edited (status: ${existing.status})` }
     }
     // Options: honour a frontmatter block the editor kept/changed; fall back to
     // the recorded ones so a body-only edit never silently drops the choices.
     const options = parsePlanOptions(content) ?? existing.options
     try {
-      await storeWritePlan(session.record.cwd, slug, content, options)
-    } catch {
+      await storeWritePlan(session.record.cwd, slug, content, options, existing.content)
+    } catch (error) {
+      if (error instanceof PlanConflictError) return { ok: false, code: 'conflict', reason: error.message }
       return { ok: false, code: 'plan-not-found', reason: `Failed to write plan "${slug}"` }
     }
     const updated = await storeReadPlan(session.record.cwd, slug)
@@ -4261,7 +4346,7 @@ export class RuntimeSessionManager {
     this.append(session, 'plan_submitted', { slug, title: approved.title, status: 'approved' })
     this.touch(session)
     this.persistRecord(session)
-    this.run(id, kickoff)
+    this.run(id, kickoff, undefined, false, undefined, { origin: 'runtime_command' })
     return { ok: true }
   }
 
@@ -4306,7 +4391,7 @@ export class RuntimeSessionManager {
         session.steer.push(revisionPrompt)
         this.append(session, 'steer_queued', { text: redactText(revisionPrompt) })
       } else {
-        this.run(id, revisionPrompt)
+        this.run(id, revisionPrompt, undefined, false, undefined, { origin: 'runtime_command' })
       }
     }
     return true
@@ -4373,8 +4458,8 @@ export class RuntimeSessionManager {
   queue(
     id: string,
     text: string,
-    attachments?: { images?: string[]; attachmentText?: string; documentNames?: string[]; documents?: SessionDocumentInput[] },
-  ): { laneId: string } | 'idle' | 'not_found' | 'image_budget' | 'document_budget' {
+    attachments?: { images?: string[]; attachmentText?: string; documentNames?: string[]; documents?: SessionDocumentInput[]; archiveRefs?: SessionArchiveEventRef[] },
+  ): { laneId: string } | 'idle' | 'not_found' | 'image_budget' | 'document_budget' | 'archive_budget' {
     const session = this.sessions.get(id)
     if (!session) return 'not_found'
     if (!session.running) return 'idle'
@@ -4383,6 +4468,7 @@ export class RuntimeSessionManager {
     const usage = countLaneAttachments(session.queueLane)
     if (usage.images + (attachments?.images?.length ?? 0) > MAX_IMAGES) return 'image_budget'
     if (usage.documents + (attachments?.documentNames?.length ?? 0) > MAX_DOCUMENTS) return 'document_budget'
+    if (usage.archives + (attachments?.archiveRefs?.length ?? 0) > MAX_ARCHIVES) return 'archive_budget'
     // 排队跟进同样是用户参与——取消倒计时自动批准（与 steer 对齐）。
     this.cancelPlanAutoApprove(session, 'queue')
     // issue #300 — 文档原文在入队时落盘（归并发生在下轮 run 的同步入口，
@@ -4397,6 +4483,9 @@ export class RuntimeSessionManager {
       ...(attachments?.attachmentText ? { attachmentText: attachments.attachmentText } : {}),
       ...(attachments?.documentNames?.length ? { documentNames: attachments.documentNames } : {}),
       ...(docRefs.length ? { documents: docRefs } : {}),
+      // 压缩包原文由路由层 persistArchives 在入队前落盘（async，不能在此同步块做），
+      // 条目只留小引用；落盘幂等（docId=内容哈希），预算拒绝留下的孤儿随会话目录回收。
+      ...(attachments?.archiveRefs?.length ? { archives: attachments.archiveRefs } : {}),
     }
     session.queueLane.push(entry)
     // #238 — 事件带附件计数：卡片据此持久显示附件 chip（不再依赖转瞬即逝的
@@ -4406,6 +4495,7 @@ export class RuntimeSessionManager {
       text: redactText(text),
       ...(entry.images?.length ? { imageCount: entry.images.length } : {}),
       ...(entry.documentNames?.length ? { documentNames: entry.documentNames } : {}),
+      ...(entry.archives?.length ? { archiveNames: entry.archives.map((a) => a.name) } : {}),
     })
     this.touch(session)
     return { laneId: entry.id }
@@ -4415,7 +4505,7 @@ export class RuntimeSessionManager {
    * #238 — lane 中已排队的附件累计（路由侧 fail-fast 文案用；权威判定在
    * queue() 的同步块里）。null = 会话不存在。
    */
-  queuedAttachmentUsage(id: string): { images: number; documents: number } | null {
+  queuedAttachmentUsage(id: string): { images: number; documents: number; archives: number } | null {
     const session = this.sessions.get(id)
     if (!session) return null
     return countLaneAttachments(session.queueLane)
@@ -4453,16 +4543,17 @@ export class RuntimeSessionManager {
     session: InternalSession,
     prompt: string,
     promptImageCount = 0,
-  ): { prompt: string; images: string[]; droppedImages: number; documents: SessionDocumentRef[] } {
+  ): { prompt: string; images: string[]; droppedImages: number; documents: SessionDocumentRef[]; archives: SessionArchiveEventRef[] } {
     const steerEntries = session.steer.getPendingEntries()
     const laneQueued = session.queueLane.filter((e) => e.status === 'queued')
     if (steerEntries.length === 0 && laneQueued.length === 0) {
-      return { prompt, images: [], droppedImages: 0, documents: [] }
+      return { prompt, images: [], droppedImages: 0, documents: [], archives: [] }
     }
     session.steer.clear()
     const sections: string[] = steerEntries.map((e) => e.text)
     const images: string[] = []
     const documents: SessionDocumentRef[] = []
+    const archives: SessionArchiveEventRef[] = []
     let droppedImages = 0
     let notice = ''
     if (laneQueued.length > 0) {
@@ -4484,6 +4575,8 @@ export class RuntimeSessionManager {
         // issue #300 — 文档引用随归并进入本轮 user 事件（原文入队时已落盘，
         // 引用是小对象，merged 后保留无内存压力）。
         if (e.documents?.length) documents.push(...e.documents)
+        // 压缩包引用同构随归并（句柄文本在 attachmentText 里，随上文前置）。
+        if (e.archives?.length) archives.push(...e.archives)
         return e.attachmentText ? `${e.attachmentText}\n\n${e.text}` : e.text
       })
       sections.push(`${header}\n${laneSections.join('\n\n')}`)
@@ -4507,7 +4600,7 @@ export class RuntimeSessionManager {
     }
     const head = sections.join('\n\n')
     const mergedPrompt = notice ? `${head}\n\n${notice}\n\n${prompt}` : `${head}\n\n${prompt}`
-    return { prompt: mergedPrompt, images, droppedImages, documents }
+    return { prompt: mergedPrompt, images, droppedImages, documents, archives }
   }
 
   /** 注册 session 的 coordinator 引用（main.ts 在 agent 构建后调用）。 */
@@ -4563,54 +4656,19 @@ export class RuntimeSessionManager {
     return coordinator.isWorkerRunning(workerId)
   }
 
-  /**
-   * 兜底对账：事件日志里仍标 running 的 delegation 节点，若地面真值
-   * （backgroundAborts / coordinator.orderControllers）判定其已不在跑，
-   * 补发终态事件闭环。worker 真实死亡与终态事件落盘本是两条路径——
-   * abort 时工具层补发的终态会被 onDelegationActivity 的 lifecycleGeneration
-   * 门禁吞掉，sidecar 重启时 rehydrate 也不补 delegation 终态——没有本对账，
-   * 子代理面板回放后永远显示「运行中」，kill 只能拿到 409。
-   * 只在会话空闲时调用（running 中的会话由 run 收尾统一对账）。
-   */
+  /** Settle known idle workers from control state, including identities evicted from replay.
+   * Uncertain snapshots remain unresolved rather than inventing terminal outcomes. */
   private sweepStaleDelegationNodes(session: InternalSession, failureReason: string): void {
     if (session.running) return
-    const latest = new Map<string, {
-      workerId: string
-      status: string
-      attemptId?: string
-      dispatchId?: string
-      parentAttemptId?: string
-    }>()
-    const firstTs = new Map<string, number>()
-    for (const ev of session.events) {
-      if (ev.type !== 'delegation') continue
-      const workerId = typeof ev.data.workerId === 'string' ? ev.data.workerId : undefined
-      const status = typeof ev.data.status === 'string' ? ev.data.status : undefined
-      if (!workerId || !status) continue
-      const attemptId = typeof ev.data.attemptId === 'string' ? ev.data.attemptId : undefined
-      const dispatchId = typeof ev.data.dispatchId === 'string' ? ev.data.dispatchId : undefined
-      const parentAttemptId = typeof ev.data.parentAttemptId === 'string' ? ev.data.parentAttemptId : undefined
+    const snapshot = this.delegationStates.get(session)?.snapshot()
+    if (!snapshot?.complete) return
+    for (const event of snapshot.events) {
+      const { workerId, attemptId, dispatchId, parentAttemptId } = event.data as { workerId: string; attemptId?: string; dispatchId?: string; parentAttemptId?: string }
+      if (session.backgroundAborts?.has(workerId) || this.isWorkerRunning(session.record.id, workerId)) continue
       const key = attemptId ?? (dispatchId ? `${dispatchId}:${workerId}` : workerId)
-      if (!firstTs.has(key)) firstTs.set(key, ev.ts)
-      latest.set(key, { workerId, status, attemptId, dispatchId, parentAttemptId })
-    }
-    for (const [key, current] of latest) {
-      const { workerId, status, attemptId, dispatchId, parentAttemptId } = current
-      if (status !== 'running') continue
-      if (session.backgroundAborts?.has(workerId)) continue
-      if (this.isWorkerRunning(session.record.id, workerId)) continue
-      // 让补发的终态事件带上真实的存活时长（否则 elapsedMs 会从 0 起算）。
-      const startedMap = session.delegationStartedAt ?? (session.delegationStartedAt = new Map())
-      const ts = firstTs.get(key)
-      if (ts !== undefined && !startedMap.has(key)) startedMap.set(key, ts)
-      this.emitDelegationActivity(session, {
-        workOrderId: workerId,
-        attemptId,
-        dispatchId,
-        parentAttemptId,
-        status: 'failed',
-        failureReason,
-      })
+      const started = session.delegationStartedAt ?? (session.delegationStartedAt = new Map())
+      if (!started.has(key)) started.set(key, event.ts)
+      this.emitDelegationActivity(session, { workOrderId: workerId, attemptId, dispatchId, parentAttemptId, status: 'failed', failureReason })
     }
   }
 
@@ -4735,6 +4793,18 @@ export class RuntimeSessionManager {
       try { record.contextTokens = s.agent.getEstimatedTokens?.() } catch { /* non-fatal */ }
       try { record.contextBudget = s.agent.getContextBudget?.() ?? record.contextBudget } catch { /* non-fatal */ }
       try { record.contextWindow = s.agent.getContextWindow?.() } catch { /* non-fatal */ }
+    }
+    // agent 缺失（懒创建/idle 释放/重启装填）时 contextWindow 没有事件通道兜底
+    // （协议里没有事件携带它），桌面 ContextRing 的分母随之丢失、切会话后进度环
+    // 空转。窗口是静态模型配置，按 record.model 从模型清单回落即可，判据与
+    // listModels 的 current 判定同源（首个命中胜出）。
+    if (record.contextWindow === undefined) {
+      try {
+        const all = this.listModelsFn?.() ?? []
+        record.contextWindow = all.find((m) => modelOptionMatches(record.model, m))?.contextWindow
+      } catch { /* non-fatal */ }
+    }
+    if (s.agent) {
       // Prefer the user's explicit effort selection (including 'auto') over the
       // agent's current concrete level, so the desktop chip reflects the mode
       // the user actually set.
@@ -5018,13 +5088,15 @@ export class RuntimeSessionManager {
     let branchKept = false
     if (s.record.worktreePath && ![...this.sessions.values()].some(other => other !== s && !other.record.archived && other.record.cwd === s.record.cwd)) {
       try {
-        const work = hasUnlandedWork(this.defaultCwd, s.record.worktreePath, s.record.worktreeBranch)
+        const origin = s.record.worktreeOriginCwd ?? listWorktrees(s.record.worktreePath)[0]?.path
+        if (!origin) throw new Error('Worktree origin unavailable; preserve checkout')
+        const work = hasUnlandedWork(origin, s.record.worktreePath, s.record.worktreeBranch)
         if (work.dirty) {
           // worktree remove --force discards uncommitted changes — snapshot them.
           commitAll(s.record.worktreePath, 'rivet: archive checkpoint', { noVerify: true })
         }
         const after = work.dirty || work.unmergedCommits > 0
-          ? hasUnlandedWork(this.defaultCwd, s.record.worktreePath, s.record.worktreeBranch)
+          ? hasUnlandedWork(origin, s.record.worktreePath, s.record.worktreeBranch)
           : work
         // Squash merge-back leaves branch commits unreachable from main —
         // the landedHead marker proves they were landed. A branch head that
@@ -5032,7 +5104,7 @@ export class RuntimeSessionManager {
         const landed = Boolean(s.record.landedHead)
           && revParseHead(s.record.worktreePath) === s.record.landedHead
         branchKept = Boolean(s.record.worktreeBranch) && after.unmergedCommits > 0 && !landed
-        removeWorktree(this.defaultCwd, s.record.worktreePath, s.record.worktreeBranch, { keepBranch: branchKept })
+        removeWorktree(origin, s.record.worktreePath, s.record.worktreeBranch, { keepBranch: branchKept })
       } catch { /* non-fatal */ }
     }
     this.touch(s)
@@ -5145,16 +5217,14 @@ export class RuntimeSessionManager {
   // ── Change landing (desktop Changes tab: Commit / Merge back / Create PR) ──
 
   /**
-   * Stage and commit everything in the session's cwd (worktree for isolated
-   * sessions, shared cwd otherwise). Server-direct path of the dual-channel
-   * design — the "let the agent commit" path goes through a normal prompt.
+   * Commit only the index in the session's actual checkout.
    */
   commitSessionChanges(id: string, message?: string): { ok: boolean; sha?: string; nothingToCommit?: boolean; error?: string } | null {
     const s = this.sessions.get(id)
     if (!s) return null
-    const cwd = s.record.worktreePath ?? this.defaultCwd
+    const cwd = s.record.worktreePath ?? s.record.cwd
     const fallback = `rivet: ${s.record.title?.trim() || `session ${id.slice(0, 8)}`} changes`
-    const result = commitAll(cwd, message?.trim() || fallback)
+    const result = commitIndex(cwd, message?.trim() || fallback)
     if (result.ok && result.sha) {
       this.append(s, 'landing', { action: 'commit', sha: result.sha })
       this.touch(s)
@@ -5164,8 +5234,8 @@ export class RuntimeSessionManager {
 
   /**
    * Squash-merge the session's worktree branch into the main workspace's
-   * current branch. Uncommitted worktree changes are committed first so the
-   * squash captures the full task delta. Fail-closed on dirty main workspace
+   * current branch. Require explicitly committed worktree changes before the
+   * squash operation. Fail-closed on dirty main workspace
    * or conflicts (rolled back, conflict files reported).
    */
   mergeSessionBack(id: string): { ok: boolean; sha?: string; nothingToMerge?: boolean; conflictFiles?: string[]; error?: string } | null {
@@ -5174,11 +5244,11 @@ export class RuntimeSessionManager {
     if (!s.record.worktreeBranch || !s.record.worktreePath) {
       return { ok: false, error: 'not a worktree session — nothing to merge back' }
     }
-    // Sweep uncommitted work into the branch first (squash flattens it anyway).
-    const checkpoint = commitAll(s.record.worktreePath, 'rivet: pre-merge checkpoint', { noVerify: true })
-    if (!checkpoint.ok) return { ok: false, error: `failed to checkpoint worktree: ${checkpoint.error}` }
+    const origin = s.record.worktreeOriginCwd ?? listWorktrees(s.record.worktreePath)[0]?.path
+    if (!origin) return { ok: false, error: 'worktree origin unavailable' }
+    if (hasUnlandedWork(origin, s.record.worktreePath, s.record.worktreeBranch).dirty) return { ok: false, error: 'commit selected changes before merging back' }
     const title = s.record.title?.trim() || 'session changes'
-    const result = squashMergeBranch(this.defaultCwd, s.record.worktreeBranch, `${title} (rivet session ${id.slice(0, 8)})`)
+    const result = squashMergeBranch(origin, s.record.worktreeBranch, `${title} (rivet session ${id.slice(0, 8)})`)
     if (result.ok) {
       // Squash merges leave the branch commits unreachable from main, so
       // rev-list alone can't prove "landed". Record the branch head at merge
@@ -5193,7 +5263,7 @@ export class RuntimeSessionManager {
 
   /**
    * Push the session's worktree branch and open a PR via `gh pr create`.
-   * Uncommitted changes are checkpoint-committed first.
+   * Require explicitly committed changes; never checkpoint the directory.
    */
   async createSessionPr(id: string, title?: string, body?: string): Promise<{ ok: boolean; url?: string; error?: string } | null> {
     const s = this.sessions.get(id)
@@ -5201,8 +5271,7 @@ export class RuntimeSessionManager {
     if (!s.record.worktreeBranch || !s.record.worktreePath) {
       return { ok: false, error: 'not a worktree session — create PRs from an isolated worktree session' }
     }
-    const checkpoint = commitAll(s.record.worktreePath, 'rivet: pre-PR checkpoint', { noVerify: true })
-    if (!checkpoint.ok) return { ok: false, error: `failed to checkpoint worktree: ${checkpoint.error}` }
+    if (hasUnlandedWork(s.record.worktreePath, s.record.worktreePath, s.record.worktreeBranch).dirty) return { ok: false, error: 'commit selected changes before creating a PR' }
     const pushed = pushBranch(s.record.worktreePath, s.record.worktreeBranch)
     if (!pushed.ok) return { ok: false, error: `git push failed: ${pushed.error}` }
     const result = await createPr(s.record.worktreePath, {
@@ -5379,26 +5448,6 @@ export class RuntimeSessionManager {
    * (e.g. per-hunk edit picks) before it runs — flows through ApprovalResult.
    * (Intent is now a non-blocking timeline note and has no pending state.)
    */
-  /**
-   * Label an approval that would widen the write/read boundary to a directory
-   * outside the workspace, so the UI can offer "remember this directory". Absent
-   * for every other approval — the checkbox must not appear where remembering
-   * has no meaning.
-   */
-  private pathGrantHint(
-    cwd: string,
-    name: string,
-    input: Record<string, unknown>,
-  ): { dir: string; mode: 'read' | 'write' } | undefined {
-    if (name === 'request_path_access') {
-      const p = typeof input.path === 'string' ? input.path.trim() : ''
-      return p ? { dir: p, mode: input.mode === 'write' ? 'write' : 'read' } : undefined
-    }
-    const need = outOfWorkspaceFilePaths(cwd, name, input)
-    const first = need?.paths[0]
-    return need && first ? { dir: dirname(first), mode: need.mode } : undefined
-  }
-
   answerIntervention(
     id: string,
     requestId: string,
@@ -5723,6 +5772,7 @@ export class RuntimeSessionManager {
     let worktreePath: string | undefined
     let baselineHead: string | undefined
 
+    if (destination !== 'local' && (src.record.workspaceRoots?.length ?? 1) > 1) return {ok:false,reason:'worktree_failed',detail:'Isolated Worktree supports a single folder only'}
     if (destination === 'same-worktree') {
       if (!src.record.worktreePath || !existsSync(src.record.worktreePath)) {
         return { ok: false, reason: 'same_worktree_unavailable' }
@@ -5756,6 +5806,7 @@ export class RuntimeSessionManager {
     const created = this.createSession({
       id: newId,
       cwd: newCwd,
+      ...(src.record.workspaceRoots ? { workspaceRoots: [newCwd,...src.record.workspaceRoots.slice(1)] } : {}),
       title,
       approvalMode: src.record.approvalMode,
       model: src.record.model,
@@ -5775,15 +5826,15 @@ export class RuntimeSessionManager {
     child.record.forkSource = opts.source ?? 'header'
     child.record.worktreeBranch = worktreeBranch
     child.record.worktreePath = worktreePath
+    child.record.worktreeOriginCwd = worktreePath ? src.record.worktreeOriginCwd ?? src.record.cwd : undefined
     child.record.baselineHead = baselineHead
 
     // 1) 桌面端事件流：前缀先落盘，再镜像进内存环（与常规会话同样按 maxEvents 截尾）。
     const maxSeq = eventsPrefix.length > 0 ? eventsPrefix[eventsPrefix.length - 1]!.seq : 0
     child.seq = maxSeq
     child.diskFirstSeq = eventsPrefix[0]?.seq ?? 1
-    child.events = eventsPrefix.length > this.maxEvents
-      ? trimEventRing(eventsPrefix, this.maxEvents)
-      : [...eventsPrefix]
+    child.events = [...eventsPrefix]
+    this.enforceRingLimits(child)
     child.eventsLoaded = true
     for (const ev of eventsPrefix) {
       try { this.persistence?.appendEvent(created.id, ev) } catch { /* best-effort：活状态已就位 */ }
@@ -5816,6 +5867,13 @@ export class RuntimeSessionManager {
   private copyForkImages(sourceId: string, childId: string, events: SessionEvent[]): void {
     const images = new Set<string>()
     for (const ev of events) {
+      const outputId = ev.data.outputId
+      if (typeof outputId === 'string') {
+        try {
+          const text = this.persistence?.readToolOutput?.(sourceId, outputId)
+          if (text !== undefined) this.persistence?.saveToolOutput?.(childId, outputId, text)
+        } catch { /* missing evidence does not prevent fork */ }
+      }
       const ids = (ev.data as { imageIds?: unknown }).imageIds
       if (Array.isArray(ids)) {
         for (const img of ids) {
@@ -5952,6 +6010,7 @@ export class RuntimeSessionManager {
   private emitDelegationActivity(
     session: InternalSession,
     a: {
+      resultWorkOrderId?: string
       workOrderId: string
       parentToolId?: string
       dispatchId?: string
@@ -5993,6 +6052,7 @@ export class RuntimeSessionManager {
       startedMap.set(attemptKey, started)
     }
     this.append(session, 'delegation', {
+      resultWorkOrderId: a.resultWorkOrderId,
       workerId: a.workOrderId,
       parentId: a.parentToolId,
       dispatchId: a.dispatchId,
@@ -6144,21 +6204,11 @@ export class RuntimeSessionManager {
         // 在 tool_use 时机发 user_question SSE（工具本身只回占位符 + endTurn）。
         // 答案不走新 API —— 桌面卡片把选择组装成普通用户消息回传。
         if (name === 'ask_user_question') {
-          const questions = parseAskUserQuestions(input)
-          if (questions.length > 0) {
-            this.append(session, 'user_question', {
-              toolUseId: toolId,
-              questions: questions.map(q => ({
-                id: q.id,
-                prompt: redactText(q.prompt),
-                options: q.options.map(o => redactText(o)),
-                allowMultiple: q.allowMultiple,
-              })),
-            })
-          }
+          const question = buildUserQuestionEvent(toolId, input)
+          if (question) this.append(session, 'user_question', question)
         }
       },
-      onToolResult: (toolId, name, result, isError, _rawPath, uiContent) => {
+      onToolResult: (toolId, name, result, isError, _rawPath, uiContent, evidence) => {
         // Agent callbacks can already be queued when archive/delete closes the
         // session. Reject both stream and terminal callbacks before watchdog,
         // persistence, delegation, plan, or artifact side effects.
@@ -6166,7 +6216,19 @@ export class RuntimeSessionManager {
         // 终态才计进度单元；isError === undefined 是流式 chunk（TUI 侧同款过滤，
         // 否则单次长输出工具就能伪装稀疏 stall）。
         if (isError !== undefined) session.watchdogPolicy?.recordToolResult()
+        const display = redactText(evidence?.outputText ?? uiContent ?? result)
+        let outputId: string | undefined
+        const imageIds = isError === undefined ? [] : this.persistImages(session.record.id, evidence?.images)
+        if (isError !== undefined && this.persistence?.saveToolOutput) {
+          const id = randomId()
+          try { this.persistence.saveToolOutput(session.record.id, id, display); outputId = id } catch { /* preview remains available */ }
+        }
         const eventData = {
+          ...(evidence?.command ? { commandText: redactText(evidence.command) } : {}),
+          ...(outputId ? { outputId } : {}),
+          outputTruncated: (evidence?.outputTruncated ?? (!!evidence?.lossiness && evidence.lossiness !== 'lossless')) || (!outputId && display.length > 2000),
+          ...(imageIds.length ? { imageIds } : {}),
+          ...(Number.isInteger(evidence?.exitCode) ? { exitCode: evidence!.exitCode } : {}),
           id: toolId,
           name,
           isError: !!isError,
@@ -6234,7 +6296,7 @@ export class RuntimeSessionManager {
         session.record.contextBudget = budget
         this.append(session, 'context_budget', { ...budget })
       },
-      onTurnComplete: (usage, turnNumber, isFinal, evidenceSummary, continuationReason) => {
+      onTurnComplete: (usage, turnNumber, isFinal, evidenceSummary, continuationReason, stopReason) => {
         if (!isActive()) return
         session.watchdogPolicy?.recordTurnComplete()
         // 上下文占用随事件下发的理由：`enrichRecord().contextTokens` 只在会话记录被
@@ -6251,6 +6313,9 @@ export class RuntimeSessionManager {
           ...(contextTokens !== undefined && contextTokens > 0 ? { contextTokens } : {}),
           ...(isFinal && evidenceSummary ? { evidence: evidenceSummary } : {}),
           ...(typeof continuationReason === 'string' && continuationReason ? { continuationReason } : {}),
+          // 'max_tokens'（输出被 token 上限截断）才携带——桌面据此渲染截断提醒
+          // （additive，对齐 contextTokens 先例）；正常 end_turn 不上 wire。
+          ...(typeof stopReason === 'string' && stopReason ? { stopReason } : {}),
         })
         const watermark = session.seq
         journalWrite(async () => {
@@ -6308,11 +6373,19 @@ export class RuntimeSessionManager {
         if (!isActive()) return
         this.append(session, 'checkpoint', { hash })
       },
-      onModelRetry: ({ attempt, maxAttempts }) => {
+      onModelRetry: ({ attempt, maxAttempts, category, message, nextDelayMs }) => {
         if (!isActive()) return
         // 按尝试替换：桌面端读到本条即丢弃失败尝试的未完成 partial，避免与重试
-        // 输出拼接重复；同时留一条「未完成/重试」标记。
-        this.append(session, 'retry', { attempt, maxAttempts, replaceAttempt: true })
+        // 输出拼接重复；同时留一条「未完成/重试」标记。category/nextDelayMs 让
+        // 重试块能说清「为什么断、等多久」（429/503 退避不再像卡住）；additive。
+        this.append(session, 'retry', {
+          attempt,
+          maxAttempts,
+          replaceAttempt: true,
+          ...(category ? { category } : {}),
+          ...(message ? { message: redactText(message) } : {}),
+          ...(typeof nextDelayMs === 'number' && nextDelayMs > 0 ? { nextDelayMs } : {}),
+        })
       },
       onPhaseChange: (phase, detail) => {
         if (!isActive()) return
@@ -6471,7 +6544,7 @@ export class RuntimeSessionManager {
       }
       session.pending.set(requestId, pend)
       this.recountApprovals(session)
-      const pathGrant = this.pathGrantHint(session.record.cwd, name, input)
+      const pathGrant = approvalPathGrant(session.record.cwd, name, input)
       this.append(session, 'approval_required', {
         requestId,
         toolName: name,
@@ -6584,7 +6657,7 @@ export class RuntimeSessionManager {
           merged.images.length > 0 ? merged.images : undefined,
           false,
           undefined,
-          { documentRefs: merged.documents.length > 0 ? merged.documents : undefined },
+          { documentRefs: merged.documents.length > 0 ? merged.documents : undefined, archiveRefs: merged.archives.length > 0 ? merged.archives : undefined },
         )
       } catch {
         // best-effort：flush 失败不回滚已 merged 的 lane（文本已 echo 在流中、
@@ -7039,6 +7112,16 @@ export class RuntimeSessionManager {
     return watermark
   }
 
+  /** 环写入后的统一限额收敛（issue #315）——实现见 session-ring-limits。 */
+  private enforceRingLimits(session: InternalSession): void {
+    const index = this.delegationStates.get(session) ?? new DelegationStateIndex()
+    const seen = this.delegationSeen.get(session) ?? -1
+    for (const event of session.events) if (event.seq > seen) index.add(event)
+    this.delegationStates.set(session, index); this.delegationSeen.set(session, session.seq)
+    const next = applyRingLimits(session.events, this.maxEvents, this.maxEventBytes)
+    if (next) session.events = next
+  }
+
   private appendRaw(
     session: InternalSession,
     type: SessionEventType,
@@ -7051,9 +7134,7 @@ export class RuntimeSessionManager {
       ...(session.record.runId ? { runId: session.record.runId, attemptId: session.record.attemptId } : {}),
     }
     session.events.push(stored)
-    if (session.events.length > this.maxEvents) {
-      session.events = trimEventRing(session.events, this.maxEvents)
-    }
+    this.enforceRingLimits(session)
     session.record.lastSeq = session.seq
     session.record.updatedAt = stored.ts
     if (this.persistence) {
@@ -7120,6 +7201,10 @@ export class RuntimeSessionManager {
     return ids
   }
 
+  readToolOutput(sessionId: string, outputId: string): string | undefined {
+    return this.persistence?.readToolOutput?.(sessionId, outputId)
+  }
+
   /** Read a persisted user image (for the GET image route). */
   readImage(sessionId: string, imgId: string): { bytes: Buffer; mime: string } | undefined {
     return this.persistence?.readImage?.(sessionId, imgId)
@@ -7153,6 +7238,62 @@ export class RuntimeSessionManager {
   /** Read a persisted user document (for the GET document route). */
   readDocument(sessionId: string, docId: string): { bytes: Buffer; mime: string; ext: string } | undefined {
     return this.persistence?.readDocument?.(sessionId, docId)
+  }
+
+  /**
+   * 压缩包附件原样落盘（句柄式，2026-10-05），返回完整引用（含 savedPath/
+   * sha256short——它们只进 prompt 句柄文本，不进事件流）。与 persistDocuments
+   * 的 best-effort 不同：压缩包没有句柄就没有注入形态，任一条失败整体报错
+   * （路由映射 400）。
+   *
+   * docId = 内容 sha256（content-addressed，dsh 同款）：同内容重发 / requestId
+   * 重试落同一路径（saveArchive 幂等跳过），句柄文本字节一致——run-ledger
+   * 指纹去重因此成立（随机 docId 会让重试的 prompt 漂移成 409 request_conflict）。
+   * 拒绝路径（busy/预算）不留 discard 钩子：同内容文件可能被另一在途请求引用，
+   *  误删活引用比留孤儿更糟（孤儿随会话目录生命周期回收）。
+   *
+   * path 形态的持久化时核验（存在/regular file/≤MAX_ARCHIVE_BYTES）在这里——
+   * 线缆校验（validateArchivesPayload）只查绝对路径；realpath 后再 copyFile，
+   * 用户原文件绝不被写。sha256 流式计算，hex 前 8 位进句柄。
+   */
+  async persistArchives(sessionId: string, archives: SessionArchivePayload[]): Promise<{ refs: SessionArchiveRef[] } | { error: string }> {
+    if (!this.persistence?.saveArchive) return { error: 'Archive attachments are unavailable (persistence missing)' }
+    const refs: SessionArchiveRef[] = []
+    for (const archive of archives) {
+      const name = sanitizeArchiveDisplayName(archive.name)
+      try {
+        if (archive.path !== undefined) {
+          // realpath 解符号链接后核 regular file——对链接本身 stat 会跟到目录
+          // 也放行 copyFile 一个目录的假象（copyFile 会失败，但错误文案不可读）。
+          const srcPath = await realpath(archive.path)
+          const st = await stat(srcPath)
+          if (!st.isFile()) return { error: `${name}: not a regular file` }
+          if (st.size > MAX_ARCHIVE_BYTES) {
+            return { error: `${name}: archive exceeds ${Math.round(MAX_ARCHIVE_BYTES / 1024 / 1024)}MB limit` }
+          }
+          const hash = createHash('sha256')
+          await new Promise<void>((resolveHash, rejectHash) => {
+            const stream = createReadStream(srcPath)
+            stream.on('data', (chunk) => hash.update(chunk))
+            stream.on('error', rejectHash)
+            stream.on('end', () => resolveHash())
+          })
+          const sha256hex = hash.digest('hex')
+          const savedPath = this.persistence.saveArchive(sessionId, sha256hex, { srcPath }, archive.name)
+          refs.push({ id: sha256hex, name, bytes: st.size, sha256short: sha256hex.slice(0, 8), savedPath })
+        } else {
+          const base64 = archive.dataUrl!.split(',')[1] ?? ''
+          const bytes = Buffer.from(base64, 'base64')
+          const sha256hex = createHash('sha256').update(bytes).digest('hex')
+          const savedPath = this.persistence.saveArchive(sessionId, sha256hex, { base64 }, archive.name)
+          refs.push({ id: sha256hex, name, bytes: bytes.length, sha256short: sha256hex.slice(0, 8), savedPath })
+        }
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code
+        return { error: code === 'ENOENT' ? `${name}: source file not found` : `${name}: ${(err as Error).message}` }
+      }
+    }
+    return { refs }
   }
 
   private touch(session: InternalSession): void {

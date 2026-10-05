@@ -1,3 +1,4 @@
+import { currentWorkspaceRoots } from './workspace-context.js'
 import { readdir, lstat, realpath, stat } from 'node:fs/promises'
 import { join } from 'path'
 import type { Tool, ToolCallParams } from './types.js'
@@ -160,6 +161,16 @@ Bad: glob(pattern="node_modules/**") (excluded by default)`,
   },
 
   async execute(params: ToolCallParams) {
+    const roots = currentWorkspaceRoots(params.cwd)
+    if (params.input.path === undefined && roots.length > 1) {
+      const paths = new Set<string>()
+      for (const root of roots) {
+        const result = await GLOB_TOOL.execute({ ...params, input: { ...params.input, path: root } })
+        if (result.isError) return result
+        if (result.content !== GLOB_EMPTY_RESULT) for (const file of result.content.split('\n')) paths.add(join(params.cwd, file))
+      }
+      return { content: paths.size ? [...paths].sort().join('\n') : GLOB_EMPTY_RESULT }
+    }
     const pattern = params.input.pattern as string
     const requestedRoot = params.input.path ? String(params.input.path) : '.'
     const validated = validatePathSafe(params.cwd, requestedRoot)
@@ -181,7 +192,7 @@ Bad: glob(pattern="node_modules/**") (excluded by default)`,
     }
 
     const regex = globToRegex(pattern)
-    const gitignore = await GitignoreFilter.create(params.cwd)
+    const gitignore = await GitignoreFilter.create(searchRoot)
     const includeSilentMatches = globPatternExplicitlyTargetsSilentLayer(pattern, requestedRoot)
     const files: string[] = []
     try {
@@ -192,7 +203,7 @@ Bad: glob(pattern="node_modules/**") (excluded by default)`,
     }
 
     const matches = files
-      .filter(f => !gitignore.isIgnored(params.cwd, join(searchRoot, f)))
+      .filter(f => !gitignore.isIgnored(searchRoot, join(searchRoot, f)))
       .sort()
       .map((f) => relativePosix(params.cwd, join(searchRoot, f)))
 

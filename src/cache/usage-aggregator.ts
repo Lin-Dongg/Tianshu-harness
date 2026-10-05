@@ -99,8 +99,9 @@ export interface CacheUsageAggregate {
 
 /** Optional second arg (2026-08-07 T3): row provider — lets resolvers price
  *  the same wire model id differently per provider once tariffs diverge.
- *  Single-arg resolvers stay valid (extra arg ignored). */
-export type PricingResolver = (model: string, provider?: string) => ModelConfig['pricing'] | undefined
+ *  Optional third arg is the request timestamp for time-dependent tariffs.
+ *  Existing resolvers stay valid (extra args ignored). */
+export type PricingResolver = (model: string, provider?: string, timestamp?: number) => ModelConfig['pricing'] | undefined
 
 function num(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined
@@ -289,7 +290,7 @@ export function aggregateUsageRows(rows: readonly CacheUsageRow[], options: Aggr
 
   for (const row of rows) {
     if (row.t < windowStart || row.t > now) continue
-    const pricing = resolvePricing?.(row.model, row.provider)
+    const pricing = resolvePricing?.(row.model, row.provider, row.t)
     addRow(total, row, pricing)
 
     const day = dayKey(row.t)

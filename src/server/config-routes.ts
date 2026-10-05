@@ -33,6 +33,7 @@
  */
 import { decodeRouteParam, type RouteHandler } from './index.js'
 import { isAuthorizedRequest } from './auth.js'
+import { readCallAudit } from '../api/call-audit.js'
 import {
   loadConfig,
   getApiKeyStatus,
@@ -91,8 +92,8 @@ import { buildWorkspaceRoutes } from './workspace-route.js'
 import { applyConfiguredPathGrants, listPersistedGrants, probeConfiguredDirExists, revokeGrant } from '../tools/path-grants.js'
 import { expandHome } from '../platform.js'
 import { resolve } from 'node:path'
-import { existsSync, readFileSync, mkdirSync } from 'node:fs'
-import { writeFileAtomicSync } from '../fs-atomic.js'
+import { existsSync } from 'node:fs'
+import { loadPlatformAuth, savePlatformAuth, clearPlatformAuth } from '../api/deepseek-platform-auth.js'
 import { join } from 'node:path'
 import { rivetHome } from '../config/paths.js'
 import { isKeylessProviderEntry } from '../config/provider-presets.js'
@@ -275,7 +276,7 @@ export interface ProviderListItem {
    *  provider（桌面表单 API Key 可选，用户有意空着 = keyless 端点）。
    *  模型选择器据此区分「keyless」与「该配 key 而没配」——前者照常列出。 */
   keyless: boolean
-  models: { id: string; alias?: string; supportsVision?: boolean; supportsVideo?: boolean; supportsImageGen?: boolean; effortSupported?: boolean; reasoningEffort?: string }[]
+  models: { id: string; alias?: string; supportsVision?: boolean; supportsVideo?: boolean; supportsImageGen?: boolean; free?: boolean; effortSupported?: boolean; reasoningEffort?: string }[]
   /** 端点是否真的会把推理档位发上线（provider 级 resolveEffortSupported）。
    *  设置页开关据此回显真实状态——不是「是否显式声明」，避免预设名自带通道时
    *  取消勾选成为空操作。undefined 字段兜底旧 sidecar（按支持处理）。 */
@@ -355,6 +356,9 @@ export function buildConfigRoutes(apiToken?: string, hooks?: ConfigRouteHooks): 
             supportsVision: m.supportsVision,
             supportsVideo: m.supportsVideo,
             supportsImageGen: m.supportsImageGen,
+            // 免费徽章数据源：schema 的 pricing.free（真正免费——区别于订阅折算价）。
+            // undefined 即"未知/付费"，desktop 以 === true 判定渲染。
+            free: m.pricing?.free,
             reasoningEffort: m.reasoningEffort,
             // 桌面 EffortMenu 的诚实化开关：无档位通道（自定义 provider 默认）→ false，
             // 控件据此禁用调档，而不是静默丢弃后仍报「设置成功」。
@@ -478,7 +482,7 @@ export function buildConfigRoutes(apiToken?: string, hooks?: ConfigRouteHooks): 
         return { status: 400, body: { error: 'model or models is required' } }
       }
       if (protocol !== undefined && !PROVIDER_PROTOCOL_VALUES.includes(protocol)) {
-        return { status: 400, body: { error: `Invalid protocol: ${String(protocol)} (expected 'openai', 'anthropic', or 'openai-responses')` } }
+        return { status: 400, body: { error: `Invalid protocol: ${String(protocol)} (expected ${PROVIDER_PROTOCOL_VALUES.join(' | ')})` } }
       }
       let parsedCapabilities: ProviderCapabilitiesConfig | undefined
       if (capabilities !== undefined) {
@@ -619,7 +623,7 @@ export function buildConfigRoutes(apiToken?: string, hooks?: ConfigRouteHooks): 
       const { provider, apiKey, baseUrl: override, protocol, model } = body as { provider?: string; apiKey?: string; baseUrl?: string; protocol?: ProviderProtocol; model?: string }
       if (!provider) return { status: 400, body: { error: 'provider is required' } }
       if (protocol !== undefined && !PROVIDER_PROTOCOL_VALUES.includes(protocol)) {
-        return { status: 400, body: { error: `Invalid protocol: ${String(protocol)} (expected 'openai', 'anthropic', or 'openai-responses')` } }
+        return { status: 400, body: { error: `Invalid protocol: ${String(protocol)} (expected ${PROVIDER_PROTOCOL_VALUES.join(' | ')})` } }
       }
       // key/baseUrl 走与 /config/providers/test 同源的共享解析链（防两端点漂移）；
       // allowKeyless：无鉴权端点（Ollama/vLLM）缺 key 不拦截，探测结果定成败。
@@ -669,6 +673,7 @@ export function buildConfigRoutes(apiToken?: string, hooks?: ConfigRouteHooks): 
     //    盲测 models[0]（撞 embedding/未开通型号会误报，且用户此时要测的是
     //    「URL 连接」）：/models 200 → ok=true + completionSkipped（UI 提示
     //    「未测模型对话」）；/models 失败 → ok=false 带原因。
+    'GET /config/provider-calls': withAuth((_body, params) => ({ status: 200, body: { calls: readCallAudit({ model: params?.model, sessionId: params?.sessionId, purpose: params?.purpose, since: Number(params?.since) || undefined }) } }), apiToken),
     'POST /config/providers/test': withAuth(async (body) => {
       const { provider, apiKey, baseUrl: override, protocol, model, vision } = body as {
         provider?: string
@@ -699,6 +704,7 @@ export function buildConfigRoutes(apiToken?: string, hooks?: ConfigRouteHooks): 
           modelsOk: report.modelsOk,
           latencyMs: report.latencyMs,
           probedModel: report.probedModel,
+          operationId: report.operationId, testedAt: report.testedAt,
           models: report.models,
           // 成功且未测 completion 时不带 error（UI 走「未测」提示而非报错）；
           // 失败路径首个错误优先（/models 失败详情或 completion 失败原因）。
@@ -1351,10 +1357,9 @@ export function buildConfigRoutes(apiToken?: string, hooks?: ConfigRouteHooks): 
     'GET /config/deepseek/summary': withAuth(async () => {
       const cfg = loadConfig()
       const provider = cfg.provider.providers[cfg.provider.default]
-      if (!provider) return { status: 200, body: { summary: null } }
-      const apiKey = provider.apiKey ?? (provider.apiKeyEnv ? process.env[provider.apiKeyEnv] : undefined)
+      const apiKey = provider?.apiKey ?? (provider?.apiKeyEnv ? process.env[provider.apiKeyEnv] : undefined)
       // failure/message 透出，桌面端才能区分「未登录」与「网络错」。
-      const result = await getDeepSeekUserSummary(apiKey, provider.baseUrl)
+      const result = await getDeepSeekUserSummary(apiKey, provider?.baseUrl)
       return { status: 200, body: { summary: result.data, failure: result.failure, message: result.message } }
     }, apiToken),
 
@@ -1362,49 +1367,43 @@ export function buildConfigRoutes(apiToken?: string, hooks?: ConfigRouteHooks): 
     'GET /config/deepseek/cost': withAuth(async (_body, params) => {
       const cfg = loadConfig()
       const provider = cfg.provider.providers[cfg.provider.default]
-      if (!provider) return { status: 200, body: { cost: null } }
-      const apiKey = provider.apiKey ?? (provider.apiKeyEnv ? process.env[provider.apiKeyEnv] : undefined)
+      const apiKey = provider?.apiKey ?? (provider?.apiKeyEnv ? process.env[provider.apiKeyEnv] : undefined)
       const now = new Date()
       const month = Number(params?.month ?? now.getMonth() + 1)
       const year = Number(params?.year ?? now.getFullYear())
-      const result = await getDeepSeekCostReport(apiKey, provider.baseUrl, month, year)
+      const result = await getDeepSeekCostReport(apiKey, provider?.baseUrl, month, year)
       return { status: 200, body: { cost: result.data, failure: result.failure, message: result.message } }
     }, apiToken),
 
     // ── DeepSeek 平台网页登录（token + cookie 持久化） ────────────
 
     'GET /config/deepseek/auth': withAuth(() => {
-      const filePath = join(rivetHome(), 'deepseek-platform-auth.json')
-      if (!existsSync(filePath)) return { status: 200, body: { loggedIn: false } }
-      try {
-        const data = JSON.parse(readFileSync(filePath, 'utf-8')) as { token?: string }
-        return { status: 200, body: { loggedIn: !!data.token } }
-      } catch {
-        return { status: 200, body: { loggedIn: false } }
-      }
+      return { status: 200, body: { loggedIn: !!loadPlatformAuth() } }
     }, apiToken),
 
     'POST /config/deepseek/auth': withAuth((body) => {
-      const { token, cookies } = (body ?? {}) as { token?: string; cookies?: string }
-      if (!token) return { status: 400, body: { error: 'token is required' } }
+      const { token, cookies } = (body ?? {}) as { token?: unknown; cookies?: unknown }
+      if (typeof token !== 'string' || !token.trim() || (cookies !== undefined && typeof cookies !== 'string')) {
+        return { status: 400, body: { error: 'invalid login credentials' } }
+      }
       try {
-        const filePath = join(rivetHome(), 'deepseek-platform-auth.json')
-        mkdirSync(join(rivetHome()), { recursive: true })
-        // 原子写（0600）——平台会话 token 与 Cookie 属账号级凭证，与 secrets.json
-        // 同级保护；此前的裸 writeFileSync 以默认 0644 落盘。
-        writeFileAtomicSync(filePath, JSON.stringify({ token, cookies: cookies ?? '', savedAt: Date.now() }) + '\n')
+        savePlatformAuth(token, (cookies as string | undefined) ?? '')
+        if (loadPlatformAuth()?.token !== token) throw new Error('read-back failed')
+        console.info('[insights-login] credentials saved and verified')
         return { status: 200, body: { ok: true, loggedIn: true } }
-      } catch (err) {
-        return { status: 500, body: { error: (err as Error).message } }
+      } catch {
+        console.warn('[insights-login] credential persistence failed')
+        return { status: 500, body: { error: 'Could not save platform login credentials' } }
       }
     }, apiToken),
 
     'DELETE /config/deepseek/auth': withAuth(() => {
-      const filePath = join(rivetHome(), 'deepseek-platform-auth.json')
-      if (existsSync(filePath)) {
-        try { writeFileAtomicSync(filePath, '{}\n') } catch { /* best-effort */ }
+      try {
+        clearPlatformAuth()
+        return { status: 200, body: { ok: true, loggedIn: false } }
+      } catch {
+        return { status: 500, body: { error: 'Could not clear platform login credentials' } }
       }
-      return { status: 200, body: { ok: true, loggedIn: false } }
     }, apiToken),
 
     // 多 key 池（PR-3）：本文件零行预算，路由住在 config-routes-keys.ts，以

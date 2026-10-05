@@ -1,3 +1,5 @@
+import { proveWirePrefix, assertContinuationPrefix, wireObservation, type ContinuationPrefixProof, type RequestDiagnostics } from './continuation-prefix.js'
+import { beginCallAudit, auditConfigFingerprint, observedAuditUsage } from './call-audit.js'
 import { createHash } from 'node:crypto'
 import type { Usage } from './types.js'
 import { assertCompleteAttachments } from './attachment-integrity.js'
@@ -15,7 +17,7 @@ import { parseRetryAfterMs } from './error-classifier.js'
 import { resolveWireEffort } from './provider.js'
 import { ReasoningRepetitionGuard, REASONING_REPETITION_CORRECTION } from './reasoning-repetition.js'
 import { deepSeekImageLimitError } from '../context/image-input-limits.js'
-import { isOfficialDeepSeek, deepSeekBudgetPolicy, buildContextBudget, assertContextBudget, DEEPSEEK_BODY_LIMIT } from '../context/request-budget.js'
+import { isOfficialDeepSeek, deepSeekBudgetPolicy, buildContextBudget, assertContextBudget, DEEPSEEK_BODY_LIMIT, DEEPSEEK_OUTPUT_RESERVE } from '../context/request-budget.js'
 import type { ContextBudgetSnapshot } from '../server/protocol.js'
 import { classifyApiError } from './error-classifier.js'
 import { normalizeBaseUrl } from './endpoint-map.js'
@@ -415,6 +417,8 @@ export class OpenAIClient implements StreamClient {
    *  request's FINAL bytes (post reasoning-strip / sanitize / system-suffix).
    *  Only updated for requests with `prefixProbe: true` so side-path calls
    *  through this client don't poison the baseline. */
+  private mainPrefixProof?: ContinuationPrefixProof
+  getMainPrefixProof(): ContinuationPrefixProof | undefined { return this.mainPrefixProof }
   private prevWireSignatures: Array<{ sig: string; len: number; role: string }> | null = null
   /** 上一次主轮请求的 tools 数组指纹（同序 stable-json——上线字节保数组序）。
    *  消息级探针对工具定义变化隐形（2026-09-06 主会话 toolsUpdated 碎裂事件
@@ -533,9 +537,16 @@ export class OpenAIClient implements StreamClient {
   }
 
   previewContextRequest(request: OaiChatRequest): OaiChatRequest {
-    return { ...request, model: request.model || this.config.model, max_tokens: request.max_tokens ?? this.config.maxTokens,
+    const model = request.model || this.config.model
+    return { ...request, model, max_tokens: this.capOutputTokens(request.max_tokens ?? this.config.maxTokens, model),
       messages: this.mapWireMessages(request.messages, { toolsPresent: !!request.tools?.length,
         suppressStickyPreserve: this.requestInvariant.hasObserved(request) }) }
+  }
+
+  /** 官方 DeepSeek 的单次输出封顶到「现实预留」（DEEPSEEK_OUTPUT_RESERVE）——与预算侧
+   *  outputReserve 同源，保证 `input + max_tokens ≤ window` 不被大输入破坏。其他 provider 原样。 */
+  private capOutputTokens(maxTokens: number, model: string): number {
+    return isOfficialDeepSeek(this.config.baseUrl, model) ? Math.min(maxTokens, DEEPSEEK_OUTPUT_RESERVE) : maxTokens
   }
 
   async stream(
@@ -564,10 +575,11 @@ export class OpenAIClient implements StreamClient {
     }
 
     // MiMo API uses max_completion_tokens, standard OpenAI uses max_tokens
+    const wireMaxTokens = this.capOutputTokens(request.max_tokens ?? this.config.maxTokens, String(body.model))
     if (this.config.useMaxCompletionTokens) {
-      body.max_completion_tokens = request.max_tokens ?? this.config.maxTokens
+      body.max_completion_tokens = wireMaxTokens
     } else {
-      body.max_tokens = request.max_tokens ?? this.config.maxTokens
+      body.max_tokens = wireMaxTokens
     }
 
     // stream_options: { include_usage: true } is an OpenAI extension.
@@ -610,6 +622,7 @@ export class OpenAIClient implements StreamClient {
     //   'adaptive' → {thinking: {type: 'adaptive'}}
     //   'none'     → no thinking block; use reasoning_effort param instead
     const blockType = this.config.thinkingBlockType ?? 'none'
+    if (['worker_report_repair', 'compact_summary'].includes(request.diagnostics?.purpose ?? '') && this.config.thinking === 'disabled' && blockType !== 'none') body.thinking = { type: 'disabled' }
 
     if (this.config.thinking === 'enabled') {
       if (blockType !== 'none') {
@@ -712,7 +725,7 @@ export class OpenAIClient implements StreamClient {
     this.requestInvariant.observe(request, msgArray, body.tools as unknown[] | undefined)
 
 
-    await this.sendStream(body, callbacks, signal, request.messages, request.contextBudget, request.prefixProbe)
+    await this.sendStream(body, callbacks, signal, request.messages, request.contextBudget, request.prefixProbe, request.diagnostics)
   }
 
   /** Compare this request's final wire bytes with the previous main-turn
@@ -785,6 +798,7 @@ export class OpenAIClient implements StreamClient {
     sourceMessages?: OaiMessage[],
     preparedBudget?: ContextBudgetSnapshot,
     prefixProbe = false,
+    diagnostics?: RequestDiagnostics,
   ): Promise<void> {
     // reasoningRef survives retry attempts within this sendStream call.
     // When a mid-stream failure occurs (e.g. idle timeout, connection reset),
@@ -829,12 +843,7 @@ export class OpenAIClient implements StreamClient {
     })
 
     await withStructuredRetry(async () => {
-      // Failover replays the same request object (same preparedBudget.requestId)
-      // through another client instance; each client's attempt counter restarts
-      // at 1, so `requestId:1` collided across primary/backup and
-      // SessionContext's dedupe swallowed the fallback's real usage. Append a
-      // fresh UUID per actual send attempt: unique across clients and retries,
-      // while keeping the ordinal for diagnostics.
+      // Unique attempt IDs prevent failover usage dedupe collisions.
       const identity: Omit<NonNullable<Usage['observation']>, 'status' | 'fields'> = { requestId, attemptId: `${requestId}:${++attempt}:${crypto.randomUUID()}` }
       // Reset instance state for each attempt
       this.toolCallBuffer.clear()
@@ -957,6 +966,16 @@ export class OpenAIClient implements StreamClient {
       }
       // 客户端限速（未配置 rateLimit 时零开销）：同 provider 的所有 client 实例共享一只桶。
       await acquireRateLimitSlot(this.config.providerName ?? this.config.baseUrl, this.config.retry?.rateLimit, lifecycle.signal)
+      const proof = proveWirePrefix(guard.body, this.config.providerName ?? 'openai', requestId, normalizeBaseUrl(this.config.baseUrl))
+      identity.wire = wireObservation(guard.body, proof, diagnostics, this.mainPrefixProof)
+      if (diagnostics?.continuationSource) {
+        try {
+          const baseline = assertContinuationPrefix(diagnostics.priorPrefix, proof)
+          identity.wire.baseline = baseline
+          identity.wire.comparison = baseline === 'present' ? 'preserved' : baseline
+        } catch (error) { identity.wire.comparison = 'fork'; throw error }
+      }
+      if (prefixProbe) this.mainPrefixProof = proof
       if (prefixProbe) {
         const messages = guard.body.messages as Array<Record<string, unknown>>
         this.recordWireDivergence(messages, guard.body.tools as unknown[] | undefined)
@@ -970,6 +989,14 @@ export class OpenAIClient implements StreamClient {
       }
       let parserStarted = false
       const sentAt = Date.now()
+      const audit = beginCallAudit({ requestId, attemptId: identity.attemptId, sessionId: this.config.sessionId,
+        provider: this.config.providerName ?? 'openai', model: String(guard.body.model), purpose: diagnostics?.purpose ?? (this.config.sessionId?.startsWith('worker-') ? 'worker_execution' : 'main_execution'),
+        workOrderId: diagnostics?.workOrderId, routeReason: diagnostics?.routeReason, parentRequestId: diagnostics?.parentRequestId ?? diagnostics?.previousMainRequestId,
+        configFingerprint: auditConfigFingerprint(identity.wire?.options) })
+      const observedCallbacks: StreamCallbacks = { ...callbacks,
+        onStopReason: (reason, usage) => { audit.finish({ status: 'complete', responseId: identity.responseId, responseModel: identity.responseModel, systemFingerprint: identity.systemFingerprint, finishReason: identity.finishReason ?? reason, usage: observedAuditUsage(usage) }); callbacks.onStopReason?.(reason, usage) },
+        onStreamAttemptAborted: info => { audit.finish({ status: 'aborted', responseId: identity.responseId, errorName: info.errorName, usage: observedAuditUsage(info.usage) }); callbacks.onStreamAttemptAborted?.(info) },
+      }
       try {
       const response = await fetchWithTimeout(`${normalizeBaseUrl(this.config.baseUrl)}/chat/completions`, {
         method: 'POST',
@@ -1034,8 +1061,10 @@ export class OpenAIClient implements StreamClient {
       if (!reader) throw new Error('Response body is not readable')
 
       parserStarted = true
-      await this.parseStreamFromReader(reader, callbacks, signal, reasoningRef, lifecycle, firstByteMs, identity)
+      await this.parseStreamFromReader(reader, observedCallbacks, signal, reasoningRef, lifecycle, firstByteMs, identity)
+      audit.finish({ status: 'complete', responseId: identity.responseId, responseModel: identity.responseModel, systemFingerprint: identity.systemFingerprint, finishReason: identity.finishReason })
       } catch (error) {
+        audit.finish({ status: lifecycle.signal.aborted ? 'aborted' : 'failed', responseId: identity.responseId, errorName: (error as Error).name })
         if (!parserStarted) callbacks.onStreamAttemptAborted?.({
           ...identity, provider: this.config.providerName ?? 'openai', receivedChars: 0,
           elapsedMs: Date.now() - sentAt, errorName: (error as Error).name, errorMessage: (error as Error).message,
@@ -1079,6 +1108,21 @@ export class OpenAIClient implements StreamClient {
         if (info.classified.category === 'reasoning_repetition') {
           repeatCorrectionRequested = true
         }
+        // 重试可见性（dsh 式）：429/503 的退避可持续 10-20 分钟（maxTotalDurationMs
+        // 预算），此前零事件——用户看到的是「卡住」。仅 rate_limit/overloaded 两类
+        // （其余类别有一次性专属通道：image-stripped / reasoning-echo / 剥图），
+        // 第 1 次与之后每 3 次发一次防轰炸；瞬态相位，不进历史。
+        if (
+          (info.classified.category === 'rate_limit' || info.classified.category === 'overloaded')
+          && (info.attempt === 1 || (info.attempt - 1) % 3 === 0)
+        ) {
+          callbacks.onRetryNotice?.({
+            category: info.classified.category,
+            attempt: info.attempt,
+            maxAttempts: info.maxAttempts,
+            nextDelayMs: info.nextDelayMs,
+          })
+        }
       },
     })
 
@@ -1098,8 +1142,6 @@ export class OpenAIClient implements StreamClient {
       debugLog('[openai-client] reasoning_echo 自愈：已为该 provider 打开 preservedThinkingProtocol（后续轮次不再重试）')
     }
   }
-
-  /** Parse SSE stream from a reader — exposed for testing */
 
   /** Parse SSE stream from a reader — exposed for testing */
   async parseStreamFromReader(
@@ -1153,6 +1195,11 @@ export class OpenAIClient implements StreamClient {
       let parsed: Parameters<OpenAIClient['processDelta']>[0]
       try { parsed = JSON.parse(payload) } catch { return }
       if (!parsed || typeof parsed !== 'object') return
+      const metadata = parsed as typeof parsed & { id?: string; model?: string; system_fingerprint?: string }
+      if (metadata.id) identity.responseId = metadata.id
+      if (metadata.model) identity.responseModel = metadata.model
+      if (metadata.system_fingerprint) identity.systemFingerprint = metadata.system_fingerprint
+      if (parsed.choices?.[0]?.finish_reason) identity.finishReason = parsed.choices[0].finish_reason
       const delta = parsed?.choices?.[0]?.delta
       if (parsed.choices?.[0] && !delta && !parsed.choices[0].finish_reason && !parsed.usage) return
       // Completed calls leave toolCallBuffer when flushed. Progress remains
@@ -1367,11 +1414,7 @@ export class OpenAIClient implements StreamClient {
         promotionFired = true
       }
 
-      // Emit the final text content block (normal completion only — never on
-      // error/retry paths, where a second attempt would re-emit and duplicate).
-      // The agent loop persists assistant turns from content blocks; without
-      // this block, text-only replies never reached session history and the
-      // model re-answered the previous turn. Mirrors anthropic/codex clients.
+      // Persist final text only on successful completion, never during retries.
       const finalText = !textConsumedAsToolJson && this._textAccum
         ? this._textAccum
         : promotionFired ? reasoningAccum : ''

@@ -1,59 +1,66 @@
 import { open } from 'node:fs/promises'
 import { StringDecoder } from 'node:string_decoder'
 import { setImmediate as yieldToLoop } from 'node:timers/promises'
+// @ts-ignore Native development workers load TypeScript directly.
+import { DelegationStateIndex } from './delegation-state.ts'
 import type { RawEventsTail, RawSessionEvent } from './cpu-tasks.js'
 
 interface OrderedEvent { event: RawSessionEvent; order: number }
 const compare = (a: OrderedEvent, b: OrderedEvent): number => a.event.seq - b.event.seq || a.order - b.order
 
-/** Top K ordinary events by seq, with file order breaking ties as in stable sort. */
+export const DEFAULT_TAIL_BYTES = 64 * 1024 * 1024
+const byteSize = (item: OrderedEvent): number => Buffer.byteLength(JSON.stringify(item.event), 'utf8')
+
+/** A contiguous suffix under both count and UTF-8 budgets, including unordered input. */
 class EventHeap {
   private items: OrderedEvent[] = []
+  private bytes = 0
+  private discarded: OrderedEvent | undefined
   private readonly capacity: number
-  constructor(capacity: number) { this.capacity = capacity }
-
+  private readonly maxBytes: number
+  constructor(capacity: number, maxBytes: number) {
+    if (!Number.isSafeInteger(capacity) || capacity < 0 || !Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new Error('Invalid event tail budget')
+    this.capacity = capacity; this.maxBytes = maxBytes
+  }
   add(item: OrderedEvent): void {
-    if (this.capacity === 0) return
-    if (this.items.length < this.capacity) {
-      let i = this.items.length
-      this.items.push(item)
-      while (i > 0) {
-        const parent = (i - 1) >> 1
-        if (compare(this.items[parent]!, item) <= 0) break
-        this.items[i] = this.items[parent]!
-        i = parent
-      }
-      this.items[i] = item
-      return
+    if (this.discarded && compare(item, this.discarded) <= 0) return
+    let i = this.items.length
+    this.items.push(item); this.bytes += byteSize(item)
+    while (i > 0) {
+      const parent = (i - 1) >> 1
+      if (compare(this.items[parent]!, item) <= 0) break
+      this.items[i] = this.items[parent]!; i = parent
     }
-    if (compare(item, this.items[0]!) <= 0) return
+    this.items[i] = item
+    while (this.items.length > this.capacity || (this.maxBytes > 0 && this.bytes > this.maxBytes)) this.removeOldest()
+  }
+  private removeOldest(): void {
+    const oldest = this.items[0]!, last = this.items.pop()!
+    this.bytes -= byteSize(oldest); this.discarded = oldest
+    if (!this.items.length) return
     let i = 0
     while (i * 2 + 1 < this.items.length) {
       let child = i * 2 + 1
       if (child + 1 < this.items.length && compare(this.items[child + 1]!, this.items[child]!) < 0) child++
-      if (compare(item, this.items[child]!) <= 0) break
-      this.items[i] = this.items[child]!
-      i = child
+      if (compare(last, this.items[child]!) <= 0) break
+      this.items[i] = this.items[child]!; i = child
     }
-    this.items[i] = item
+    this.items[i] = last
   }
-
   sorted(): OrderedEvent[] { return this.items.sort(compare) }
 }
 
 /** Retain only the replay window and the metadata required from its discarded head. */
 export class TailAccumulator {
-  private readonly maxEvents: number
   private readonly ordinary: EventHeap
-  private delegation: OrderedEvent[] = []
+  private readonly delegationState = new DelegationStateIndex()
   private artifacts: Array<{ seq: number; order: number; id: string }> = []
   private total = 0
   private firstSeq = Infinity
   private lastSeq = -Infinity
 
-  constructor(maxEvents: number) {
-    this.maxEvents = maxEvents
-    this.ordinary = new EventHeap(maxEvents)
+  constructor(maxEvents: number, maxEventBytes = DEFAULT_TAIL_BYTES) {
+    this.ordinary = new EventHeap(maxEvents, maxEventBytes)
   }
 
   addLine(line: string): void {
@@ -67,20 +74,16 @@ export class TailAccumulator {
     this.lastSeq = Math.max(this.lastSeq, event.seq)
     if (event.type === 'artifact') this.artifacts.push({ seq: event.seq, order, id: String(event.data.id) })
     const item = { event, order }
-    if (event.type === 'delegation') this.delegation.push(item)
-    else this.ordinary.add(item)
+    this.delegationState.add(event)
+    this.ordinary.add(item)
   }
 
   finish(): RawEventsTail {
-    // Existing trim semantics: discard total-maxEvents ordinary events first;
-    // all delegation events survive, even when they alone exceed the capacity.
-    const ordinary = this.ordinary.sorted()
-    const keep = Math.max(0, this.maxEvents - this.delegation.length)
-    const events = [...ordinary.slice(Math.max(0, ordinary.length - keep)), ...this.delegation]
-      .sort(compare).map(({ event }) => event)
+    const events = this.ordinary.sorted().map(({ event }) => event)
     this.artifacts.sort((a, b) => a.seq - b.seq || a.order - b.order)
     return {
       events,
+      ...(this.total > 0 ? { delegationState: this.delegationState.snapshot() } : {}),
       diskFirstSeq: this.total === 0 ? 0 : this.firstSeq,
       lastSeq: this.total === 0 ? 0 : this.lastSeq,
       artifactIds: this.artifacts.map(a => a.id),
@@ -135,8 +138,9 @@ export async function readEventsTailSnapshot(
   handle: EventFile, size: number, maxEvents: number,
   consume?: (raw: Buffer, offset: number, complete: boolean, event: RawSessionEvent | undefined) => void | Promise<void>,
   onRead?: (bytes: number) => void,
+  maxEventBytes = DEFAULT_TAIL_BYTES,
 ): Promise<RawEventsTail> {
-  const tail = new TailAccumulator(maxEvents)
+  const tail = new TailAccumulator(maxEvents, maxEventBytes)
   await scanEventLines(handle, 0, size, (raw, offset, complete) => {
     const event = parseEventLine(raw.toString('utf8'))
     if (event) tail.addEvent(event)
@@ -148,11 +152,11 @@ export async function readEventsTailSnapshot(
 /**
  * Scan a fixed file snapshot in 64 KiB chunks; never materialize the whole log.
  * Memory is the retained events + artifact IDs + one chunk + the longest line.
- * All delegation payloads remain required by the existing replay contract.
+ * Delegation lifecycle identity is retained separately without activity payloads.
  */
-export async function readEventsTailRaw(file: string, maxEvents: number): Promise<RawEventsTail> {
+export async function readEventsTailRaw(file: string, maxEvents: number, maxEventBytes = DEFAULT_TAIL_BYTES): Promise<RawEventsTail> {
   if (!Number.isSafeInteger(maxEvents) || maxEvents < 0) throw new Error('Invalid event tail capacity')
-  const tail = new TailAccumulator(maxEvents)
+  const tail = new TailAccumulator(maxEvents, maxEventBytes)
   let handle: Awaited<ReturnType<typeof open>>
   try { handle = await open(file, 'r') } catch { return tail.finish() }
   try {

@@ -2,6 +2,7 @@ import { type SessionContext } from './context.js'
 import { type SessionPersist } from './session-persist.js'
 import type { OaiMessage } from '../api/oai-types.js'
 import { debugLog } from '../utils/debug.js'
+import { isHumanInput } from './input-origin.js'
 
 /**
  * drain 终值快照（2026-10-02 第四批）：meta.tokenUsage 原只在「消息 append」时
@@ -71,7 +72,7 @@ export function attachSessionPersistListener(deps: {
             // also excludes them), so don't title/count them.
             const isReminder = typeof msg.content === 'string' && msg.content.startsWith('<system-reminder>')
             if (msg.role === 'user' && !isReminder) {
-              if (typeof msg.content === 'string' && !snapshot?.title) {
+              if (isHumanInput(msg.origin) && typeof msg.content === 'string' && !snapshot?.title) {
                 patch.title = msg.content.slice(0, 120)
               }
               patch.turnCount = (snapshot?.turnCount ?? 0) + 1

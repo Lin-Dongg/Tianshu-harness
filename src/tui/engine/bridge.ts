@@ -52,15 +52,20 @@ export function wrapCallbacksWithTuiApp(
       app.callbacks.onToolResult(id, name, result, isError, rawPath, uiContent)
       original.onToolResult?.(id, name, result, isError, rawPath, uiContent)
     },
-    onTurnComplete: (usage, turnNumber, isFinal) => {
+    onTurnComplete: (usage, turnNumber, isFinal, evidenceSummary, continuationReason, stopReason) => {
       if (!live()) return
-      app.callbacks.onTurnComplete(usage, turnNumber, isFinal)
-      original.onTurnComplete?.(usage, turnNumber, isFinal)
+      app.callbacks.onTurnComplete(usage, turnNumber, isFinal, evidenceSummary, continuationReason, stopReason)
+      original.onTurnComplete?.(usage, turnNumber, isFinal, evidenceSummary, continuationReason, stopReason)
     },
     onError: (error) => {
       if (!live()) return
       app.callbacks.onError(error)
       original.onError?.(error)
+    },
+    onModelRetry: (info) => {
+      if (!live()) return
+      app.callbacks.onModelRetry?.(info)
+      original.onModelRetry?.(info)
     },
     onAbort: (reason) => {
       // 迟到的旧 run onAbort：新 run 已开始（gen 不符）→ 丢弃，否则会清掉新 run 的 busy

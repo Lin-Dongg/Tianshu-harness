@@ -127,6 +127,8 @@ export {
 
 export {
   MAX_TEXT_ATTACHMENT_BYTES, CONTEXT_DOCUMENT_MIME,
-  contextFileKind, contextExtension, contextBasename,
+  contextFileKind, contextExtension, contextBasename, isSupportedArchiveName,
   decodeContextText, contextDataUrlBytes,
 } from './file-context-policy.js'
+
+export { STELLAR_CARDS, stellarCard } from '../agent/stellar-card.js'

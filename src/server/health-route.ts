@@ -10,6 +10,7 @@
 import type { RouteHandler } from './index.js'
 import type { RuntimeSessionManager } from './session-manager.js'
 import type { LoopLagSnapshot } from './loop-health.js'
+import type { StoreLockHolder } from './store-lock.js'
 import { isAuthorizedRequest } from './auth.js'
 import { PROTOCOL_VERSION, RUNTIME_CAPABILITIES, type RuntimeCapabilities } from './protocol.js'
 import { randomUUID } from 'node:crypto'
@@ -38,6 +39,10 @@ export interface HealthBody {
   configured: boolean
   loopLagP99Ms?: number
   loopLagMaxMs?: number
+  /** 初始化失败原因（如拿不到会话库独占锁而拒绝启动）——有值时 readiness='failed'。 */
+  initializationError?: string
+  /** 会话库独占锁被**别的进程**占用时的占用者（P0-1）。本进程持锁时省略。 */
+  storeLockHolder?: StoreLockHolder
 }
 
 export type HealthSnapshot = () => HealthBody
@@ -54,12 +59,15 @@ export function createHealthSnapshot(
   configured?: () => boolean,
   loopLag?: () => LoopLagSnapshot,
   initializationError?: () => string | undefined,
+  storeLockHolder?: () => StoreLockHolder | undefined,
 ): HealthSnapshot {
   return () => {
     const registryOk = registryReady ? registryReady() : true
     const configuredOk = configured?.() ?? true
     const { sessionCount, runningCount } = manager.stats()
     const lag = loopLag?.()
+    const initError = initializationError?.()
+    const lockHolder = storeLockHolder?.()
     return {
       snapshotAt: Date.now(),
       storage: manager.getStorageHealth(),
@@ -67,7 +75,7 @@ export function createHealthSnapshot(
       nodeVersion: process.version,
       memory: { rss: process.memoryUsage().rss, heapUsed: process.memoryUsage().heapUsed },
       instanceId: RUNTIME_INSTANCE_ID,
-      readiness: initializationError?.() ? 'failed' : registryOk ? 'ready' : 'initializing',
+      readiness: initError ? 'failed' : registryOk ? 'ready' : 'initializing',
       ok: registryOk && configuredOk,
       version,
       protocolVersion: PROTOCOL_VERSION,
@@ -78,6 +86,8 @@ export function createHealthSnapshot(
       registryOk,
       configured: configuredOk,
       ...(lag ? { loopLagP99Ms: lag.p99Ms, loopLagMaxMs: lag.maxMs } : {}),
+      ...(initError ? { initializationError: initError } : {}),
+      ...(lockHolder ? { storeLockHolder: lockHolder } : {}),
     }
   }
 }
@@ -91,8 +101,11 @@ export function buildHealthRoute(
   configured?: () => boolean,
   loopLag?: () => LoopLagSnapshot,
   initializationError?: () => string | undefined,
+  storeLockHolder?: () => StoreLockHolder | undefined,
 ): Record<string, RouteHandler> {
-  const snapshot = createHealthSnapshot(manager, startedAt, version, registryReady, configured, loopLag, initializationError)
+  const snapshot = createHealthSnapshot(
+    manager, startedAt, version, registryReady, configured, loopLag, initializationError, storeLockHolder,
+  )
   return {
     'GET /readyz': (_body, _params, headers) => {
       if (!isAuthorizedRequest({ headers: headers ?? {} }, apiToken)) {

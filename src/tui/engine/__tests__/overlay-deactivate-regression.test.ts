@@ -40,7 +40,7 @@ describe('Overlay deactivate · picker exit regression', () => {
 
     // After deactivate, screen should have exactly one input box border (╭)
     const allOutput = out.chunks.join('')
-    const topBorders = stripAnsi(allOutput).match(/^[─━┄-]{3,}\s*$/gm) ?? []
+    const topBorders = stripAnsi(allOutput).match(/^(?:[─━┄-]{3,}|[─━┄-] .+ [─━┄-]{2,})\s*$/gm) ?? []
     assert.equal(topBorders.length, 2, `Expected 2 writing rules in one composer after deactivate, got ${topBorders.length}`)
   })
 
@@ -83,7 +83,7 @@ describe('Overlay deactivate · picker exit regression', () => {
     }
 
     const output = out.chunks.join('')
-    const topBorders = stripAnsi(output).match(/^[─━┄-]{3,}\s*$/gm) ?? []
+    const topBorders = stripAnsi(output).match(/^(?:[─━┄-]{3,}|[─━┄-] .+ [─━┄-]{2,})\s*$/gm) ?? []
     assert.equal(topBorders.length, 2, `Expected 2 writing rules in one composer after 3 cycles, got ${topBorders.length} — ghost accumulation`)
   })
 
@@ -95,7 +95,7 @@ describe('Overlay deactivate · picker exit regression', () => {
     app.deactivateOverlay()
 
     const output = out.chunks.join('')
-    const topBorders = stripAnsi(output).match(/^[─━┄-]{3,}\s*$/gm) ?? []
+    const topBorders = stripAnsi(output).match(/^(?:[─━┄-]{3,}|[─━┄-] .+ [─━┄-]{2,})\s*$/gm) ?? []
     assert.equal(topBorders.length, 2, `Expected 2 writing rules in one composer after connect exit, got ${topBorders.length}`)
     const plain = stripAnsi(output)
     assert.ok(plain.includes('❯'), 'Input prompt symbol ❯ must be present after connect overlay exit')

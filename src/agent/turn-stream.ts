@@ -47,6 +47,9 @@ export interface TurnStreamCallbacks {
   /** 出网请求体触发了体积护栏（截断历史工具输出 / 逼近上限）。必须可见：被截断的
    *  历史静默 = 「模型忘了我们刚做的事」，逼近上限在第三方中转上直接 400。 */
   onBodyGuard?: (info: BodyGuardNotice) => void
+  /** provider 层重试节流通知（429/503 退避可见性，dsh 式）——调用方经相位通道
+   *  瞬态呈现；缺省 = 不想要该可见性。 */
+  onRetryNotice?: (info: { category: string; attempt: number; maxAttempts: number; nextDelayMs: number }) => void
 }
 
 export interface TurnStreamDeps {
@@ -271,6 +274,9 @@ export class TurnStreamController {
       onContextBudget: publishBudget,
       onBodyGuard: (info) => {
         input.callbacks.onBodyGuard?.(info)
+      },
+      onRetryNotice: (info) => {
+        input.callbacks.onRetryNotice?.(info)
       },
       onStreamAttemptAborted: (info) => {
         const attemptId = info.attemptId ?? info.usage?.observation?.attemptId

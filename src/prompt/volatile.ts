@@ -114,7 +114,7 @@ export function renderPlanModeBlock(
 0. **建调研 todo** — 先用 \`todo\` 列出 3-6 个调研步骤（摸清各模块现状、外部调研、设计收敛），**最后一项固定为「汇总写计划并用 plan action=submit 提交审批」**；逐项勾掉推进。计划正文只进计划文件，不进 todo。
 1. **识别关键问题** — 先列出 2-3 个对计划至关重要的问题。不确定代码结构时，用 \`delegate_task\`（profile=code_scout）并行调研；独立问题并行派多个 worker。**多模块任务先并行调研**：用 \`delegate_batch\` 一次并行派 2-4 个只读 code_scout（按模块/文件域切分），汇总后再写计划——串行逐个调研浪费轮次。调研子纪律：① **理解"为什么存在"**——对每个拟删除/改行为的函数，读函数注释 / commit message / 相关测试回答它为什么存在、谁调用、有无只有它处理的边缘情况；② **水平复用扫描**——产生"需要新建 X"判断时，先 grep 整个 src/ 邻域，已有实现则方案收敛为"导出+连接"；③ **全量消费方枚举**——对每个拟修改/删除/导出的函数，grep 函数名列出**所有**调用点（文件:行号）逐一确认不破坏；④ **函数-调用方责任边界**——不要把调用链下游行为归因到纯函数，责任边界画错改谁都不对；⑤ **指标选择自检**——有效性判据用变换的 native 维度（行数/节点数/字段数）而非通用代理（字节数）。子代理只认 \`delegate_task\` / \`delegate_batch\`——不要调用 \`task\` / \`Agent\` 等非 Rivet 工具（会被自动映射）。
 2. **外部调研** — 涉及外部库/协议/最佳实践时，用 \`web_search\` / \`web_fetch\` 核实，不凭训练记忆下结论。
-3. **设计收敛** — 最多 2-3 个真正不同的方案；一个明显更优就只提一个。偏好/约束不明时用 \`ask_user_question\` 澄清。
+3. **设计收敛** — 最多 2-3 个真正不同的方案；一个明显更优就只提一个。偏好/约束不明时用 \`ask_user_question\` 澄清。有选项必须用工具结构化呈现，恰好一个标记 recommended: true 并填写 recommendation_reason（为何更符合用户目标及主要取舍），不要只在回复里列编号菜单。影响计划成立的未决问题先问清，再提交审批。
 4. **事实锚点核对（硬性）** — 写入计划前，计划引用的每个文件路径、符号、行号都必须用工具对当前源码核实过。项目内的文档、历史计划、记忆/约定文件描述的是**写下时的状态**，不是现状——涉及现状的断言（技术栈、框架、渲染路径、入口文件、目录结构）一律以当前源码为准，文档与源码冲突时信源码。scout 报告中引用文档得出的结论，必须自己对源码复核后才能写进计划。
 5. **写入计划** — 将完整**设计文档**写入活动计划文件（write_file / edit_file），成熟后用 \`plan action=submit\` 提交（可省略 plan 字段，从活动计划文件读取）。
 
@@ -142,7 +142,7 @@ flowchart LR
 - 包含根因分析，而非只描述表面症状
 - 用完整路径引用文件，如 \`src/agent/loop.ts:643\`
 - 每个文件给出提议代码（diff 或伪代码），不能只有文件路径或 "TODO"
-- 存在设计决策时，用表格对比备选方案；多方案时在 submit 的 \`options\` 参数中列出供用户选择
+- 存在设计决策时，用表格对比备选方案；多方案时在 submit 的 \`options\` 参数中列出供用户选择，恰好一个方案标记 recommended: true，并填写 recommendation_reason
 - **验证清单**（不是逐步命令剧本）：列出要测的用例名/场景、人工检查点、期望可见结果；不要写 \`\`\`bash\`\`\` / \`git commit\` 菜谱
 - **瑶光反证**：必须含**标题**带「反证」或「复现」的 ## 级章节（正文/列表里提到不算，submit 门禁）；关键断言 + file:line 或 run_tests 证据摘要；复现不了的标「待验证假设」
 - **分波结构（大计划硬性，submit 门禁）**：checkbox 任务 >8 或引用文件 >15 时，必须含 \`### Wave N\` 分波章节 + 每波验证命令
@@ -265,6 +265,7 @@ export interface ToolHistoryEntry {
 
 export interface VolatileContext {
   cwd: string
+  workspaceRoots?: readonly string[]
   /** 各 frozen 块的字符上限。缺省 = {@link FROZEN_BLOCK_CAPS}（standard 档）。
    *  由 block-policy 按 profile 缩放后经 createVolatileSnapshot 传入；
    *  会话内冻结，中途变更不生效。 */
@@ -1067,6 +1068,7 @@ function buildVolatileBlockInternal(ctx: VolatileContext): string {
   const targetPlatform = getTargetPlatform()
   const hostAttr = targetPlatform !== process.platform ? ` host="${process.platform}"` : ''
   parts.push(`<environment platform="${targetPlatform}"${hostAttr} cwd="${escapeXml(ctx.cwd)}" os="${escapeXml(`${os.type()} ${os.release()}`)}" />`)
+  if (ctx.workspaceRoots && ctx.workspaceRoots.length > 1) parts.push(`<workspace_roots primary="${escapeXml(ctx.cwd)}">\n${ctx.workspaceRoots.map(root => `<root>${escapeXml(root)}</root>`).join('\n')}\n</workspace_roots>`)
   if (targetPlatform !== process.platform) {
     parts.push(`<platform-note>文件约定（换行/路径风格）按 ${targetPlatform} 生成；但 shell 命令在宿主 ${process.platform} 上执行——优先使用跨平台命令，避免目标平台专属语法在宿主机执行失败。</platform-note>`)
   }

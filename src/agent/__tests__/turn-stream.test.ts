@@ -864,7 +864,8 @@ describe('native context budget observation', () => {
     const measured = seen[seen.length - 1]!
     assert.equal(measured.inputTokens, 600_000)
     assert.equal(measured.generatedTokens, 50_000)
-    assert.equal(measured.state, 'blocked')
+    // inputBudget 现为 1_000_000 − 256_000 − 50_000 = 694_000；600K/694K ≈ 0.865 → warning。
+    assert.equal(measured.state, 'warning')
     assert.equal(measured.source, 'measured')
   })
 })

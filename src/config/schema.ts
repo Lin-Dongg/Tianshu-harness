@@ -166,7 +166,7 @@ export type ProviderKeyConfig = z.infer<typeof providerKeySchema>
 
 /** Wire-protocol union — runtime list + TS type in one place so the zod enum,
  *  route validation and CLI parsing can never drift apart. */
-export const PROVIDER_PROTOCOL_VALUES = ['openai', 'anthropic', 'openai-responses'] as const
+export const PROVIDER_PROTOCOL_VALUES = ['openai', 'anthropic', 'openai-responses', 'gemini'] as const
 export type ProviderProtocol = (typeof PROVIDER_PROTOCOL_VALUES)[number]
 
 export const providerBaseSchema = z.object({
@@ -180,7 +180,12 @@ export const providerBaseSchema = z.object({
   /** Wire protocol of the endpoint. 'openai' = chat/completions-compatible;
    *  'anthropic' = /v1/messages with cache_control breakpoints;
    *  'openai-responses' = OpenAI Responses API (POST /v1/responses) — for
-   *  API-key endpoints that only speak the Responses format (issue #239).
+   *  API-key endpoints that only speak the Responses format (issue #239);
+   *  'gemini' = Google Gemini native generateContent/streamGenerateContent —
+   *  a different wire shape on every axis (path-carried model id,
+   *  x-goog-api-key auth, contents/parts instead of messages/content,
+   *  top-level systemInstruction, generationConfig, thought signatures), so it
+   *  cannot be reached through the OpenAI-compatible path.
    *  Factory dispatch is driven ONLY by this field — provider names and
    *  capability heuristics are not consulted. A provider NAMED 'anthropic'
    *  defaults to protocol 'anthropic'. */
@@ -188,7 +193,7 @@ export const providerBaseSchema = z.object({
   auth: authConfigSchema.nullable().optional(),
   capabilities: providerCapabilitiesSchema,
   fallback: z.array(z.string()).optional(),
-  /** Model to use when falling back to this provider (defaults to 'deepseek-v4-flash'). */
+  /** Model to use when falling back to this provider (defaults to 'deepseek-flash'). */
   fallbackModel: z.string().optional(),
   /** Allow strong/pro tier models to be used as fallback. Default false to avoid
    *  cold-start cache-miss cost on large-context pro models. */
@@ -612,7 +617,7 @@ export const agentSchema = z.object({
   greeting: z.object({
     /** When false, all greeting LLM calls are skipped (algorithm templates only). */
     enabled: z.boolean(),
-    /** Model ID for greeting generation (e.g. deepseek-v4-flash). */
+    /** Model ID for greeting generation (e.g. deepseek-flash). */
     model: z.string(),
   }).optional(),
   /** Goal autonomy (/goal & --goal) completion judge. */
@@ -651,7 +656,7 @@ export const compactSchema = z.object({
    *  — see resolveCompactProviderName(). Pair with `provider` to force a
    *  specific host. Without a resolvable provider+credentials, compaction
    *  uses the session's primary model (backward compatible). */
-  model: z.string().default('deepseek-v4-flash'),
+  model: z.string().default('deepseek-flash'),
   /** Provider hosting the compaction model (must exist in provider.providers).
    *  Optional: when omitted, the runtime infers a provider that lists `model`
    *  (preferring the session primary). Set explicitly to pin compaction onto
@@ -775,8 +780,7 @@ export const workerRoutingSchema = z.record(z.string(), z.string()).default({
   code_edit: 'cheap-flash',
   test_failure_diagnosis: 'cheap-flash',
   risky_refactor: 'cheap-flash',
-  // 规划模型独立路由：2026-08-02 起默认走 cheap-flash（deepseek-v4-flash）——
-  // v4-flash 能力实测已超 v4-pro，成本仅 1/3；需更强可在此键改 capable。
+  // 规划默认走 cheap-flash。2026-10-04 起该档官方模型是 deepseek-flash（DeepSeek 4.1 Flash）；需更强可改 capable。
   planning: 'cheap-flash',
 })
 

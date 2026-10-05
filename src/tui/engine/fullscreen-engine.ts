@@ -12,8 +12,8 @@ export interface MousePress {
   meta: boolean
 }
 export interface TerminalSize { cols: number; rows: number }
-const MOUSE_ON = '\x1b[?1002h\x1b[?1006h'
-const MOUSE_OFF = '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l'
+export const MOUSE_ON = '\x1b[?1002h\x1b[?1006h'
+export const MOUSE_OFF = '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l'
 
 /** The main frontend's sole alternate-buffer owner; overlays borrow its drawing surface. */
 export class FullscreenEngine {

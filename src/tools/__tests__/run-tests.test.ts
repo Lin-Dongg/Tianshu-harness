@@ -58,6 +58,30 @@ function setupPythonProject(options: { withTests?: boolean; withFakePytest?: boo
   return dir
 }
 
+/** dotnet 项目形态：无 package.json，tests/ 下只有 *.csproj（无任何 .py）。
+ *  这是缺陷①的现场（dotnet×pytest×无 bash 死锁）——tests/ 目录本身不是
+ *  Python 证据，判定必须落到「tests/ 下有 .py 文件」。 */
+function setupDotnetProject(): string {
+  const dir = makeTestDir('run-tests-dotnet-')
+  mkdirSync(join(dir, 'tests'), { recursive: true })
+  writeFileSync(join(dir, 'tests', 'SelfTest.csproj'), '<Project Sdk="Microsoft.NET.Sdk" />\n')
+  return dir
+}
+
+/** 无 marker 文件（pyproject/pytest.ini/tox.ini/setup.cfg 全缺）但 tests/ 下有
+ *  test_*.py 的合法 Python 项目——收紧 tests/ 条件后的防误伤正例。 */
+function setupUnmarkedPythonProject(): string {
+  const dir = makeTestDir('run-tests-python-unmarked-')
+  mkdirSync(join(dir, 'tests'), { recursive: true })
+  writeFileSync(join(dir, 'tests', 'test_example.py'), 'def test_ok():\n    assert 1 + 1 == 2\n')
+  const binDir = join(dir, 'node_modules', '.bin')
+  mkdirSync(binDir, { recursive: true })
+  const pytestPath = join(binDir, 'pytest')
+  writeFileSync(pytestPath, '#!/usr/bin/env node\nconsole.log("1 passed in 0.01s")\n')
+  chmodSync(pytestPath, 0o755)
+  return dir
+}
+
 /** 见 setupPythonProject 的注释：夹具是 POSIX-only，win32 上显式跳过并说明原因，
  *  而不是留一条永远红的用例。 */
 const FAKE_PYTEST_SKIP: string | false = process.platform === 'win32'
@@ -269,6 +293,54 @@ it('works', () => assert.equal(2 + 2, 4))`)
     }
   })
 
+  it('does not spawn pytest for a dotnet project even with a filter', async () => {
+    const dir = setupDotnetProject()
+    try {
+      // 死锁主路径（比无 filter 更危险）：带 filter 时 buildTestCommand 跳过
+      // `!filter && hasTests === false` 的 blocked 门，旧实现直接拼
+      // `pytest <filter>` 直连 spawn → Windows ENOENT（verifier 无 bash）。
+      const result = await RUN_TESTS_TOOL.execute(makeParams({ filter: 'SelfTest' }, dir))
+
+      assert.ok(!(result.verification!.command ?? '').startsWith('pytest'))
+      assert.notEqual(result.verification!.recommendedCommand, 'pytest')
+    } finally {
+      await rm(dir, { recursive: true, force: true, maxRetries: 15, retryDelay: 50 })
+    }
+  })
+
+  it('does not treat a dotnet tests/ directory as a Python project', async () => {
+    const dir = setupDotnetProject()
+    try {
+      // 缺陷①现场：tests/ 里只有 SelfTest.csproj 时旧判据判 Python →
+      // recommendedCommand=pytest → worker 直 spawn pytest → Windows ENOENT
+      // （verifier 无 bash，无旁路，工单直接 blocked）。
+      // 判据收紧为「tests/ 下含 .py」后不得再推荐或运行 pytest。
+      const result = await RUN_TESTS_TOOL.execute(makeParams({}, dir))
+
+      assert.notEqual(result.verification!.recommendedCommand, 'pytest')
+      assert.notEqual(result.verification!.command, 'pytest')
+      assert.ok(!(result.verification!.command ?? '').startsWith('pytest '))
+    } finally {
+      await rm(dir, { recursive: true, force: true, maxRetries: 15, retryDelay: 50 })
+    }
+  })
+
+  it('still detects an unmarked Python project from tests/*.py', { skip: FAKE_PYTEST_SKIP }, async () => {
+    const dir = setupUnmarkedPythonProject()
+    try {
+      // 防误伤：无 marker 文件、只有 tests/test_example.py —— 收紧后仍须判 pytest
+      // 并正常跑通（否则真实 Python 项目会被推给 unknown blocked 引导）。
+      const result = await RUN_TESTS_TOOL.execute(makeParams({}, dir))
+
+      assert.equal(result.isError, false)
+      assert.equal(result.verification!.command, 'pytest')
+      assert.equal(result.verification!.status, 'passed')
+      assert.equal(result.verification!.passed, 1)
+    } finally {
+      await rm(dir, { recursive: true, force: true, maxRetries: 15, retryDelay: 50 })
+    }
+  })
+
   it('unknown npm runner with filter does not synthesize npm test arguments', async () => {
     const dir = makeTestDir('run-tests-unknown-filter-')
     try {
@@ -363,14 +435,17 @@ it('works', () => assert.equal(2 + 2, 4))`)
       writeFileSync(join(dir, 'package.json'), JSON.stringify({
         name: 'ui-budget',
         scripts: {
-          test: `node -e "process.stdout.write('x'.repeat(25000))"`,
+          test: `node -e "process.stdout.write('x'.repeat(150000))"`,
         },
       }))
-      await RUN_TESTS_TOOL.execute({
+      const result = await RUN_TESTS_TOOL.execute({
         ...makeParams({}, dir),
         onOutput: (text: string) => chunks.push(text),
       })
 
+      assert.ok(result.displayOutput?.includes('x'.repeat(150000)), 'full display retains the head beyond the runner ring buffer')
+      assert.equal(result.displayOutputTruncated, false)
+      assert.equal(result.exitCode, 0)
       const visible = chunks.join('')
       const marker = '[stream output truncated]'
       assert.equal(visible.split(marker).length - 1, 1)

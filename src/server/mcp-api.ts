@@ -12,16 +12,15 @@ import type { RouteHandler } from './index.js'
 import { isAuthorizedRequest } from './auth.js'
 import { readFileSync } from 'node:fs'
 import { loadConfig, saveConfig, findProjectConfig } from '../config/manager.js'
-import { isProjectTrusted } from '../config/project-trust.js'
 import type { McpManager } from '../mcp/manager.js'
 import { mcpServerConfigSchema, type McpServerConfig } from '../mcp/config.js'
 import { MCP_PRESETS } from '../mcp/presets.js'
 import { serverLogger } from './logger.js'
 import type { Tool } from '../tools/types.js'
 import { findMcpOAuthProvider } from '../mcp/oauth/providers.js'
-import { startMcpOAuth, loadMcpOAuthToken, revokeMcpOAuth } from '../mcp/oauth/connector.js'
+import { beginMcpOAuth, loadMcpOAuthToken, revokeMcpOAuth } from '../mcp/oauth/connector.js'
 import type { McpOAuthToken } from '../mcp/oauth/types.js'
-import { isAbsolute, dirname } from 'node:path'
+import { isAbsolute } from 'node:path'
 
 function withAuth(handler: RouteHandler, apiToken?: string): RouteHandler {
   return async (body, params, headers, res) => {
@@ -44,24 +43,41 @@ function persistMcpServers(servers: Record<string, McpServerConfig>): void {
 }
 
 /**
- * 项目级 `mcp.servers` 是否因「项目未授信」被 loadConfig 剥离。
+ * 桌面端 MCP 面板的「项目里定义了 MCP 但列表里没有」解释器。
  *
- * 信任门（config/project-trust）对未授信项目剥离安全敏感键，`mcp.servers` 在
- * 剥离清单内（layered-config.test.ts 断言其长度为 0）。随后 `initializeMcp`
- * 第一行就因 `servers` 为空而整体跳过——终端用户看到的是「MCP 服务器全没了」，
- * 而 UI 上没有任何线索指向原因：剥离通知走 stderr（notifyUntrustedOnce），
- * 桌面端不可见。
+ * **桌面端不加载项目级 MCP**：serve.ts 的 MCP manager 全程用无参 `loadConfig()`
+ * （只读用户级配置），只有 CLI 路径（`loadConfig({ cwd })`）会经信任门合并项目层。
+ * 因此「未授信被剥离」只是项目 MCP 不在桌面端生效的子情形——**已授信时同样不加载**
+ * （2026-10-04 实测：未授信/已授信两态 `loadConfig().mcp.servers` 均为空，对照
+ * CLI 路径已授信才出现）。此前注释把用户反馈的「MCP 全没了」全部归因于未授信剥离
+ * ——该归因对本函数（桌面端）不成立，文案据此修正。
  *
- * 这里把事实暴露给 `GET /mcp/status`，让面板能直接说清「为什么是空的、怎么恢复」，
- * 而不是让用户和排查者对着空列表猜。返回 null = 无需提示（已授信 / 无项目配置 /
- * 项目里本就没有 MCP）。
+ * 检测到「项目配置里定义了 mcp.servers」时（**无论项目授信与否**），把
+ * {projectPath, serverCount} 暴露给 `GET /mcp/status`，面板据此解释空列表。
+ * 返回 null = 无需提示（无项目配置 / 项目里本就没有 MCP）。
+ *
+ * 修订（2026-10-05，提交后审查）：此前本函数在已授信时提前返回 null、面板侧
+ * 仅在 trust 数据不可得时渲染——两者叠加使「已授信项目面对空 MCP 列表」零提示。
+ * 现两处门控均移除：解释在任何信任状态下都可见。函数名/字段名「Stripped」
+ * 保留自历史语义（当时仅覆盖未授信剥离）。
+ *
+ * 若未来立项「桌面端支持项目级 MCP」，必须同步三件套：
+ *   ① sidecar spawn 设 RIVET_MCP_APPROVAL=gate（desktop/src-tauri/src/lib.rs
+ *      与 wsl_attach.rs 两处；当前未设 → fail-open 会吞掉连接级审批门）；
+ *   ② 连接级审批 UI 接线（McpSettings / client / types 三处；当前
+ *      McpServerStatus 联合里还没有 awaiting-approval / denied）；
+ *   ③ 本函数与 i18n（mcp.configStripped / trustNotice）的文案语义。
+ *
+ * 文案契约（见 desktop/src/components/__tests__/mcp-settings.test.ts）：i18n
+ * 不得承诺「/trust 可恢复项目 MCP」——该路径对桌面端不可达。
  */
 export function detectStrippedProjectMcp(
   cwd: string,
 ): { projectPath: string; serverCount: number } | null {
   const projectPath = findProjectConfig(cwd)
   if (!projectPath) return null
-  if (isProjectTrusted(dirname(projectPath))) return null
+  // 不设信任门控（2026-10-05）：桌面端不从项目层加载 MCP 与授信无关——
+  // 未授信/已授信都要解释，否则已授信项目面对空列表零提示（提交后审查 HIGH）。
   try {
     const raw = JSON.parse(readFileSync(projectPath, 'utf-8')) as {
       mcp?: { servers?: Record<string, unknown> }
@@ -84,13 +100,16 @@ export interface McpRouteDeps {
 export function buildMcpRoutes(
   getMcpManager: (() => McpManager | null) | McpRouteDeps,
   apiToken?: string,
-): Record<string, RouteHandler> {
-  // Backward-compatible: (getMgr, token) OR ({ getMcpManager, onToolsReady, apiToken })
+): Record<string, RouteHandler> {  // Backward-compatible: (getMgr, token) OR ({ getMcpManager, onToolsReady, apiToken })
   const deps: McpRouteDeps = typeof getMcpManager === 'function'
     ? { getMcpManager, apiToken }
     : getMcpManager
   const getMgr = deps.getMcpManager
   const token = deps.apiToken
+
+  /** 在途 OAuth 流程（serverId → 落定状态）。随路由器实例走——桌面 sidecar 单例，
+   *  测试里每个 router 各持一份互不串。 */
+  const mcpOAuthFlows = new Map<string, { error?: string; doneAt?: number }>()
   const onToolsReady = deps.onToolsReady
 
   const notifyTools = (mgr: McpManager, serverId: string) => {
@@ -143,9 +162,16 @@ export function buildMcpRoutes(
 
     // GET /mcp/presets — curated one-click MCP catalog + which ids are already
     // configured (mirrors provider `unconfigured` so the UI can render add state).
+    // OAuth 预设附带 clientIdHelp（providers.ts 的注册指引）——桌面端的授权表单
+    // 要拿它告诉用户去哪办 client id，单源在 providers.ts，这里只做投影。
     'GET /mcp/presets': withAuth(() => {
       const configuredIds = Object.keys(cloneMcpServers())
-      return { status: 200, body: { presets: MCP_PRESETS, configuredIds } }
+      const presets = MCP_PRESETS.map(p => {
+        if (p.auth?.type !== 'oauth') return p
+        const clientIdHelp = findMcpOAuthProvider(p.auth.provider)?.clientIdHelp
+        return clientIdHelp ? { ...p, clientIdHelp } : p
+      })
+      return { status: 200, body: { presets, configuredIds } }
     }, token),
 
     // POST /mcp/servers — add or update an MCP server config.
@@ -353,6 +379,10 @@ export function buildMcpRoutes(
     }, token),
 
     // POST /mcp/servers/:id/oauth/start — initiate OAuth flow for a preset MCP server.
+    // 立即返回 authUrl（前端 openExternal 打开授权页）；回调等待与换 token 在
+    // 后台跑，结果经 oauth/status 暴露给轮询方。此前本端点阻塞到流程完成才返回，
+    // 而 serveCallback 只把 URL 写 sidecar 的 stderr——桌面端用户永远看不到该开
+    // 哪个链接，OAuth 从桌面端实际不可达（2026-10-04 排查：GitHub 预设无法启用）。
     'POST /mcp/servers/:id/oauth/start': withAuth(async (body, params) => {
       const serverId = params?.id
       if (!serverId) return { status: 400, body: { error: 'server id is required' } }
@@ -371,29 +401,36 @@ export function buildMcpRoutes(
         return { status: 400, body: { error: `Unknown OAuth provider: ${authConfig.provider}` } }
       }
 
-      // startMcpOAuth blocks until the user completes browser auth — return authUrl
-      // for the frontend to open, but the actual flow runs server-side.
-      // For headless/CLI, the function handles localhost callback internally.
       try {
         const scopes = [...provider.defaultScopes, ...(authConfig.scopes ?? [])]
-        const token = await startMcpOAuth(serverId, provider, clientId, scopes)
-        return { status: 200, body: { ok: true, serverId, provider: token.provider, expiresAt: token.expiresAt } }
+        const { authUrl, completion } = await beginMcpOAuth(serverId, provider, clientId, scopes)
+        mcpOAuthFlows.set(serverId, {})
+        // 落定结果写回 flows 表供 status 轮询；catch 必须就地挂——否则超时/被拒
+        // 的 reject 会变 unhandled rejection。
+        completion.then(
+          () => mcpOAuthFlows.set(serverId, { doneAt: Date.now() }),
+          (err) => mcpOAuthFlows.set(serverId, { error: (err as Error).message }),
+        )
+        return { status: 200, body: { ok: true, serverId, authUrl } }
       } catch (err) {
         return { status: 500, body: { error: (err as Error).message } }
       }
     }, token),
 
-    // GET /mcp/servers/:id/oauth/status
+    // GET /mcp/servers/:id/oauth/status — connected（token 落盘且未过期）+ 在途流程状态。
     'GET /mcp/servers/:id/oauth/status': withAuth((_, params) => {
       const serverId = params?.id
       if (!serverId) return { status: 400, body: { error: 'server id is required' } }
       const token = loadMcpOAuthToken(serverId)
+      const flow = mcpOAuthFlows.get(serverId)
       return {
         status: 200,
         body: {
           connected: token !== null && token.expiresAt > Date.now(),
           provider: token?.provider,
           expiresAt: token?.expiresAt,
+          pending: !!flow && !flow.error && !flow.doneAt,
+          error: flow?.error,
         },
       }
     }, token),

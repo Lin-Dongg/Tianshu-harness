@@ -12,11 +12,12 @@
  * Anti-regression: without the cap, a model that keeps emitting the matched
  * command would loop until maxTurns, spamming identical reminders.
  */
-import { describe, it, mock } from 'node:test'
+import { after, describe, it, mock } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync } from 'node:fs'
+import { existsSync, mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { defaultRivetHome, projectSlug } from '../../config/paths.js'
 import { AgentLoop } from '../loop.js'
 import { SessionContext } from '../context.js'
 import { PromptEngine } from '../../prompt/engine.js'
@@ -26,6 +27,14 @@ import type { StreamCallbacks, StreamClient } from '../../api/stream-client.js'
 import type { ContentBlock } from '../../api/types.js'
 
 const TEST_CWD = mkdtempSync(join(tmpdir(), 'rivet-ttsr-cwd-'))
+// 直接 `node --test` 跑本文件时没有 run-node-tests 的 RIVET_HOME 隔离，loop 会把
+// cache-log / 信息素按 TEST_CWD 的 slug 写进真实 ~/.rivet/sessions。
+process.env.RIVET_SESSION_DIR = mkdtempSync(join(tmpdir(), 'rivet-ttsr-sessions-'))
+
+after(() => {
+  assert.equal(existsSync(join(defaultRivetHome(), 'sessions', projectSlug(TEST_CWD))), false,
+    '测试会话不得落进真实 ~/.rivet/sessions')
+})
 
 function makeToolUseBlock(id: string, command: string): ContentBlock {
   return { type: 'tool_use', id, name: 'bash', input: { command } }

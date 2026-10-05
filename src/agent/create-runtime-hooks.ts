@@ -210,7 +210,7 @@ export interface RuntimeHookDeps {
   /** Returns the original user task for MCTS planning. */
   getInitialUserMessage?: () => string | null
   /** Lightweight seed model call for MCTS planning branches. */
-  callAntiAnchoringSeedModel?: (prompt: string) => Promise<string>
+  callAntiAnchoringSeedModel?: (prompt: string, signal?: AbortSignal) => Promise<string>
   /** Observe MCTS planning result for diagnostics/tests. */
   onAntiAnchoringMCTSResult?: Parameters<typeof createMCTSPlanningHook>[0]['onResult']
 
@@ -719,9 +719,11 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
     }))
   }
 
-  // Probe Discipline: postTool hook — 诊断轮连续 ≥3 个只读工具而零探针 →
+  // Probe Discipline: postTool hook — 诊断轮连续 ≥5 个只读工具而零探针 →
   // 提示「30 秒探针能否杀死当前假设」。太一域洞察机制化（2026-08-07）。
-  // 冷却 8 次工具调用（防狂轰滥炸）；env RIVET_PROBE_DISCIPLINE=0 可关。
+  // 冷却 12 次工具调用（防狂轰滥炸）；env RIVET_PROBE_DISCIPLINE=0 可关。
+  // 阈值/冷却的单一事实源是 probe-discipline-hook.ts 的 PROBE_THRESHOLD /
+  // COOLDOWN_CALLS（2026-09-07 fdec8d858 由 3/8 调至 5/12），改值请同步本注释。
   if (deps.advisoryBus && process.env.RIVET_PROBE_DISCIPLINE !== '0') {
     hooks.push(createProbeDisciplineHook({ advisoryBus: deps.advisoryBus }))
   }

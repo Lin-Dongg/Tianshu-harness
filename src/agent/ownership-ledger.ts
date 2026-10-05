@@ -30,6 +30,13 @@ export interface OwnershipReport {
 
 export interface OwnershipLedger {
   registerOwned(filePath: string): void
+  /** Remove a path from all ownership sets — symmetric counterpart of
+   *  registerOwned for callers that drop a path (plan draft release in
+   *  loop.ts releasePlanModeArtifacts). Without it ownership outlives its
+   *  ledger event: the dropped path keeps appearing in owned-file lists and
+   *  delivery scope even though no write event backs it (8784b64b8 审查 P1；
+   *  指纹侧已与 ownership 解耦，此处残留影响仅限归属面本身）。 */
+  unregisterOwned(filePath: string): void
   /** Auto-populate owned files from TaskLedger write events */
   autoOwnFromLedger(): void
   /** Auto-classify unclassified dirty files by checking WorktreeBaseline.
@@ -77,6 +84,12 @@ export function createOwnershipLedger(opts: {
       return
     }
     ownedSet.add(filePath)
+  }
+
+  function unregisterOwned(filePath: string): void {
+    ownedSet.delete(filePath)
+    coOwnedSet.delete(filePath)
+    adoptedSet.delete(filePath)
   }
 
   function autoOwnFromLedger(): void {
@@ -189,6 +202,7 @@ export function createOwnershipLedger(opts: {
 
   return {
     registerOwned,
+    unregisterOwned,
     autoOwnFromLedger,
     autoOwnFromBaseline,
     adoptFiles,

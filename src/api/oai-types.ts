@@ -30,6 +30,8 @@ export type OaiContentPart = OaiTextPart | OaiImagePart
 export interface OaiUserMessage {
   role: 'user'
   content: string | OaiContentPart[]
+  /** Local-only provenance, persisted but removed before transport. */
+  origin?: import('../agent/input-origin.js').InputOrigin
 }
 
 /** Assistant message, optionally including tool calls and provider reasoning. */
@@ -225,6 +227,7 @@ export interface OaiChatRequest {
    *  (compaction summaries etc.) don't poison the baseline. Never serialized
    *  into the HTTP body. */
   prefixProbe?: boolean
+  diagnostics?: import('./continuation-prefix.js').RequestDiagnostics
 }
 
 /** Usage stats from OpenAI-compatible API responses. */
@@ -233,4 +236,11 @@ export interface OaiUsage {
   completion_tokens: number
   prompt_cache_hit_tokens?: number
   prompt_cache_miss_tokens?: number
+}
+
+/** Provenance is local storage metadata, never a provider parameter. */
+export function wireOaiMessage(message: OaiMessage): OaiMessage {
+  if (message.role !== 'user' || !message.origin) return message
+  const { origin: _origin, ...wire } = message
+  return wire
 }

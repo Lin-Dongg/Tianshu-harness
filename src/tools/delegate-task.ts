@@ -1,3 +1,4 @@
+import { workerDeliverySchema } from '../agent/work-order.js'
 import { z } from 'zod'
 import type { CoordinatorRun, DelegationRequest } from '../agent/coordinator.js'
 import type { ContextClaimStore } from '../context/claim-store.js'
@@ -68,6 +69,7 @@ const authorityStringSchema = z.string().refine(
 
 const delegateTaskInputSchema = z.object({
   objective: z.string().min(1),
+  delivery: workerDeliverySchema.optional(),
   kind: z.enum(['code_search', 'doc_research', 'plan', 'review', 'verify', 'patch_proposal']).optional(),
   profile: profileStringSchema.optional(),
   authority: authorityStringSchema.optional(),
@@ -135,8 +137,9 @@ export function createDelegateTaskTool(
         type: 'object',
         properties: {
           objective: { type: 'string', description: 'worker 的具体目标。' },
+          delivery: { type: 'string', enum: ['diagnosis', 'patch', 'verification'], description: '交付契约：diagnosis＝诊断、patch＝文件改动、verification＝实际执行测试；省略时沿用旧契约并保持 unknown。' },
           kind: { type: 'string', enum: ['code_search', 'doc_research', 'plan', 'review', 'verify', 'patch_proposal'], description: 'worker 任务类型。默认：code_search。' },
-          profile: { type: 'string', enum: profileRegistry.getProfileNames(), description: 'worker profile。默认：code_scout。' },
+          profile: { type: 'string', enum: profileRegistry.getProfileNames(), description: 'worker profile。默认：code_scout。能力按实际工具集合检查：adversarial_verifier 可运行 run_tests，其他只读档不能改文件。写文件声明 delivery=patch，实测声明 delivery=verification。' },
           authority: { type: 'string', description: '可选星域人格（如 tianquan、tianji、yuheng）。注入该专家的视角与方法论，并把工具限制在其白名单内。' },
           files: { type: 'array', items: { type: 'string' }, description: '可选，要聚焦的文件路径。' },
           symbols: { type: 'array', items: { type: 'string' }, description: '可选，要聚焦的符号。' },
@@ -198,6 +201,7 @@ export function createDelegateTaskTool(
         run = await coordinator.delegate({
           parentTurnId: params.toolUseId,
           objective: taskObjective,
+          delivery: parsed.data.delivery,
           kind: parsed.data.kind ?? 'code_search',
           profile: (parsed.data.profile ?? DEFAULT_DELEGATE_PROFILE) as import('../agent/work-order.js').WorkerProfile,
           authority: parsed.data.authority,
@@ -286,6 +290,7 @@ export function createDelegateTaskTool(
 
         return {
           content: run.packet,
+          presentation: { kind: 'worker_packet', bounded: true },
           uiContent: formatUiContent(run),
           isError: false,
         }

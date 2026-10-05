@@ -27,7 +27,9 @@ import type { DomainDriftResult } from './domain-drift-detector.js'
 export type ApprovalMode = 'auto-accept' | 'auto-safe' | 'manual' | 'dangerously-skip-permissions'
 
 export interface AgentConfig {
+  inputOrigin?: import('./input-origin.js').InputOrigin
   client: StreamClient
+  budgetSummaryClient?: () => StreamClient
   promptEngine: PromptEngine
   toolRegistry: ToolRegistry
   maxTurns: number
@@ -348,6 +350,15 @@ export interface DomainResolvedPayload {
   reason: 'keyword' | 'fallback'
 }
 
+export interface ToolDisplayEvidence {
+  command?: string
+  outputText?: string
+  outputTruncated?: boolean
+  images?: string[]
+  exitCode?: number
+  lossiness?: 'lossless' | 'truncated' | 'collapsed' | 'preview_only'
+}
+
 export interface AgentCallbacks {
   onContextBudget?: (budget: import('../server/protocol.js').ContextBudgetSnapshot) => void
   /** Await durable execution intent before a tool may produce side effects. */
@@ -355,19 +366,22 @@ export interface AgentCallbacks {
   onTextDelta: (text: string) => void
   onThinkingDelta: (thinking: string) => void
   onToolUse: (id: string, name: string, input: Record<string, unknown>) => void
-  onToolResult: (id: string, name: string, result: string, isError?: boolean, rawPath?: string, uiContent?: string) => void
-  /** 自动续轮原因（obligation-verification / action-intent / steer / goal-continuation）。
-   *  Additive wire field：仅当中间 turn 之后由系统注入提醒并继续运行时携带；
-   *  desktop 用它把“给系统的自检回复”与“给用户的交付文本”区分开。 */
-  onTurnComplete: (usage: Partial<Usage>, turnNumber: number, isFinal?: boolean, evidenceSummary?: EvidenceSummary, continuationReason?: string) => void
+  onToolResult: (id: string, name: string, result: string, isError?: boolean, rawPath?: string, uiContent?: string, evidence?: ToolDisplayEvidence) => void
+  /** 自动续轮原因（continuationReason，obligation-verification / action-intent /
+   *  steer / goal-continuation）。Additive wire field：仅当中间 turn 之后由系统注入
+   *  提醒并继续运行时携带；desktop 用它把“给系统的自检回复”与“给用户的交付文本”区分开。
+   *  stopReason：本轮流式收尾的停止原因——目前只在 'max_tokens'（输出被 token 上限
+   *  截断）时携带，消费方据此渲染「已被截断，发『继续』可续」提醒；正常 end_turn 不携带。 */
+  onTurnComplete: (usage: Partial<Usage>, turnNumber: number, isFinal?: boolean, evidenceSummary?: EvidenceSummary, continuationReason?: string, stopReason?: string) => void
   onError: (error: Error) => void
   /** 流错误终结本 run（超时/网络——非用户中断，AbortError 不走此回调）：server
    *  据此把会话终态记为 'interrupted' 而非 'completed'（2026-09-16 终态语义修复）。
    *  可选：轻量测试替身无需实现——缺省等价于修复前行为（completed）。 */
   onStreamInterrupted?: (error: Error) => void
-  /** 模型请求中断后**本轮重试**：在重发前触发，带上尝试序号。消费方据此把失败
-   *  尝试的未完成 partial 标为未完成并按尝试替换（避免与重试输出重复）。 */
-  onModelRetry?: (info: { attempt: number; maxAttempts: number }) => void
+  /** 模型请求中断后**本轮重试**：在重发前触发，带上尝试序号与分类信息。消费方据此把失败
+   *  尝试的未完成 partial 标为未完成并按尝试替换（避免与重试输出重复）；
+   *  category/message/nextDelayMs 让 UI 能说清「为什么断、等多久」（429 不再像卡住）。 */
+  onModelRetry?: (info: { attempt: number; maxAttempts: number; category?: string; message?: string; nextDelayMs?: number }) => void
   onAbort: (reason?: string) => void
   onApprovalRequired: (id: string, name: string, input: Record<string, unknown>) => Promise<ApprovalResult | boolean>
   onCheckpoint?: (hash: string) => void
@@ -386,6 +400,8 @@ export interface AgentCallbacks {
   ) => void
   /** Auto session domain resolved at the first bind; observability only. */
   onDomainResolved?: (payload: DomainResolvedPayload) => void
+  /** Actual domain after binding for this user run; observability only. */
+  onDomainUsed?: (key: string) => void
   /** Auto domain drift is user-facing observability only; it never changes model state. */
   onDomainDrift?: (drift: DomainDriftResult) => void
   /** R4 — structured course-correction signal surfaced to the desktop conversation. */

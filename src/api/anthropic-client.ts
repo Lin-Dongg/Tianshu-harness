@@ -1,3 +1,4 @@
+import { requestAuditContext } from './call-audit.js'
 import type { StreamClient, StreamCallbacks } from './stream-client.js'
 import type { OaiChatRequest, OaiMessage } from './oai-types.js'
 import { stripOaiImageParts } from './oai-types.js'
@@ -190,6 +191,7 @@ export class AnthropicClient implements StreamClient {
     let stripRequested = false
     let imagesStripped = false
 
+    const auditContext = requestAuditContext(this.config, request)
     await withStructuredRetry(async () => {
       // 剥图重发：只重建本次请求体，不动调用方的 messages（会话历史仍保图）。
       let wireMessages = request.messages
@@ -240,7 +242,7 @@ export class AnthropicClient implements StreamClient {
         },
         body: JSON.stringify(guard.body),
         signal: lifecycle.signal,
-      }, this.thinkingActive() ? 90_000 : 45_000, this.proxyDispatcher)
+      }, this.thinkingActive() ? 90_000 : 45_000, this.proxyDispatcher, auditContext)
 
       if (!response.ok) {
         const errorBody = await response.text().catch(() => '')

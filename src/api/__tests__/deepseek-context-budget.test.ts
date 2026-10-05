@@ -11,7 +11,7 @@ const callbacks = { onTextDelta: () => {}, onThinkingDelta: () => {}, onContentB
 test('final transport guard rejects an oversized request before fetch', async t => {
   let fetched = false
   t.mock.method(globalThis, 'fetch', async () => { fetched = true; throw new Error('network forbidden') })
-  await assert.rejects(new OpenAIClient(config).stream({ model: config.model, stream: true, messages: [{ role: 'user', content: 'x'.repeat(2_600_000) }] }, callbacks), { name: 'ContextBudgetExceededError' })
+  await assert.rejects(new OpenAIClient(config).stream({ model: config.model, stream: true, messages: [{ role: 'user', content: 'x'.repeat(4_000_000) }] }, callbacks), { name: 'ContextBudgetExceededError' })
   assert.equal(fetched, false)
 })
 
@@ -65,7 +65,8 @@ test('ordinary tool continuation keeps the outgoing prefix byte-for-byte identic
     { role: 'user', content: '<system-reminder>new progress</system-reminder>' }], tools }, callbacks)
   assert.equal(JSON.stringify(bodies[1].messages.slice(0, 3)), JSON.stringify(bodies[0].messages))
   assert.deepEqual(bodies[0].tools, bodies[1].tools)
-  assert.equal(bodies[1].max_tokens, 384_000)
+  // 官方 DeepSeek 单次输出封顶到现实预留（config.maxTokens=384K 被 cap 到 256_000）
+  assert.equal(bodies[1].max_tokens, 256_000)
   assert.equal('contextBudget' in bodies[1], false)
 })
 

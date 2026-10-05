@@ -58,6 +58,13 @@ export interface StreamCallbacks {
    *  truncated history silently reads as "the model forgot what we just did",
    *  and a near-limit body fails outright on relays. Optional. */
   onBodyGuard?: (info: BodyGuardNotice) => void
+  /** Called (throttled) when the client's internal structured retry waits before
+   *  re-sending after a rate_limit / overloaded rejection — the backoff can run
+   *  minutes, and a silent one reads as "stuck". Fired on the 1st retry and every
+   *  3rd after that; only those two categories. The caller is expected to surface
+   *  it transiently (phase line), not into history. Optional — absent means the
+   *  caller doesn't want retry visibility. */
+  onRetryNotice?: (info: { category: string; attempt: number; maxAttempts: number; nextDelayMs: number }) => void
 }
 
 /** Wire-level prefix divergence: how this request's FINAL bytes (after
@@ -92,4 +99,5 @@ export interface StreamClient {
   setThinking?(mode: 'enabled' | 'disabled'): void
   /** Consume-once accessor for the latest wire-level prefix divergence. Optional. */
   consumeWireDivergence?(): WireDivergence | null
+  getMainPrefixProof?(): import('./continuation-prefix.js').ContinuationPrefixProof | undefined
 }

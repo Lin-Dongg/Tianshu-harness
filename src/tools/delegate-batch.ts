@@ -1,3 +1,4 @@
+import { workerDeliverySchema } from '../agent/work-order.js'
 import { z } from 'zod'
 import { deriveWorkOrderId, type CoordinatorRun, type DelegationRequest } from '../agent/coordinator.js'
 import { aggregationPolicyKinds, aggregationPolicySchema, workOrderKindSchema, type AggregationPolicy } from '../agent/work-order.js'
@@ -72,6 +73,7 @@ const dependsOnEdgeSchema = z.object({
 
 const taskSchema = z.object({
   objective: z.string().min(1),
+  delivery: workerDeliverySchema.optional(),
   kind: workOrderKindSchema.optional(),
   profile: profileStringSchema.optional(),
   authority: authorityStringSchema.optional(),
@@ -191,8 +193,9 @@ export function createDelegateBatchTool(
               type: 'object',
               properties: {
                 objective: { type: 'string' },
+                delivery: { type: 'string', enum: ['diagnosis', 'patch', 'verification'] },
                 kind: { type: 'string', enum: [...workOrderKindSchema.options] },
-                profile: { type: 'string', enum: profileRegistry.getProfileNames() },
+                profile: { type: 'string', enum: profileRegistry.getProfileNames(), description: 'worker profile。默认：code_scout。能力按实际工具集合检查：adversarial_verifier 可运行 run_tests，其他只读档不能改文件。写文件声明 delivery=patch，实测声明 delivery=verification。' },
                 authority: { type: 'string', description: '可选星域人格（如 tianquan、tianji、yuheng）。' },
                 files: { type: 'array', items: { type: 'string' } },
                 symbols: { type: 'array', items: { type: 'string' } },
@@ -331,6 +334,7 @@ export function createDelegateBatchTool(
         return {
         parentTurnId: `${params.toolUseId}:batch:${i}`,
         objective: t.objective,
+        delivery: t.delivery,
         kind: t.kind ?? 'code_search',
         profile: (t.profile ?? DEFAULT_DELEGATE_PROFILE) as import('../agent/work-order.js').WorkerProfile,
         authority: t.authority,
@@ -483,7 +487,8 @@ export function createDelegateBatchTool(
 
         const passed = run.results.filter(r => r.status === 'passed').length
         return {
-          content: run.packet + trimmedNote,
+          content: trimmedNote ? trimmedNote.trim() + '\n\n' + run.packet : run.packet,
+          presentation: { kind: 'worker_packet', bounded: true },
           uiContent: `delegate_batch：${passed}/${run.results.length} 通过`,
           isError: false,
         }

@@ -57,7 +57,7 @@ describe('SessionContext OpenAI-native message storage', () => {
     ctx.addUserMessage('Hello')
 
     assert.deepEqual(ctx.getMessages(), [
-      { role: 'user', content: 'Hello' },
+      { role: 'user', content: 'Hello', origin: 'human' },
     ])
   })
 

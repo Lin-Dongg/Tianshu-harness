@@ -96,6 +96,18 @@ test('Auto emits one detailed resolution when keywords match', async () => {
   }])
 })
 
+test('actual domain observability reaches the callback on every run, including pinned and already-resolved Auto', async () => {
+  for (const defaultDomain of ['auto', 'tianliang']) {
+    const { agent, callbacks } = makeObservedAgent({ defaultDomain })
+    const used: string[] = []
+    callbacks.onDomainUsed = key => used.push(key)
+    await agent.run('对账插桩测量定位这个偏差', callbacks)
+    await agent.run('继续', callbacks)
+    assert.equal(used.length, 2)
+    assert.ok(used.every(key => key === (defaultDomain === 'auto' ? 'kaiyang' : 'tianliang')))
+  }
+})
+
 test('Auto emits one fallback resolution when no unique match exists', async () => {
   const resolutions = await observeDomainResolution('帮我看看', {
     defaultDomain: 'auto',

@@ -1,3 +1,5 @@
+import { createReportClientFactory } from '../api/report-client.js'
+import { currentWorkspaceRoots } from '../tools/workspace-context.js'
 /**
  * worker-runtime.ts — WorkerSessionConfig 的三分支组装（从 bootstrap runtimeFactory 抽出）。
  *
@@ -116,6 +118,7 @@ export function buildWorkerRuntime(
           providerName: ovProvider.name,
           baseUrl: ovProvider.baseUrl,
           slowThinking: ovProvider.slowThinking,
+          reportRepairClient: createReportClientFactory(ovProvider, ovCapabilities, { apiKey: ovApiKey, model: ovModel, auth: ovAuth, sessionId: wireSessionId }),
           client: createProviderClient(ovProvider, ovCapabilities, {
             apiKey: ovApiKey,
             model: ovModel,
@@ -134,6 +137,7 @@ export function buildWorkerRuntime(
           toolRegistry: workerRegistry,
           blockPolicy: blocks,
           cwd,
+          workspaceRoots: [...currentWorkspaceRoots(cwd)],
           maxTurns: 100,
           contextWindow: ovContextWindow,
           compact: { enabled: false, model: 'flash' },
@@ -184,7 +188,8 @@ export function buildWorkerRuntime(
         providerName: overrideResolved.providerName,
         baseUrl: overrideResolved.providerConfig.baseUrl,
         slowThinking: overrideResolved.providerConfig.slowThinking,
-        client: createProviderClient(
+        reportRepairClient: createReportClientFactory(overrideResolved.providerConfig, overrideCapabilities, { apiKey: overrideApiKey, model: overrideResolved.modelId, sessionId: wireSessionId }),
+          client: createProviderClient(
           overrideResolved.providerConfig,
           overrideCapabilities,
           {
@@ -205,6 +210,7 @@ export function buildWorkerRuntime(
         toolRegistry: workerRegistry,
         blockPolicy: blocks,
         cwd,
+        workspaceRoots: [...currentWorkspaceRoots(cwd)],
         maxTurns: 100,
         contextWindow: overrideContextWindow,
         compact: { enabled: false, model: 'flash' },
@@ -285,7 +291,8 @@ export function buildWorkerRuntime(
     providerName: workerProvider.name,
     baseUrl: workerProvider.baseUrl,
     slowThinking: workerProvider.slowThinking,
-    client: createProviderClient(workerProvider, workerCapabilities, {
+    reportRepairClient: createReportClientFactory(workerProvider, workerCapabilities, { apiKey: workerApiKey, model: workerModel, auth: workerAuth, sessionId: wireSessionId }),
+          client: createProviderClient(workerProvider, workerCapabilities, {
       apiKey: workerApiKey,
       model: workerModel,
       reasoningEffort: undefined,
@@ -305,6 +312,7 @@ export function buildWorkerRuntime(
     toolRegistry: workerRegistry,
     blockPolicy: blocks,
     cwd,
+    workspaceRoots: [...currentWorkspaceRoots(cwd)],
     maxTurns: 100,
     contextWindow: workerContextWindow,
     compact: { enabled: false, model: 'flash' },

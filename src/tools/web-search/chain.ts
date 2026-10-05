@@ -1,10 +1,13 @@
 import type { SearchBackend, SearchResult } from './types.js'
 import { fetchCauseDetail } from '../../api/error-classifier.js'
 import { OFF_TOPIC_ERROR, looksOffTopic } from './relevance.js'
+import { classifySearchError, type SearchFailureKind } from './errors.js'
 
 export interface BackendError {
   backend: string
   message: string
+  /** Present for thrown failures; empty/off-topic results are soft outcomes. */
+  errorKind?: SearchFailureKind
 }
 
 export interface ChainResult {
@@ -63,7 +66,11 @@ export async function runBackendChain(
       }
       errors.push({ backend: backend.name, message: 'no results' })
     } catch (err) {
-      errors.push({ backend: backend.name, message: describeError(err, timeoutMs) })
+      errors.push({
+        backend: backend.name,
+        message: describeError(err, timeoutMs, controller.signal.aborted),
+        errorKind: classifySearchError(err, controller.signal.aborted),
+      })
     } finally {
       clearTimeout(timeoutId)
     }
@@ -77,8 +84,8 @@ export async function runBackendChain(
   }
 }
 
-function describeError(err: unknown, timeoutMs: number): string {
-  if (err instanceof Error && err.name === 'AbortError') {
+function describeError(err: unknown, timeoutMs: number, timedOut: boolean): string {
+  if (timedOut) {
     return `timed out after ${timeoutMs / 1000}s`
   }
   const message = err instanceof Error ? err.message : String(err)

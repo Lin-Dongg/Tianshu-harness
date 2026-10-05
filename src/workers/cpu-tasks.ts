@@ -1,3 +1,6 @@
+import type { DelegationSnapshot } from './delegation-state.js'
+// @ts-ignore Native development workers load TypeScript directly.
+import { TailAccumulator } from './events-tail.ts'
 /**
  * CPU-bound pure functions offloaded to a worker_threads pool.
  *
@@ -85,6 +88,7 @@ export interface RawSessionEvent {
 /** 尾部读的回传形状——`events` 已按内存环容量截断，其余字段是「被截掉的头部
  *  里仍然需要的那点信息」，避免调用方为了拿它们而要求全量。 */
 export interface RawEventsTail {
+  delegationState?: DelegationSnapshot
   /** 尾部 maxEvents 条（日志更短时即全部）。 */
   events: RawSessionEvent[]
   /** 磁盘日志最早 seq（空日志为 0）——前端据此判断头部是否被截。 */
@@ -105,41 +109,10 @@ export interface RawEventsTail {
  * structured clone 的成本与条数成正比（实测 43,717 条 139ms / 5,000 条 14ms）。
  * 调用方拿到全量后立刻丢掉 90%，那份搬运是纯浪费——所以截断挪到这一侧做。
  */
-export function parseEventsTailRaw(text: string, maxEvents: number): RawEventsTail {
-  const all = parseEventsJsonlRaw(text)
-  if (all.length === 0) {
-    return { events: [], diskFirstSeq: 0, lastSeq: 0, artifactIds: [], total: 0 }
-  }
-  const artifactIds: string[] = []
-  for (const e of all) {
-    if (e.type === 'artifact') artifactIds.push(String(e.data.id))
-  }
-  return {
-    // delegation 事件豁免截尾（M1：stale 对账与回放依赖它们完整；被截尾的
-    // 早期 running 节点对账不可见，回放永久卡「运行中」）。与
-    // session-manager.trimEventRing 同语义——尾部窗口 + 保留 delegation。
-    events: tailExemptDelegation(all, maxEvents),
-    diskFirstSeq: all[0]!.seq,
-    lastSeq: all[all.length - 1]!.seq,
-    artifactIds,
-    total: all.length,
-  }
-}
-
-/** 保留尾部 maxEvents 条，但 delegation 事件永远保留（从头部淘汰普通事件）。 */
-function tailExemptDelegation(events: RawSessionEvent[], maxEvents: number): RawSessionEvent[] {
-  if (events.length <= maxEvents) return events
-  const overflow = events.length - maxEvents
-  const kept: RawSessionEvent[] = []
-  let dropped = 0
-  for (const e of events) {
-    if (dropped < overflow && e.type !== 'delegation') {
-      dropped++
-      continue
-    }
-    kept.push(e)
-  }
-  return kept
+export function parseEventsTailRaw(text: string, maxEvents: number, maxEventBytes?: number): RawEventsTail {
+  const tail = new TailAccumulator(maxEvents, maxEventBytes)
+  for (const line of text.split('\n')) tail.addLine(line)
+  return tail.finish()
 }
 
 export function parseEventsJsonlRaw(text: string): RawSessionEvent[] {

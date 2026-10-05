@@ -37,9 +37,12 @@ export interface PwConsoleMessage {
   text(): string
 }
 export interface PwKeyboard {
+  insertText?(text:string):Promise<void>
   press(key: string): Promise<void>
 }
 export interface PwPage {
+  close?():Promise<void>
+  setInputFiles?(selector:string,files:string[]|Array<{name:string;mimeType:string;buffer:Buffer}>):Promise<void>
   goto(url: string, opts: Record<string, unknown>): Promise<unknown>
   evaluate(expr: string): Promise<unknown>
   screenshot(opts: Record<string, unknown>): Promise<Buffer>

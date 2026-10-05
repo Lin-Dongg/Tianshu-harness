@@ -3,6 +3,13 @@ import assert from 'node:assert/strict'
 import { CoordinatorState } from '../coordinator-state.js'
 
 describe('CoordinatorState', () => {
+  it('final escalation emits the same blocked terminal delivery while preserving failure budget', () => {
+    const state = new CoordinatorState(1, { maxFailures: 2 })
+    assert.equal(state.recordFinalOutcome('failed', 'first').escalated, false)
+    assert.deepEqual(state.recordFinalOutcome('failed', 'second'), { escalated: true, consecutiveFailures: 2 })
+    assert.equal(state.getEvents().filter(e => e.workOrderId === 'second' && e.type !== 'escalated').at(-1)?.type, 'blocked')
+    assert.equal(state.recordFinalOutcome('passed', 'third').escalated, false)
+  })
   it('tracks worker lifecycle events', () => {
     const state = new CoordinatorState(2)
 

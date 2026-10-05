@@ -17,11 +17,12 @@
  * 键；读/列路径对旧格式（未编码原名）做回退——POSIX 平台的存量归档升级后
  * 仍可读；Windows 上旧格式从不曾以正常文件存在，回退在那里是空操作。
  */
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { subagentsDir } from '../config/paths.js'
 import { isSafeFileName, orderFileKey } from '../utils/safe-path.js'
 import { parseWorkerResult, type WorkerResult } from './work-order.js'
+import { writeWorkerFileAtomic } from './worker-history-store.js'
 
 /** LRU cap for result files under the subagents dir. */
 export const MAX_SUBAGENT_RESULTS = 500
@@ -77,24 +78,25 @@ export function evictOldSubagentResults(dir: string, limit = MAX_SUBAGENT_RESULT
  * 时代更早触顶；淘汰仍按最旧 mtime 优先，语义不变——最旧的轮次先死。
  * homeDir 仅供测试注入（与 loadPersistedResult 同例）。
  */
-export function persistWorkerResult(result: WorkerResult, fingerprint?: string, dispatchNonce?: string, homeDir?: string): void {
+export function persistWorkerResult(result: WorkerResult, fingerprint?: string, dispatchNonce?: string, homeDir?: string): boolean {
   try {
     const dir = coordinatorSubagentsDir(homeDir)
     mkdirSync(dir, { recursive: true })
     const json = JSON.stringify(result, null, 2)
     const key = orderFileKey(result.workOrderId)
-    writeFileSync(join(dir, `${key}.json`), json, 'utf-8')
+    if (!writeWorkerFileAtomic(join(dir, `${key}.json`), json)) return false
     if (dispatchNonce) {
-      writeFileSync(join(dir, `${key}.${dispatchNonce}.json`), json, 'utf-8')
+      if (!writeWorkerFileAtomic(join(dir, `${key}.${dispatchNonce}.json`), json)) return false
     }
     // T5: also write a fingerprint-indexed copy for resume lookup
     if (fingerprint) {
-      writeFileSync(join(dir, `${fingerprint}.json`), json, 'utf-8')
+      if (!writeWorkerFileAtomic(join(dir, `${fingerprint}.json`), json)) return false
     }
     // Keep the sink bounded — LRU-evict once it exceeds the cap.
     evictOldSubagentResults(dir)
+    return true
   } catch {
-    // Best-effort: never block primary session on persistence failure
+    return false
   }
 }
 

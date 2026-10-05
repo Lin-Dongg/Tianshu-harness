@@ -43,7 +43,7 @@ jobs:
       - run: npm run build
       - run: npm ci
         working-directory: vscode-extension
-      - run: node tests/smoke.e2e.ts
+      - run: node --import tsx tests/smoke.e2e.mts
         working-directory: vscode-extension
 
   # Release 时按平台矩阵出自包含运行时包（E2 ②级自举），挂到同一 Release。

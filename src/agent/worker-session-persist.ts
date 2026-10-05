@@ -1,17 +1,21 @@
-import { join, dirname, basename } from 'node:path'
-import { mkdirSync, writeFileSync, readFileSync, existsSync, renameSync, unlinkSync } from 'node:fs'
-import { randomBytes } from 'node:crypto'
+import type { ContinuationPrefixProof } from '../api/continuation-prefix.js'
+import { createHash } from 'node:crypto'
+import { stableStringify } from '../api/stable-json.js'
+import { parseFrozenSnapshotData, type FrozenSnapshotData } from '../prompt/frozen-snapshot.js'
+import { join } from 'node:path'
+import { mkdirSync, readFileSync, existsSync, unlinkSync } from 'node:fs'
 import { subagentsDir } from '../config/paths.js'
 import { orderFileKey } from '../utils/safe-path.js'
 import type { OaiMessage } from '../api/oai-types.js'
 import type { WorkerCheckpoint } from './worker-session.js'
+import { archiveWorkerHistory, readWorkerHistory, writeWorkerFileAtomic, type WorkerHistoryRef, type WorkerPersistenceOutcome } from './worker-history-store.js'
 
 /** Persisted worker session history — the full OaiMessage transcript from a
  *  completed worker run, so a later `resume` delegate_task can rebuild it.
  *
- *  v2 format (`format: 2`): adds an optional resume checkpoint and, on size
- *  overflow, `historyOmitted` recording the size limit that caused messages
- *  to be dropped. v1 records (no `format` field) still load — normalized to
+ *  v2 format (`format: 2`): adds a resume checkpoint and optional durable
+ *  history archive. Legacy `historyOmitted` records remain readable, but
+ *  cannot be resumed as a full execution. v1 records (no `format` field) still load — normalized to
  *  `format: 1`. */
 export interface WorkerSessionRecord {
   /** 1 = legacy pre-v2 record, 2 = current format. */
@@ -23,15 +27,16 @@ export interface WorkerSessionRecord {
   readonly savedAt: number
   /** Resume checkpoint captured from a previous run. Only present on v2. */
   readonly checkpoint?: WorkerCheckpoint
+  readonly frozenSnapshot?: FrozenSnapshotData
+  readonly prefixProof?: ContinuationPrefixProof
   /** Set when messages were dropped because the serialized record exceeded
    *  SESSION_HISTORY_SIZE_LIMIT. Value = the limit that was exceeded. */
   readonly historyOmitted?: number
+  readonly historyRef?: WorkerHistoryRef
 }
 
-/** Serialized-size ceiling for a persisted session record. When the full
- *  transcript exceeds this, messages are dropped wholesale (never sliced to a
- *  tail) and `historyOmitted` records the limit — only the checkpoint and
- *  metadata survive, so a resume still has somewhere to start from. */
+/** Inline serialized-size ceiling. Larger complete histories are archived
+ *  with a digest and atomically referenced; persistence failure is surfaced. */
 export const SESSION_HISTORY_SIZE_LIMIT = 1_000_000
 
 function workerSubagentsDir(homeDir?: string): string {
@@ -61,19 +66,7 @@ function legacySessionPath(workOrderId: string, homeDir?: string): string | null
  *  rename over the target. A reader never observes a partially-written record
  *  (rename is atomic on the same filesystem). Best-effort: on failure the temp
  *  file is cleaned up and the error is swallowed. */
-function writeAtomic(path: string, content: string): void {
-  const tmp = join(dirname(path), `.${basename(path)}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`)
-  try {
-    writeFileSync(tmp, content, 'utf-8')
-    renameSync(tmp, path)
-  } catch {
-    try {
-      unlinkSync(tmp)
-    } catch {
-      // temp file already gone — nothing left to clean up
-    }
-  }
-}
+const writeAtomic = writeWorkerFileAtomic
 
 function isFiniteNum(v: unknown): v is number {
   return typeof v === 'number' && Number.isFinite(v)
@@ -115,17 +108,19 @@ function parseWorkerRecord(value: unknown): WorkerSessionRecord | null {
     objective: o.objective,
     messages: o.messages as OaiMessage[],
     savedAt: o.savedAt,
+    ...(parseFrozenSnapshotData(o.frozenSnapshot) ? { frozenSnapshot: parseFrozenSnapshotData(o.frozenSnapshot) } : {}),
+    ...(validPrefixProof(o.prefixProof) ? { prefixProof: o.prefixProof } : {}),
     ...(o.checkpoint !== undefined ? { checkpoint: o.checkpoint as WorkerCheckpoint } : {}),
     ...(o.historyOmitted !== undefined ? { historyOmitted: o.historyOmitted as number } : {}),
+    ...(o.historyRef !== undefined ? { historyRef: o.historyRef as WorkerHistoryRef } : {}),
   }
   return record
 }
 
 /** Persist worker session history to ~/.rivet/subagents/<orderId>.session.jsonl.
  *  v2 format, written atomically (temp file + rename). If the serialized record
- *  exceeds SESSION_HISTORY_SIZE_LIMIT, messages are dropped wholesale and
- *  `historyOmitted` records the limit — the checkpoint (if any) is kept.
- *  Best-effort: never blocks the primary session on persistence failure. */
+ *  exceeds SESSION_HISTORY_SIZE_LIMIT, archive the complete messages first.
+ *  The caller must consume the outcome before advertising resumability. */
 export function saveWorkerSession(
   workOrderId: string,
   profile: string,
@@ -133,7 +128,8 @@ export function saveWorkerSession(
   messages: readonly OaiMessage[],
   homeDir?: string,
   checkpoint?: WorkerCheckpoint,
-): void {
+  continuation?: { frozenSnapshot?: FrozenSnapshotData; prefixProof?: ContinuationPrefixProof },
+): WorkerPersistenceOutcome {
   try {
     const dir = workerSubagentsDir(homeDir)
     mkdirSync(dir, { recursive: true })
@@ -145,27 +141,29 @@ export function saveWorkerSession(
       messages,
       savedAt: Date.now(),
       ...(checkpoint ? { checkpoint } : {}),
+      ...continuation,
     }
     let serialized = JSON.stringify(record)
     if (serialized.length > SESSION_HISTORY_SIZE_LIMIT) {
-      // Never slice a tail — drop messages wholesale, keep the checkpoint.
+      // The manifest stays small; the complete transcript remains recoverable.
       const trimmed: WorkerSessionRecord = {
         ...record,
         messages: [],
-        historyOmitted: SESSION_HISTORY_SIZE_LIMIT,
+        historyRef: archiveWorkerHistory(workerSessionPath(workOrderId, homeDir), messages),
       }
       serialized = JSON.stringify(trimmed)
     }
-    writeAtomic(workerSessionPath(workOrderId, homeDir), serialized + '\n')
-  } catch {
-    // Best-effort: never block primary session on persistence failure
+    if (!writeAtomic(workerSessionPath(workOrderId, homeDir), serialized + '\n')) throw new Error('worker session manifest write failed')
+    return { ok: true }
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) }
   }
 }
 
 /** Load a previously persisted worker session history.
  *  Returns null on cold miss, empty file, corrupt content, or structurally
- *  invalid records (fail-open) — callers must handle it (typically by
- *  degrading to a fresh worker). v1 records load unchanged (`format: 1`). */
+ *  invalid records. Explicit resume refuses execution on a missing record;
+ *  display reads may report unavailable. v1 records remain readable. */
 export function loadWorkerSession(workOrderId: string, homeDir?: string): WorkerSessionRecord | null {
   const candidates = [workerSessionPath(workOrderId, homeDir)]
   const legacy = legacySessionPath(workOrderId, homeDir)
@@ -176,7 +174,7 @@ export function loadWorkerSession(workOrderId: string, homeDir?: string): Worker
       const content = readFileSync(path, 'utf-8').trim()
       if (!content) continue
       const record = parseWorkerRecord(JSON.parse(content))
-      if (record) return record
+      if (record) return record.historyRef ? { ...record, messages: readWorkerHistory(path, record.historyRef) } : record
     } catch { /* corrupt — fall through to the legacy name once more */ }
   }
   return null
@@ -188,11 +186,12 @@ export function loadWorkerSession(workOrderId: string, homeDir?: string): Worker
  *  a later resume. If the rewrite fails, nothing is returned and the file is
  *  left untouched so a later consume can retry. Pure `loadWorkerSession` never
  *  consumes (display/transcript reads must not destroy a resume checkpoint). */
-export function consumeCheckpointOnce(workOrderId: string, homeDir?: string): WorkerCheckpoint | null {
+export function consumeCheckpointOnce(workOrderId: string, homeDir?: string, expectedSavedAt?: number, expectedGeneration?: string): WorkerCheckpoint | null {
   const record = loadWorkerSession(workOrderId, homeDir)
-  if (!record || record.checkpoint === undefined) return null
+  if (!record || record.checkpoint === undefined || (expectedSavedAt !== undefined && record.savedAt !== expectedSavedAt)) return null
+  if (expectedGeneration && createHash('sha256').update(stableStringify(record)).digest('hex') !== expectedGeneration) return null
   const { checkpoint, ...rest } = record
-  writeAtomic(workerSessionPath(workOrderId, homeDir), JSON.stringify(rest) + '\n')
+  if (!writeAtomic(workerSessionPath(workOrderId, homeDir), JSON.stringify({ ...rest, ...(record.historyRef ? { messages: [] } : {}) }) + '\n')) return null
   // 升级过渡：消费后清掉旧格式（未编码）副本——它是同一记录的陈旧拷贝，
   // 留着会让已消费的 checkpoint 在「新名文件丢失」的极端情形下复活（二次消费）。
   const legacy = legacySessionPath(workOrderId, homeDir)
@@ -200,4 +199,12 @@ export function consumeCheckpointOnce(workOrderId: string, homeDir?: string): Wo
     try { unlinkSync(legacy) } catch { /* already gone — fine */ }
   }
   return checkpoint
+}
+
+function validPrefixProof(value: unknown): value is ContinuationPrefixProof {
+  if (!value || typeof value !== 'object') return false
+  const p = value as ContinuationPrefixProof
+  return p.version === 1 && typeof p.provider === 'string' && typeof p.model === 'string'
+    && typeof p.requestId === 'string' && typeof p.optionsHash === 'string' && typeof p.toolsHash === 'string'
+    && Array.isArray(p.messages) && p.messages.every(m => typeof m.hash === 'string' && typeof m.role === 'string' && Number.isFinite(m.chars))
 }

@@ -1,3 +1,5 @@
+import { resolve } from 'node:path'
+import { isPathUnder } from '../../tools/path-grants.js'
 import type { ApprovalResult } from '../../agent/approval-edit.js'
 import type { RiskExplanation } from '../../agent/risk-explain.js'
 
@@ -17,7 +19,34 @@ export interface PendingApproval {
  * non-blocking timeline note with no pending state.)
  */
 export class ApprovalIntentController {
-  approvalPending: PendingApproval | null = null
+  private readonly approvals: PendingApproval[] = []
+
+  get approvalPending(): PendingApproval | null { return this.approvals[0] ?? null }
+  get approvalCount(): number { return this.approvals.length }
+  enqueue(approval: PendingApproval): void { this.approvals.push(approval) }
+  shift(): PendingApproval | undefined { return this.approvals.shift() }
+  drain(): PendingApproval[] { return this.approvals.splice(0) }
+  activateCurrent(cwd?: string): boolean {
+    const pending = this.approvalPending
+    if (!pending) return false
+    this.resetEditing()
+    this.showRememberOption = cwd !== undefined && approvalTargetsOutOfWorkspace(cwd, pending.name, pending.input)
+    return true
+  }
+
+  rejectAll(): void {
+    const pending = this.drain()
+    this.resetEditing()
+    for (const approval of pending) approval.resolve(false)
+  }
+
+  private resetEditing(): void {
+    this.editedInput = undefined
+    this.approvalEditMode = false
+    this.approvalEditError = ''
+    this.resetRiskExplanation()
+  }
+
   approvalEditMode = false
   approvalEditError = ''
   editedInput?: Record<string, unknown>
@@ -46,4 +75,27 @@ export class ApprovalIntentController {
     this.approvalOptionIndex = 0
     this.showRememberOption = false
   }
+}
+
+/**
+ * 审批的工具调用是否涉及工作区外路径（决定是否显示「批准并记住此目录」）。
+ * 与 tool-pipeline 的 outOfWorkspaceFilePaths 消费 remember 的工具集严格对齐：
+ * 只有这四个文件工具的批准会经 `resolved.remember` 持久化目录授权；其他工具
+ * （如 request_path_access，其 remember 是模型侧参数）显示了记住选项也不会
+ * 生效，宁可不显示也不给用户一个勾了没用的按钮。
+ */
+export function approvalTargetsOutOfWorkspace(cwd: string, toolName: string, input: Record<string, unknown>): boolean {
+  if (toolName !== 'read_file' && toolName !== 'write_file' && toolName !== 'edit_file' && toolName !== 'hash_edit') {
+    return false
+  }
+  const candidates: string[] = []
+  if (typeof input.file_path === 'string') candidates.push(input.file_path)
+  if (Array.isArray(input.file_paths)) {
+    for (const p of input.file_paths) if (typeof p === 'string') candidates.push(p)
+  }
+  // 两端都要 resolve 到同一「世界」：Windows 上 resolve(cwd, c) 产出 C:\…
+  // 绝对形式，而裸 cwd（POSIX 风格，如测试/配置里的 /workspace）归一后是
+  // \workspace——前缀判定必然 false，工作区内文件被误判为工作区外
+  // （审批误显示「批准并记住此目录」）。POSIX 上 resolve 恒等，行为不变。
+  return candidates.some(c => !isPathUnder(resolve(cwd), resolve(cwd, c)))
 }

@@ -12,7 +12,10 @@
  *
  * 注意：cost_in_cents 单位是**分**（不是元），展示时需 /100。
  */
+import { loadPlatformAuth } from './deepseek-platform-auth.js'
+export { loadPlatformAuth } from './deepseek-platform-auth.js'
 import { fetchWithTimeout } from './fetch-timeout.js'
+import { normalizeWalletSummary, normalizeKeyUsage, platformMonthRange } from './deepseek-platform-normalize.js'
 
 // ── 响应类型（从 exe 逆向的 serde 结构） ──────────────────────────
 
@@ -23,12 +26,13 @@ interface PlatformEnvelope<T> {
 }
 
 export interface DeepSeekUserSummary {
+  estimated_available_tokens?: number
   is_account_available: boolean
-  current_day_cost: number
-  current_month_cost: number
-  current_day_requests: number
-  flash_usage: number
-  pro_usage: number
+  current_day_cost?: number
+  current_month_cost?: number
+  current_day_requests?: number
+  flash_usage?: number
+  pro_usage?: number
   balance_info: {
     currency: string
     total_balance: number
@@ -79,29 +83,6 @@ function platformBaseUrl(baseUrl: string | undefined): string {
   return 'https://platform.deepseek.com'
 }
 
-/** Load persisted platform auth (from webview login). Returns null if not logged in. */
-export function loadPlatformAuth(): { token: string; cookies: string } | null {
-  try {
-    // Must match the path resolution used by config-routes.ts (which writes
-    // the file via rivetHome()). The previous implementation used
-    // `process.env.RIVET_HOME || ''`, which fell back to an empty string
-    // when RIVET_HOME was unset — causing filePath to resolve to the
-    // filesystem root (/deepseek-platform-auth.json) and silently miss the
-    // real file. Using rivetHome() guarantees read/write see the same path.
-    const { rivetHome } = require('../config/paths')
-    const { join } = require('node:path')
-    const filePath = join(rivetHome(), 'deepseek-platform-auth.json')
-    // Use dynamic require to avoid pulling fs into the browser bundle
-    const { existsSync, readFileSync } = require('node:fs')
-    if (!existsSync(filePath)) return null
-    const data = JSON.parse(readFileSync(filePath, 'utf-8')) as { token?: string; cookies?: string }
-    if (!data.token) return null
-    return { token: data.token, cookies: data.cookies ?? '' }
-  } catch {
-    return null
-  }
-}
-
 // ── 结果类型 ──────────────────────────────────────────────────────
 
 /**
@@ -118,6 +99,7 @@ export interface PlatformResult<T> {
   data: T | null
   failure?: PlatformFailure
   message?: string
+  httpStatus?: number
 }
 
 function fail<T>(failure: PlatformFailure, message?: string): PlatformResult<T> {
@@ -161,7 +143,7 @@ async function platformFetch(
   if (res.status === 401 || res.status === 403) {
     return fail('unauthorized', `平台返回 ${res.status}，凭证已失效`)
   }
-  if (!res.ok) return fail('network', `平台返回 HTTP ${res.status}`)
+  if (!res.ok) return { ...fail<unknown>('network', `平台返回 HTTP ${res.status}`), httpStatus: res.status }
   try {
     return { data: await res.json() }
   } catch (err) {
@@ -177,7 +159,11 @@ function unwrap<T>(result: PlatformResult<unknown>): PlatformResult<T> {
   if (result.data === null) return result as PlatformResult<T>
   const raw = result.data
   if (!raw || typeof raw !== 'object') return fail('malformed', '响应不是对象')
-  const outer = raw as PlatformEnvelope<PlatformEnvelope<unknown>>
+  const envelope = raw as { code?: number; data?: unknown }
+  if (typeof envelope.code === 'number' && envelope.code !== 0) {
+    return fail(envelope.code === 401 || envelope.code === 403 || envelope.code === BIZ_CODE_UNAUTHORIZED ? 'unauthorized' : 'malformed', `平台 code ${envelope.code}`)
+  }
+  const outer = (envelope.data ?? raw) as PlatformEnvelope<PlatformEnvelope<unknown>>
   if (typeof outer.biz_code === 'number' && outer.biz_code !== 0) {
     return outer.biz_code === BIZ_CODE_UNAUTHORIZED
       ? fail('unauthorized', 'biz_code 40003：平台未认证（需网页登录）')
@@ -186,7 +172,14 @@ function unwrap<T>(result: PlatformResult<unknown>): PlatformResult<T> {
   const inner = outer.biz_data
   if (!inner || typeof inner !== 'object') return fail('malformed', '响应缺少 biz_data')
   // 有些端点只有一层 biz_data（直接是 payload），有些有两层
+  const innerCode = (inner as PlatformEnvelope<unknown>).biz_code
+  if (typeof innerCode === 'number' && innerCode !== 0) {
+    return innerCode === BIZ_CODE_UNAUTHORIZED
+      ? fail('unauthorized', '平台登录已失效，请重新登录')
+      : fail('malformed', `平台 biz_code ${innerCode}`)
+  }
   const payload = (inner as PlatformEnvelope<unknown>).biz_data ?? inner
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return fail('malformed', '响应内容不是对象')
   return { data: payload as T }
 }
 
@@ -199,9 +192,19 @@ export async function getDeepSeekUserSummary(
   baseUrl: string | undefined,
   signal?: AbortSignal,
 ): Promise<PlatformResult<DeepSeekUserSummary>> {
-  return unwrap<DeepSeekUserSummary>(
+  const result = unwrap<DeepSeekUserSummary>(
     await platformFetch('/api/v0/users/get_user_summary', apiKey, baseUrl, signal),
   )
+  if (result.data && 'normal_wallets' in result.data) {
+    try { return { data: normalizeWalletSummary(result.data) } }
+    catch { return fail('malformed', '平台钱包响应格式异常') }
+  }
+  if (result.data && (!result.data.balance_info ||
+    ![result.data.current_day_cost, result.data.current_month_cost, result.data.current_day_requests,
+      result.data.balance_info.total_balance].every(value => typeof value === 'number' && Number.isFinite(value)))) {
+    return fail('malformed', '平台摘要响应格式异常')
+  }
+  return result
 }
 
 /**
@@ -217,10 +220,36 @@ export async function getDeepSeekCostReport(
   year: number,
   signal?: AbortSignal,
 ): Promise<PlatformResult<DeepSeekCostReport>> {
+  if (!Number.isInteger(month) || month < 1 || month > 12 || !Number.isInteger(year) || year < 1970 || year > 9999) {
+    return fail('malformed', '账单月份无效')
+  }
+  const legacy = await platformFetch(`/api/v0/usage/cost?month=${month}&year=${year}`, apiKey, baseUrl, signal)
+  const legacyPayload = unwrap<{ days?: unknown }>(legacy)
+  // Retired routes can return HTTP 200 with a business error or unrelated payload.
+  // Only a validated legacy report suppresses the current endpoint fallback.
+  if (legacy.httpStatus === 404 || legacy.httpStatus === 405 || legacyPayload.failure === 'malformed' ||
+      (legacyPayload.data && !Array.isArray(legacyPayload.data.days))) {
+    const range = platformMonthRange(month, year)
+    const query = `start=${range.start}&end=${range.end}&tz=${range.tz}`
+    const [amount, cost] = await Promise.all([
+      platformFetch(`/api/v0/usage/by_api_key/amount?${query}`, apiKey, baseUrl, signal).then(unwrap),
+      platformFetch(`/api/v0/usage/by_api_key/cost?${query}`, apiKey, baseUrl, signal).then(unwrap),
+    ])
+    if (!amount.data) return amount as PlatformResult<DeepSeekCostReport>
+    if (!cost.data) return cost as PlatformResult<DeepSeekCostReport>
+    try { return { data: normalizeKeyUsage(amount.data, cost.data, range.tz) } }
+    catch { return fail('malformed', '平台用量响应格式异常或币种不支持') }
+  }
   const result = unwrap<{ total: DeepSeekCostReport['total']; days?: DeepSeekModelCost[] }>(
-    await platformFetch(`/api/v0/usage/cost?month=${month}&year=${year}`, apiKey, baseUrl, signal),
+    legacy,
   )
   if (!result.data) return result as PlatformResult<DeepSeekCostReport>
+  if (!Array.isArray(result.data.days) || result.data.days.some(model =>
+    !model || typeof model.model !== 'string' || !Array.isArray(model.usage) || model.usage.some(entry =>
+      !entry || ![entry.total_tokens, entry.cost_in_cents, entry.input_cache_hit_tokens, entry.input_cache_miss_tokens,
+        entry.output_tokens, entry.request_count].every(value => typeof value === 'number' && Number.isFinite(value))))) {
+    return fail('malformed', '平台成本响应格式异常')
+  }
   return {
     data: {
       total: result.data.total ?? { cost_in_cents: 0, total_tokens: 0 },

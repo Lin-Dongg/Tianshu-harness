@@ -234,12 +234,10 @@ describe('coordinator 续跑冻结快照回传', () => {
       scope: { files: ['a.ts'] },
     })
 
-    assert.equal(captured.length, 4, '首轮 + 两次续跑 + 一次证据复核（findings 为空触发）')
+    assert.equal(captured.length, 3, '首轮 + 两次真实续跑；不为证据措辞复核')
     assert.equal(captured[0]!.priorFrozenSnapshot, undefined, '首轮无快照可继承')
     assert.deepEqual(captured[1]!.priorFrozenSnapshot, makeSnapshot('round1'), '第一次续跑继承首轮快照')
     assert.deepEqual(captured[2]!.priorFrozenSnapshot, makeSnapshot('round2'), '第二次续跑拿到覆盖后的新快照')
-    assert.deepEqual(captured[3]!.priorFrozenSnapshot, makeSnapshot('round3'), '证据复核继承第三轮快照')
-    assert.notEqual(captured[3]!.objective, captured[0]!.objective, '复核轮走 revision objective')
   })
 })
 
@@ -261,6 +259,7 @@ rl.on('line', (line) => {
         usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
         messages: [{ role: 'user', content: 'echo' }],
         frozenSnapshot: msg.payload.config.priorFrozenSnapshot,
+        prefixProof: msg.payload.config.priorPrefixProof,
         turnCount: 1,
       } })
       process.exit(0)
@@ -285,6 +284,7 @@ describe('OOP 协议面冻结快照往返', () => {
       spawnOverride: (_e, script) => spawn(process.execPath, [script], { stdio: ['pipe', 'pipe', 'pipe'] }),
     }
     const snapshot = makeSnapshot('wire')
+    const proof = { version: 1 as const, provider: 'deepseek', model: 'deepseek-v4-flash', requestId: 'previous', optionsHash: 'o', toolsHash: 't', messages: [{ hash: 'm', chars: 10, role: 'user' }] }
     const cfg = {
       order: { id: 'wo_echo', objective: 'echo', profile: 'code_scout', allowedTools: ['read_file'], budget: { maxTurns: 3, maxTokens: 1000, wallClockMs: 60_000, inputTokens: 10_000, outputTokens: 2_000 } } as unknown as WorkOrder,
       client: {} as WorkerSessionConfig['client'],
@@ -297,9 +297,11 @@ describe('OOP 协议面冻结快照往返', () => {
       runtimeDecision: { providerName: 'deepseek', model: 'deepseek-v4-flash', maxTokens: 4096, contextWindow: 64000, thinkingBudget: 4096, isWrite: false },
       activeClaims: [],
       priorFrozenSnapshot: snapshot,
+      priorPrefixProof: proof,
     } as WorkerSessionConfig
     const run = await runWorkerSessionOop(cfg, opts)
     assert.equal(run.result.status, 'passed')
+    assert.deepEqual(run.prefixProof, proof, '真实子进程协议不能丢续跑证明')
     assert.deepEqual(run.frozenSnapshot, snapshot, '快照经 init 帧到子进程、result 帧完整带回父进程')
   })
 

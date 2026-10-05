@@ -1,4 +1,5 @@
 import type { SearchBackend, SearchFetch, SearchResult } from './types.js'
+import { SearchHttpError } from './errors.js'
 import { decodeHtmlEntities } from './duckduckgo.js'
 
 /**
@@ -178,7 +179,7 @@ export class BingBackend implements SearchBackend {
       redirect: 'manual',
     })
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`)
+      throw new SearchHttpError(response.status)
     }
     const html = await response.text()
     return parseBingResults(html, count)

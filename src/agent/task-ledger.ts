@@ -14,6 +14,8 @@
  * @task B1-1
  */
 
+import { getEffectiveVerifications } from './verification-attribution.js'
+
 export type TaskLedgerEventType =
   | 'file_read'
   | 'file_write'
@@ -86,7 +88,7 @@ export interface TaskLedger {
   reset(): void
 }
 
-export function createTaskLedger(opts: { taskId: string }): TaskLedger {
+export function createTaskLedger(opts: { taskId: string; validateEvents?: (events: TaskLedgerEvent[]) => void }): TaskLedger {
   const events: TaskLedgerEvent[] = []
 
   function record(event: Omit<TaskLedgerEvent, 'timestamp'>): void {
@@ -94,6 +96,7 @@ export function createTaskLedger(opts: { taskId: string }): TaskLedger {
   }
 
   function getEvents(): ReadonlyArray<TaskLedgerEvent> {
+    opts.validateEvents?.(events)
     return events
   }
 
@@ -116,11 +119,12 @@ export function createTaskLedger(opts: { taskId: string }): TaskLedger {
   }
 
   function getVerifications(): ReadonlyArray<TaskLedgerEvent> {
+    opts.validateEvents?.(events)
     return events.filter(e => e.type === 'verification')
   }
 
   function getVerificationStatus(): DeliveryVerificationLevel {
-    const verifications = getVerifications()
+    const verifications = getEffectiveVerifications(getVerifications()).effective
     if (verifications.length === 0) {
       const writes = events.filter(e => e.type === 'file_write')
       return writes.length === 0 ? 'verified' : 'unverified'

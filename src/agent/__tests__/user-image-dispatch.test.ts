@@ -31,6 +31,12 @@ function visionClientThrowing(message: string) {
 }
 
 describe('dispatchUserImages', () => {
+  it('truncated descriptions stay visible but never enter the complete-description cache', async () => {
+    let cached = 0
+    const client = { stream: async (_request: unknown, cb: any) => { cb.onTextDelta('partial OCR'); cb.onStopReason('length', { output_tokens: 3 }) } } as StreamClient
+    const result = await dispatchUserImages('inspect', [IMG], { supportsVision: false, visionClient: client, registeredIds: ['img_1'], cacheDescription: () => { cached++ } })
+    assert.match(result.userInput, /图片描述被截断/); assert.equal(cached, 0)
+  })
   it('无图：原样返回（连引用都不换）', async () => {
     const out = await dispatchUserImages('hi', undefined, { supportsVision: false })
     assert.deepEqual(out, { userInput: 'hi', images: undefined })

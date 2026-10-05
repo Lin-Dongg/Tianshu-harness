@@ -20,6 +20,7 @@ import { applyPatchArgProcessor, APPLY_PATCH_POINTER_PREFIX } from '../apply-pat
 import { WRITE_FILE_TOOL } from '../write-file.js'
 import { EDIT_FILE_TOOL } from '../edit.js'
 import { HASH_EDIT_TOOL } from '../hash-edit.js'
+import { READ_FILE_TOOL } from '../read-file.js'
 import type { ToolCallParams } from '../types.js'
 
 const TEST_DIR = join(process.cwd(), '.test-tmp', 'pointer-guard-test')
@@ -232,6 +233,12 @@ describe('cross-tool pointer rejection', () => {
   it('hash_edit still accepts real new_string (guard is prefix-literal only)', async () => {
     const file = join(TEST_DIR, 'real.md')
     writeFileSync(file, 'old heading\nbody\n')
+    // 仅位置锚点（L1，无内容哈希）要求本会话存在**完整读取基线**——这是 hash-edit.ts
+    // 的位置锚点硬化契约（内容哈希 2026-10-04 起取代旧的 mtime 漂移警告，见
+    // read-file-invalidation.test.ts）。先 read_file 建立基线，本用例的判定面才
+    // 收敛到「指针守卫只做前缀字面量检查、不误伤真实内容」这一条。
+    const read = await READ_FILE_TOOL.execute(makeParams({ file_path: file }))
+    assert.ok(!read.isError, `baseline read must succeed: ${read.content}`)
     const result = await HASH_EDIT_TOOL.execute(makeParams({
       file_path: file,
       anchors: ['L1'],

@@ -3,7 +3,7 @@ import { strict as assert } from 'node:assert'
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir as osTmpdir } from 'node:os'
-import { detectProjectFingerprint } from '../project-fingerprint.js'
+import { detectProjectFingerprint, fingerprintToVerifyConfig } from '../project-fingerprint.js'
 
 function tmpdir() {
   return mkdtempSync(join(osTmpdir(), 'fingerprint-'))
@@ -144,6 +144,59 @@ describe('detectProjectFingerprint', () => {
       const fp = detectProjectFingerprint(dir)
       assert.equal(fp.language, 'unknown')
       assert.deepEqual(fp.externalAgentDocs, ['CLAUDE.md'])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('detects .NET project with a root .csproj', () => {
+    const dir = tmpdir()
+    try {
+      writeFileSync(join(dir, 'App.csproj'), '<Project Sdk="Microsoft.NET.Sdk" />\n')
+      const fp = detectProjectFingerprint(dir)
+      assert.equal(fp.language, 'dotnet')
+      assert.equal(fp.testCommand, 'dotnet test')
+      assert.equal(fp.buildCommand, 'dotnet build')
+      assert.equal(fp.typecheckCommand, undefined)
+      assert.equal(fp.lintCommand, undefined)
+      assert.equal(fp.hasTestInfra, true)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('detects .NET project with a root .sln', () => {
+    const dir = tmpdir()
+    try {
+      writeFileSync(join(dir, 'Solution.sln'), 'Microsoft Visual Studio Solution File\n')
+      const fp = detectProjectFingerprint(dir)
+      assert.equal(fp.language, 'dotnet')
+      assert.equal(fp.testCommand, 'dotnet test')
+      assert.equal(fp.hasTestInfra, true)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('mixed node+dotnet repo keeps Node as primary (detector order preserved)', () => {
+    const dir = tmpdir()
+    try {
+      writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts: { test: 'vitest run' } }))
+      writeFileSync(join(dir, 'App.csproj'), '<Project Sdk="Microsoft.NET.Sdk" />\n')
+      const fp = detectProjectFingerprint(dir)
+      assert.equal(fp.language, 'typescript')
+      assert.equal(fp.testCommand, 'npx vitest run')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('fingerprintToVerifyConfig surfaces dotnet commands', () => {
+    const dir = tmpdir()
+    try {
+      writeFileSync(join(dir, 'App.csproj'), '<Project Sdk="Microsoft.NET.Sdk" />\n')
+      const cfg = fingerprintToVerifyConfig(detectProjectFingerprint(dir))
+      assert.deepEqual(cfg, { test: 'dotnet test', build: 'dotnet build' })
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }

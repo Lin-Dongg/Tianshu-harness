@@ -474,3 +474,47 @@ describe('ownership-ledger — file ownership tracking', () => {
     })
   })
 })
+
+describe('unregisterOwned — 草稿/瞬态产物的对称清理（8784b64b8 审查 P1）', () => {
+  const make = () => {
+    const baseline = createWorktreeBaseline(baselineSnap)
+    const ledger = createTaskLedger({ taskId: 't1' })
+    return createOwnershipLedger({ baseline, taskLedger: ledger })
+  }
+
+  it('从 owned 集合删除（plan draft 释放路径的对称操作）', () => {
+    const ownership = make()
+    ownership.registerOwned('src/owned.ts')
+    assert.equal(ownership.isOwned('src/owned.ts'), true)
+
+    ownership.unregisterOwned('src/owned.ts')
+
+    assert.equal(ownership.isOwned('src/owned.ts'), false)
+    assert.equal(ownership.getOwnedFiles().includes('src/owned.ts'), false)
+  })
+
+  it('覆盖 co-owned 与 adopted 集合（跨会话认领后撤销）', () => {
+    const ownership = make()
+    // baselineSnap 的 preExistingDirty 成员 → registerOwned 会落进 co-owned 集合
+    ownership.registerOwned('src/external-dirty.ts')
+    assert.equal(ownership.isCoOwned('src/external-dirty.ts'), true)
+
+    ownership.unregisterOwned('src/external-dirty.ts')
+    assert.equal(ownership.isCoOwned('src/external-dirty.ts'), false)
+    assert.equal(ownership.isOwned('src/external-dirty.ts'), false)
+
+    // adopted 集合：adoptFiles 迁移后的条目同样要被 unregisterOwned 清掉
+    ownership.registerOwned('src/external-dirty.ts')
+    ownership.adoptFiles(['src/external-dirty.ts'])
+    assert.equal(ownership.isOwned('src/external-dirty.ts'), true, 'adopted 条目按 isOwned 语义可见')
+
+    ownership.unregisterOwned('src/external-dirty.ts')
+    assert.equal(ownership.isOwned('src/external-dirty.ts'), false, 'unregisterOwned 必须覆盖 adopted 集合')
+  })
+
+  it('对未注册路径幂等（不抛错）', () => {
+    const ownership = make()
+    ownership.unregisterOwned('never-registered.ts')
+    assert.equal(ownership.isOwned('never-registered.ts'), false)
+  })
+})

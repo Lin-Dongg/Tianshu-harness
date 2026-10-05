@@ -61,7 +61,8 @@ describe('handoff persist', () => {
     writeFileSync(join(tempDir, 'prev-diff-domain.handoff.md'), 'other domain handoff')
 
     const result = SessionPersist.loadPrevHandoff(tempDir, 'current-session', 'tianliang')
-    assert.equal(result, 'same domain handoff')
+    assert.ok(result?.startsWith('same domain handoff'))
+    assert.match(result!, /coverage: unknown/)
   })
 
   it('loadPrevHandoff falls back to most recent when current session has no domain', () => {
@@ -92,6 +93,7 @@ describe('handoff persist', () => {
     writeFileSync(join(tempDir, 'prev-older.handoff.md'), 'older handoff')
 
     const result = SessionPersist.loadPrevHandoff(tempDir, 'current-session')
-    assert.equal(result, 'newer handoff')
+    assert.ok(result?.startsWith('newer handoff'))
+    assert.match(result!, /coverage: unknown/)
   })
 })

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdirSync, writeFileSync, rmSync, readFileSync } from 'fs'
 import { join } from 'path'
 import { HASH_EDIT_TOOL } from '../hash-edit.js'
-import { markSessionFileEdit, wasFileEditedBySession, __resetSessionFileEditsForTests } from '../read-file.js'
+import { READ_FILE_TOOL, markSessionFileEdit, wasFileEditedBySession, __resetSessionFileEditsForTests } from '../read-file.js'
 import type { ToolCallParams } from '../types.js'
 
 // Use a directory inside the project tree so validatePath() doesn't reject
@@ -82,7 +82,7 @@ describe('hash_edit', () => {
   // is a dead end. The diagnostic must hand the model ready-to-use retry
   // anchors built from the CURRENT hashes it already computed.
 
-  it('stale diagnostic offers ready-to-use retry anchors with current hashes', async () => {
+  it('stale diagnostic requires semantic re-reading instead of substituting current hashes', async () => {
     const cwd = setup({
       'test.txt': 'line one\nline two\nline three\n',
     })
@@ -95,12 +95,10 @@ describe('hash_edit', () => {
     })
     const result = await HASH_EDIT_TOOL.execute(p)
     assert.equal(result.isError, true)
-    // Retry line substitutes the current hash for the stale anchor and keeps the valid one.
-    assert.ok(result.content.includes(`anchors: ["L1:${h('line one')}", "L3:${h('line three')}"]`),
-      `retry anchors missing or wrong: ${result.content}`)
-    // Steers re-location to grep, not read_file, and forbids replaying dead anchors.
+    assert.ok(!result.content.includes('anchors: ['))
+    assert.ok(result.content.includes('重新 read_file'))
+    assert.ok(result.content.includes('禁止只把旧行号的哈希换成当前值'))
     assert.ok(result.content.includes('grep'))
-    assert.ok(result.content.includes('read_file 不会输出哈希'))
     assert.ok(result.content.includes('不要再用已经用过的锚点重试'))
   })
 
@@ -133,6 +131,7 @@ describe('hash_edit', () => {
       anchors: [`L2:${h(lines[1]!)}`, `L3:${h(lines[2]!)}`],
       new_string: '',
     })
+    await READ_FILE_TOOL.execute({ ...p, input: { file_path: join(cwd, 'test.txt') } })
     const result = await HASH_EDIT_TOOL.execute(p)
     assert.equal(result.isError, undefined)
 
@@ -197,6 +196,7 @@ describe('hash_edit', () => {
       anchors: ['L2', 'L3'],
       new_string: 'replaced two\nreplaced three',
     })
+    await READ_FILE_TOOL.execute({ ...p, input: { file_path: join(cwd, 'test.txt') } })
     const result = await HASH_EDIT_TOOL.execute(p)
     assert.equal(result.isError, undefined)
     assert.ok(result.content.includes('将 L2-L3'))
@@ -231,6 +231,7 @@ describe('hash_edit', () => {
       anchors: [`L1:${h(lines[0]!)}`, 'L2'],
       new_string: 'new one\nnew two',
     })
+    await READ_FILE_TOOL.execute({ ...p, input: { file_path: join(cwd, 'test.txt') } })
     const result = await HASH_EDIT_TOOL.execute(p)
     assert.equal(result.isError, undefined)
 
@@ -240,7 +241,7 @@ describe('hash_edit', () => {
 
   // ── P0: position-only hard reject after session file edit ──
 
-  it('allows position-only anchors after session file edit (with warning)', async () => {
+  it('rejects position-only anchors without a fresh full read after session edit', async () => {
     const cwd = setup({ 'test.txt': 'line one\nline two\nline three\n' })
     const filePath = join(cwd, 'test.txt')
     markSessionFileEdit(filePath)
@@ -252,10 +253,9 @@ describe('hash_edit', () => {
       new_string: 'new one\nnew two',
     })
     const result = await HASH_EDIT_TOOL.execute(p)
-    assert.ok(!result.isError)
-    assert.ok(result.content.includes('fresh anchors') || result.content.includes('新鲜锚点'))
+    assert.equal(result.isError, true)
     const content = readFileSync(filePath, 'utf-8')
-    assert.equal(content, 'new one\nnew two\nline three\n')
+    assert.equal(content, 'line one\nline two\nline three\n')
   })
 
   it('full-hash anchors NOT blocked even after session file edit', async () => {
@@ -283,6 +283,7 @@ describe('hash_edit', () => {
     const cwd = setup({ 'test.txt': 'a\nb\nc\n' })
     const filePath = join(cwd, 'test.txt')
     assert.equal(wasFileEditedBySession(filePath), false)
+    await READ_FILE_TOOL.execute({ input: { file_path: filePath }, toolUseId: 'read-baseline', cwd })
 
     const p = params({
       file_path: filePath,

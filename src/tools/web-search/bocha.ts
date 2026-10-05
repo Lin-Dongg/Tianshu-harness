@@ -1,4 +1,5 @@
 import type { SearchBackend, SearchFetch, SearchResult } from './types.js'
+import { SearchHttpError } from './errors.js'
 
 const BOCHA_ENDPOINT = 'https://api.bochaai.com/v1/web-search'
 
@@ -61,7 +62,7 @@ export class BochaBackend implements SearchBackend {
       body: JSON.stringify({ query, count, summary: true }),
     })
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`)
+      throw new SearchHttpError(response.status)
     }
     const data = (await response.json()) as BochaResponse
     // 博查业务错误（如 key 无效）HTTP 可能仍 200，靠 code/msg 兜底判败

@@ -503,7 +503,9 @@ async function finalizeEdit(
     if (restored) {
       try {
         const s = await stat(filePath)
-        noteFileObserved(filePath, s.mtimeMs, s.size, sessionId)
+        // 回滚恢复的就是编辑前内容：带上 before 重建内容哈希基线——否则
+        // hash_edit 的位置锚点检查（要求完整观察且内容未变）会因 mtime 变化误报。
+        noteFileObserved(filePath, s.mtimeMs, s.size, sessionId, before)
       } catch { /* stat 失败不影响主流程 */ }
     }
     const fails = incrementEditFailCount(filePath)

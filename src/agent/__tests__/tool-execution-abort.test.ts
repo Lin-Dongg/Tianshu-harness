@@ -2,6 +2,7 @@ import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { ToolExecutionController, type ToolExecutionDeps, type ToolExecBatchInput } from '../tool-execution.js'
 import { createPredictionAccumulator } from '../prediction-error.js'
+import { makeApp } from '../../tui/engine/__tests__/_harness.js'
 import { createTurnBudget } from '../turn-budget.js'
 
 /**
@@ -24,11 +25,13 @@ import { createTurnBudget } from '../turn-budget.js'
  * object identity.
  */
 describe('ToolExecutionController abort-signal threading', () => {
-  function makeController(captured: { signal?: AbortSignal | undefined }, concurrencySafe: boolean) {
+  function makeController(captured: { signal?: AbortSignal | undefined }, concurrencySafe: boolean, needsApproval = false, executed?: string[]) {
     const deps = {
       config: {
+        approvalMode: 'manual',
         toolRegistry: {
           execute: async (_name: string, params: any) => {
+            executed?.push(String(params.input.label))
             captured.signal = params.abortSignal
             return { content: 'ok', isError: false }
           },
@@ -37,7 +40,7 @@ describe('ToolExecutionController abort-signal threading', () => {
             isConcurrencySafe: () => concurrencySafe,
             timeoutMs: () => 5000,
           }),
-          needsApproval: () => false,
+          needsApproval: () => needsApproval,
           resolveName: (n: string) => n,
         },
         hooks: null,
@@ -98,6 +101,53 @@ describe('ToolExecutionController abort-signal threading', () => {
       latestRisk: { level: 'none', reasons: [], suggestedAction: '' } as any,
     }
   }
+
+  for (const parallel of [false, true]) it(`aborted ${parallel ? 'parallel' : 'sequential'} tools cannot emit late decision requests`, async () => {
+    const controller = makeController({}, parallel)
+    const deps = (controller as any).deps as ToolExecutionDeps
+    let emitted = 0, entered!: () => void, release!: () => void
+    deps.onPlanSubmitted = () => { emitted++ }
+    deps.onAskUserQuestion = () => { emitted++ }
+    const started = new Promise<void>(r => { entered = r })
+    const waiting = new Promise<void>(r => { release = r })
+    ;(deps.config.toolRegistry as any).execute = async (_: string, params: any) => {
+      entered(); await waiting
+      params.onPlanSubmitted?.({ slug: 'late', title: 'late', requestId: 't1' })
+      params.onAskUserQuestion?.({ requestId: 't1', questions: [{ prompt: 'late', id: 'q', options: [], allowMultiple: false }] })
+      return { content: 'ok' }
+    }
+    const ac = new AbortController()
+    const batch = controller.executeBatch(makeInput(ac.signal))
+    await started; ac.abort(); release(); await batch
+    assert.equal(emitted, 0, 'callback must use the originating batch signal, not a new UI generation')
+  })
+
+  it('real parallel batch waits for both FIFO approvals and executes edited input', async () => {
+    const { app, stdin } = makeApp()
+    const executed: string[] = []
+    const controller = makeController({}, true, true, executed)
+    const input = makeInput(new AbortController().signal)
+    input.toolUses = [
+      { id: 'a', name: 'demo_tool', input: { label: 'a' } },
+      { id: 'b', name: 'demo_tool', input: { label: 'b' } },
+    ]
+    input.callbacks = { ...app.callbacks, onToolResult: () => {} } as any
+    try {
+      let settled = false
+      const batch = controller.executeBatch(input).then(r => { settled = true; return r })
+      await new Promise(r => setImmediate(r))
+      assert.equal((app as any).approvalIntentController.approvalCount, 2)
+      stdin.dataHandler!('e')
+      ;(app as any).inputLine.setValue(JSON.stringify({ label: 'edited-a' }))
+      stdin.dataHandler!('\r')
+      stdin.dataHandler!('y')
+      await new Promise(r => setImmediate(r))
+      assert.equal(settled, false, 'batch cannot finish while the second approval is pending')
+      stdin.dataHandler!('n')
+      await batch
+      assert.deepEqual(executed, ['edited-a'], 'only the approved tool runs with the reviewed input')
+    } finally { app.dispose() }
+  })
 
   it('threads input.abortSignal into the parallel (concurrency-safe) tool path', async () => {
     const captured: { signal?: AbortSignal | undefined } = {}

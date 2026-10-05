@@ -8,11 +8,10 @@
  *     - budget<=0 → 原样返回（空闲塌回）。
  *  2. TuiApp 活动期（thinking/streaming）连续帧的 live region 总 display rows
  *     恒定 —— 输入框屏幕坐标不随字符增长浮动。
- *  3. 空闲期与活动期同口径（高水位跨轮保留）——高度单调不缩，输入框不来回弹。
+ *  3. 活动期合并绘制；空闲与菜单关闭允许回缩，不跨轮预留空白。
  *  4. 小终端（rows=10）预算收缩，live region 不超屏。
  *  5. liveMaxRowsFor 终端高度感知（min(28, rows-1)，下限 4）。
- *  6. 半屏缓解阈值 <32：30 行窗口 cap=ceil(30/2)=15（峰值预留不吃掉半屏以上），
- *     32 行窗口回到常规 cap 28。
+ *  6. 普通区域最多半屏，审批与菜单可临时扩容。
  */
 
 import { test } from 'node:test'
@@ -136,7 +135,7 @@ test('streaming 文本增长期间同样只涨不缩', async () => {
   assert.ok(heights[heights.length - 1]! < 28, `heights=${heights.join(',')}`)
 })
 
-test('turn 结束（isFinal）后高度不回缩——回缩即输入框上跳、屏底露黑洞', async () => {
+test('turn 结束后移除空白预留，只留下输入 chrome', async () => {
   const { app } = makeApp({ cols: 80, rows: 40 })
   app.callbacks.onThinkingDelta('思考中……\n')
   await flush()
@@ -147,18 +146,11 @@ test('turn 结束（isFinal）后高度不回缩——回缩即输入框上跳�
   await flush()
   const idle = liveRows(app)
 
-  // clearForCommit 按旧高度擦到屏末，commit 正文 + 新 region 填不满差额 —— 缩多少
-  // 就在输入框下方露多少行黑。空闲期动态内容归零不等于预算可以归零。
-  assert.ok(idle >= active, `轮末高度回缩: idle=${idle} active=${active}`)
+  // 空闲期不再为旧动态帧保留空白。
+  assert.ok(idle < active, `轮末应回缩: idle=${idle} active=${active}`)
 })
 
-/**
- * 来回弹的回归闸。两种归零策略都栽在这里：空闲期 budget 归零 → 落差 = 本轮动态
- * 内容峰值（40 行终端实测 23 行，region 5 ↔ 28）；空闲期恒垫 ceiling → 落差挪到
- * 下一轮提交时刻，照样弹。此前无测试锚定「轮间高度」，两种策略各自的单点断言都
- * 能全绿。
- */
-test('连续多轮 live region 高度单调不缩——输入框不在屏底与屏中来回弹', async () => {
+test('连续多轮只在活动期扩容，空闲高度保持一致', async () => {
   const { app } = makeApp({ cols: 80, rows: 40 })
   const priv = app as unknown as {
     setPhase: (p: string) => void
@@ -189,9 +181,9 @@ test('连续多轮 live region 高度单调不缩——输入框不在屏底与�
     heights.push(liveRows(app))
   }
 
-  // 只断言不回缩：回缩才是上跳。高度可以单向长到 ceiling（不超屏由别处保证），
-  // 长出来的部分是下一轮的预留位，不是抖动。
-  assertNoShrink(heights)
+  const idle = heights.filter((_, i) => i % 3 === 2)
+  assert.ok(idle.every(height => height === idle[0]), `idle=${idle}`)
+  assert.ok(heights.every(height => height <= 20), `heights=${heights}`)
 })
 
 test('首帧走自然流，不补空行撑底（凭空造的空白只能堆在欢迎屏某一侧，比自然流更难看）', async () => {
@@ -229,7 +221,7 @@ test('30 行窗口：高水位压到半屏（cap=15）——峰值预留不吃�
   assert.equal(liveRows(app), 15, `30 行窗口 live region 应恰好等于半屏 cap: ${liveRows(app)}`)
 })
 
-test('32 行窗口（阈值边界上沿）：回到常规 cap 28，不受半屏限制', () => {
+test('32 行窗口同样限制普通高水位为半屏', () => {
   const { app } = makeApp({ cols: 80, rows: 32 })
   const priv = app as unknown as {
     getDynamicBudget: (chromeRows: number, dynamicRows: number) => number
@@ -238,7 +230,7 @@ test('32 行窗口（阈值边界上沿）：回到常规 cap 28，不受半屏�
   }
   priv.agentBusy = true
   priv.setPhase('thinking')
-  assert.equal(priv.getDynamicBudget(6, 20), 20)
+  assert.equal(priv.getDynamicBudget(6, 20), 10)
 })
 
 test('半屏 cap 不截掉审批状态行：rows=30 审批挂起时「等待审批」仍可见', async () => {
@@ -249,12 +241,7 @@ test('半屏 cap 不截掉审批状态行：rows=30 审批挂起时「等待审�
   assert.ok(frame.includes('等待审批 read_file'), '半屏 cap 下审批状态行不得被截掉')
 })
 
-/**
- * chrome（slash 提示、权限行、todo 面板）涨缩时，旧实现只高水位「动态段」，
- * 总高度 = 动态高水位 + 当前 chrome —— chrome 一关，输入框就上跳。
- * 用户观感：有时钉在屏底，有时又浮起来。总高度必须只涨不缩。
- */
-test('欢迎页 slash 开合后高度不回缩——输入框下落一次后钉住，取消不再弹回', async () => {
+test('欢迎页 slash 关闭后释放菜单预留', async () => {
   const { app } = makeApp({ cols: 80, rows: 24 })
   app.setSlashCommands(
     Array.from({ length: 8 }, (_, i) => ({
@@ -276,12 +263,12 @@ test('欢迎页 slash 开合后高度不回缩——输入框下落一次后钉�
   await flush()
   const closed = liveRows(app)
   assert.ok(
-    closed >= open,
-    `欢迎页取消 slash 后高度回缩（输入框上弹）: closed=${closed} open=${open} idle=${idle}`,
+    closed < open,
+    `欢迎页取消 slash 后应释放预留: closed=${closed} open=${open} idle=${idle}`,
   )
 })
 
-test('slash 提示开合时 live region 高度不回缩（输入框不上跳）', async () => {
+test('活动期 slash 关闭后回落半屏预算', async () => {
   const { app } = makeApp({ cols: 80, rows: 24 })
   app.setSlashCommands(
     Array.from({ length: 8 }, (_, i) => ({
@@ -302,8 +289,10 @@ test('slash 提示开合时 live region 高度不回缩（输入框不上跳）'
   app.setInput('')
   await flush()
   const closed = liveRows(app)
+  // 关闭态回落到半屏预算内（菜单扩容的预留不得滞留）。chrome 轻量时菜单把动态段
+  // 挤到 0，open 本身即半屏下界——故"回落"以半屏为界，而非严格小于 open。
   assert.ok(
-    closed >= open,
-    `slash 关闭后高度回缩（输入框上跳）: closed=${closed} open=${open} before=${before}`,
+    closed <= Math.ceil(24 / 2),
+    `slash 关闭后应回落到半屏预算内: closed=${closed} open=${open} before=${before}`,
   )
 })

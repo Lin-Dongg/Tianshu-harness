@@ -21,6 +21,9 @@
  *   drop image_url parts from the request. The model answering that turn never
  *   saw the images; without a visible line the user reads it as "the model
  *   ignored my screenshot". See issue #94.)
+ * - model-retry (turn-orchestrator — provider 层 withStructuredRetry 的 429/503
+ *   退避通知，已节流：第 1 次与之后每 3 次。退避可能持续分钟级，静默会被读成
+ *   「卡住」；瞬态相位不进历史。)
  */
 export function phaseStatusLabel(
   phase: string,
@@ -35,6 +38,8 @@ export function phaseStatusLabel(
     case 'stop-reason': return detail?.reason ?? null
     case 'image-stripped': return detail?.reason ?? null
     case 'body-guard': return detail?.reason ?? null
+    case 'model-retry': return detail?.reason ?? null
+    case 'compact-blocked': return detail?.reason ?? null
     case 'convergence-warning':
       return detail?.reason
         ? `⚠ AI 近几轮无明显进展，已建议切换策略；若再无改善将自动中断`

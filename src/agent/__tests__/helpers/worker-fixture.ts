@@ -29,6 +29,11 @@ export function makeWorkerConfig(
       budget: { timeoutMs: 60_000, maxRetries: 1, maxTurns: 2, maxTokens: 2048 },
     }),
     client: (over.client ?? makeNoopClient()) as StreamClient,
+    // e3819d6dc 把「报告修复」拆成独立通道（生产侧由 worker-runtime 的
+    // createReportClientFactory 供给）。测试 fixture 没有独立通道，默认复用主
+    // client——否则 `!config.reportRepairClient` 恒真，修复阶梯被整段跳过，
+    // 「malformed → repair re-ask → passed」这类断言只能落 blocked。
+    reportRepairClient: over.reportRepairClient ?? ((over.client ?? makeNoopClient()) as StreamClient),
     promptEngine,
     toolRegistry,
     cwd: '/tmp',

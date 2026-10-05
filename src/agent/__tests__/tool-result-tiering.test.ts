@@ -68,7 +68,7 @@ describe('tool-result-tiering', () => {
       const result = await tierToolResult('bash', content, '/tmp/output', undefined, 1_000_000)
       assert.equal(result.tier, 2)
       assert.ok(result.content.includes('[tiered-minimal:'))
-      assert.ok(result.content.includes('read_section'))
+      assert.ok(result.content.includes('not saved'))
       assert.ok(result.content.length < 500)
       assert.equal(result.originalChars, content.length)
     })
@@ -76,7 +76,7 @@ describe('tool-result-tiering', () => {
     it('saves to artifact store when provided', async () => {
       let savedArtifact: unknown = null
       const mockStore = {
-        save: async (data: unknown) => {
+        saveDurable: async (data: unknown) => {
           savedArtifact = data
           return 'artifact-123'
         },
@@ -91,22 +91,23 @@ describe('tool-result-tiering', () => {
       assert.ok(savedArtifact !== null)
     })
 
-    it('falls back to tier 0 if artifact store throws', async () => {
+    it('bounds output without a false artifact when store throws', async () => {
       const mockStore = {
-        save: async () => { throw new Error('disk full') },
+        saveDurable: async () => { throw new Error('disk full') },
       } as any
 
       const lines = Array.from({ length: 500 }, (_, i) => `line ${i}: ${'data'.repeat(10)}`).join('\n')
       const result = await tierToolResult('read_file', lines, 'big.ts', mockStore, 1_000_000)
 
-      assert.equal(result.tier, 0)
-      assert.equal(result.content, lines)
+      assert.equal(result.tier, 1)
+      assert.ok(result.content.length < 8000)
+      assert.equal(result.artifactId, undefined)
     })
 
     it('reuses an existing tool-level artifact instead of saving a second copy', async () => {
       let saveCalls = 0
       const mockStore = {
-        save: async () => {
+        saveDurable: async () => {
           saveCalls++
           return 'artifact-dup'
         },

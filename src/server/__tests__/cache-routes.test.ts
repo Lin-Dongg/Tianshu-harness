@@ -1,10 +1,14 @@
 import { describe, it, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs'
+import { runInNewContext } from 'node:vm'
+import { transformSync } from 'esbuild'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createRouter } from '../index.js'
 import { buildCacheRoutes } from '../cache-routes.js'
+import { findUsagePricing } from '../../utils/deepseek-pricing.js'
+import { PROVIDER_PRESETS } from '../../config/provider-presets.js'
 
 const TOKEN = 'secret-token'
 const AUTH = { authorization: `Bearer ${TOKEN}` }
@@ -63,11 +67,28 @@ describe('GET /cache/usage', () => {
     assert.equal(body.scannedFiles, 1)
   })
 
-  it('days 参数生效并夹到上限 90', async () => {
+  it('days 参数生效并夹到上限 366', async () => {
     const res = await call('/cache/usage?days=7')
     assert.equal((res.body as { windowDays: number }).windowDays, 7)
     const capped = await call('/cache/usage?days=9999')
-    assert.equal((capped.body as { windowDays: number }).windowDays, 90)
+    assert.equal((capped.body as { windowDays: number }).windowDays, 366)
+  })
+
+  it('还原 90 天上限会使年度查询断言失败（隔离变体）', async () => {
+    const original = readFileSync(new URL('../cache-routes.ts', import.meta.url), 'utf8')
+    const mutant = original.replace('const MAX_DAYS = 366', 'const MAX_DAYS = 90')
+    assert.notEqual(mutant, original)
+    const module = { exports: {} as { buildCacheRoutes: typeof buildCacheRoutes } }
+    runInNewContext(transformSync(mutant, { loader: 'ts', format: 'cjs' }).code, {
+      module, exports: module.exports,
+      require: () => ({ isAuthorizedRequest: () => true, sessionsDir: () => '/fixture',
+        loadConfig: () => ({ provider: { providers: {}, default: 'fixture' } }),
+        aggregateCacheUsage: async ({ days }: { days: number }) => ({ windowDays: days }),
+      }),
+    })
+    const route = module.exports.buildCacheRoutes({ defaultCwd: () => '/fixture' })['GET /cache/usage']!
+    const result = await route({}, { days: '366', scope: 'all' }, {})
+    assert.throws(() => assert.equal((result.body as { windowDays: number }).windowDays, 366))
   })
 
   it('非法 days 报 400 而不是静默当默认值', async () => {
@@ -87,4 +108,28 @@ describe('GET /cache/usage', () => {
     const res = await call('/cache/usage', {})
     assert.equal(res.status, 401)
   })
+})
+
+
+it('actual cache route forwards per-request time to the official pricing consumer', async () => {
+  const original = readFileSync(new URL('../cache-routes.ts', import.meta.url), 'utf8')
+  const execute = async (source: string) => {
+    const module = { exports: {} as { buildCacheRoutes: typeof buildCacheRoutes } }
+    runInNewContext(transformSync(source, { loader: 'ts', format: 'cjs' }).code, {
+      module, exports: module.exports, Date,
+      require: () => ({ isAuthorizedRequest: () => true, sessionsDir: () => '/fixture', findUsagePricing,
+        loadConfig: () => ({ provider: { providers: { official: PROVIDER_PRESETS.deepseek.provider }, default: 'official' } }),
+        aggregateCacheUsage: async ({ resolvePricing }: { resolvePricing: (model: string, provider: string | undefined, timestamp: number) => { output: number } }) => ({
+          outputs: ['2026-09-28T01:00:00Z', '2026-09-28T04:00:00Z'].map(time => resolvePricing('deepseek-flash', undefined, Date.parse(time)).output),
+        }),
+      }),
+    })
+    const route = module.exports.buildCacheRoutes({ defaultCwd: () => '/fixture' })['GET /cache/usage']!
+    return (await route({}, {}, {})).body as { outputs: number[] }
+  }
+  assert.deepEqual((await execute(original)).outputs, [8, 4])
+  const old = original.replace('timestamp ?? Date.now()', 'Date.now()')
+  assert.notEqual(old, original)
+  const result = await execute(old)
+  assert.throws(() => assert.deepEqual(result.outputs, [8, 4]))
 })

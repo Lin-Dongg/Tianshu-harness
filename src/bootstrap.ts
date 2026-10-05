@@ -14,7 +14,6 @@ import { join, resolve } from 'path'
 import { homedir } from 'os'
 import { randomUUID, createHash } from 'crypto'
 import { existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync, statSync, rmSync, unlinkSync } from 'fs'
-import { spawn } from 'child_process'
 import { spawnGitSync } from './tools/spawn-git.js'
 
 import type { Config, ProviderConfig } from './config/schema.js'
@@ -47,9 +46,6 @@ import {
 } from './context/write-evidence-probe.js'
 import { FileHistory } from './agent/file-history.js'
 import { makeOwnershipGuard } from './agent/checkpoint.js'
-import { PromptEngine } from './prompt/engine.js'
-import { subagentPromptBlocks } from './prompt/block-policy.js'
-import { applyDescriptionMode } from './tools/description-compact.js'
 import { createDefaultToolRegistry } from './tools/default-registry.js'
 import { presetIncludes, resolveToolPreset } from './tools/tool-preset.js'
 import { BROWSER_DEBUG_TOOL } from './tools/browser-debug/tool.js'
@@ -76,11 +72,10 @@ import { createRecallGeneralTool } from './tools/recall-general.js'
 import { createRecordGeneralFindingTool } from './tools/record-general-finding.js'
 import { createDeliverTaskTool } from './agent/deliver-task.js'
 import { createUpdateGoalTool } from './tools/update-goal.js'
-import { createTaskLedger } from './agent/task-ledger.js'
-import { createOwnershipLedger } from './agent/ownership-ledger.js'
+import type { createTaskLedger } from './agent/task-ledger.js'
+import type { createOwnershipLedger } from './agent/ownership-ledger.js'
 import { createVerificationAttribution } from './agent/verification-attribution.js'
 import { createDeliveryGateV2 } from './agent/delivery-gate-v2.js'
-import { createWorktreeBaseline } from './agent/worktree-baseline.js'
 import { createVerificationSnapshotManager, reapOrphanSnapshots, reapOrphanHandsWorktrees } from './agent/verification-snapshot-manager.js'
 import { cleanupStaleHandsBranches } from './agent/worktree.js'
 import { initializePlugins } from './plugins/plugin-loader.js'
@@ -108,6 +103,7 @@ import type { WorkerRuntimeFactory } from './agent/coordinator.js'
 import { mapWorkOrderKindToCapabilityTask } from './agent/work-order.js'
 import { PlaybookStore } from './agent/playbook-store.js'
 import { resetLegacyMemoryIfNeeded } from './agent/memory-epoch.js'
+import { createPersistentTaskState } from './agent/task-state-persist.js'
 import { ASK_USER_QUESTION_TOOL } from './tools/ask-user-question.js'
 import { createRepoGraphTool } from './tools/repo-graph.js'
 import { createRelatedTestsTool } from './tools/related-tests.js'
@@ -219,6 +215,7 @@ export interface RuntimeRefs {
 
 /** bootstrapInteractiveSession 的聚合返回值 */
 export interface BootstrapContext {
+  onAgentRuntimeChanged?: () => void
   config: Config
   provider: ProviderConfig
   apiKey: string
@@ -743,13 +740,11 @@ export function createInteractiveToolRegistry(
   // B1 deliver_task
   // sidecar 多 session 路径必须用 refs.sessionId（每个 session 独立装配），
   // 全局 getOrCreateSessionId 仅作 TUI 单 session 路径的兼容 fallback。
-  const b1TaskLedger = createTaskLedger({ taskId: refs.sessionId ?? getOrCreateSessionId() })
+  const taskState = createPersistentTaskState(cwd, refs.sessionId ?? getOrCreateSessionId(), refs.preparedBaseline ?? captureGitBaseline(cwd))
+  const b1TaskLedger = taskState.taskLedger
   refs.taskLedger = b1TaskLedger
-  const b1Baseline = createWorktreeBaseline(refs.preparedBaseline ?? captureGitBaseline(cwd))
-  const b1Ownership = createOwnershipLedger({
-    baseline: b1Baseline,
-    taskLedger: b1TaskLedger,
-  })
+  const b1Baseline = taskState.baseline
+  const b1Ownership = taskState.ownership
   refs.ownershipLedger = b1Ownership
   // VSW: best-effort reap of worktrees left by dead sessions, then a session-scoped
   // manager. §6 policy keeps a single clean session in-place (head==='' → not a git
@@ -787,6 +782,7 @@ export function createInteractiveToolRegistry(
   refs.deliveryGate = b1Gate
   reg.register(createDeliverTaskTool((params) => ({
     taskLedger: b1TaskLedger,
+    continuityStatus: taskState.recovery,
     ownership: b1Ownership,
     gate: b1Gate,
     getCurrentSnapshotRef: () => b1SnapshotManager?.currentSnapshotRef() ?? undefined,
@@ -1550,6 +1546,7 @@ export function switchAgentRuntime(ctx: BootstrapContext, modelId: string, targe
     if (carriedJobs) { try { agent.setJobs(carriedJobs) } catch { /* best-effort */ } }
 
     ctx.agent = agent
+    ctx.onAgentRuntimeChanged?.()
     ctx.refs.promptEngine = agent.config.promptEngine
     // /model 切换后新引擎重新积累冻结快照——不接线则盘存文件停留在旧引擎状态。
     wireFrozenSnapshotPersist(ctx.persist, agent.config.promptEngine)
@@ -1744,6 +1741,7 @@ export function switchAgentSession(ctx: BootstrapContext, targetId: string): Swi
 
   // 原地更新 ctx —— 持有 ctx 引用的闭包(onSubmit/onAbort/handlerCtx)即时一致。
   ctx.agent = agent
+  ctx.onAgentRuntimeChanged?.()
   ctx.persist = targetPersist
   ctx.sessionId = targetId
   ctx.refs.sessionId = targetId
@@ -1941,6 +1939,7 @@ export async function switchAgentCwd(ctx: BootstrapContext, target: string): Pro
   const oldAgent = ctx.agent
   const oldLspManager = ctx.refs.lspManager
   ctx.agent = agent
+  ctx.onAgentRuntimeChanged?.()
   ctx.persist = newPersist
   ctx.fileHistory = rebuiltStores.fileHistory
   ctx.refs.fileHistory = rebuiltStores.fileHistory

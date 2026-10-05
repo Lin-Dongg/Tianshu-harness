@@ -1,3 +1,4 @@
+import { requestAuditContext } from './call-audit.js'
 /**
  * ResponsesClient — OpenAI Responses API (`POST /v1/responses`) for API-key
  * endpoints, protocol `'openai-responses'` (issue #239).
@@ -32,6 +33,7 @@ import { repairJsonSyntax } from './json-syntax-repair.js'
 import type { ProviderRetryConfig } from '../config/retry-schema.js'
 
 export interface ResponsesClientConfig {
+  sessionId?: string
   baseUrl: string
   apiKey: string
   model: string
@@ -126,6 +128,7 @@ export class ResponsesClient implements StreamClient {
   ): Promise<void> {
     const body = this.buildRequestBody(request)
 
+    const auditContext = requestAuditContext(this.config, request)
     await withStructuredRetry(async () => {
       const authHeaders = this.config.auth
         ? await this.config.auth.getHeaders()
@@ -152,7 +155,7 @@ export class ResponsesClient implements StreamClient {
         },
         body: JSON.stringify(body),
         signal: lifecycle.signal,
-      }, this.config.firstByteTimeoutMs ?? 180_000, this.proxyDispatcher)
+      }, this.config.firstByteTimeoutMs ?? 180_000, this.proxyDispatcher, auditContext)
 
       if (!response.ok) {
         const errorBody = await response.text().catch(() => '')

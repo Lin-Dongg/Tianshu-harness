@@ -13,6 +13,7 @@ import type { RepairHintTracker } from './repair-hint.js'
 import type { AdvisoryBus } from './advisory-bus.js'
 import type { SessionContext } from './context.js'
 import type { PromptEngine } from '../prompt/engine.js'
+import { isHumanInput } from './input-origin.js'
 
 export interface ContextInjectionDeps {
   session: SessionContext
@@ -74,7 +75,8 @@ export class ContextInjectionController {
     }
   }
 
-  recordUserInputClaims(userInput: string): void {
+  recordUserInputClaims(userInput: string, origin: import('./input-origin.js').InputOrigin = 'human'): void {
+    if (!isHumanInput(origin)) return
     const contextClaimStore = this.deps.getContextClaimStore()
     const sessionId = this.deps.getSessionId()
     if (!contextClaimStore || !sessionId) return

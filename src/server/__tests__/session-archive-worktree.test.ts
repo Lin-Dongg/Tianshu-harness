@@ -85,6 +85,30 @@ test('archive deletes the branch when the worktree is clean and fully merged', (
   const branches = git(repo, ['branch', '--list', rec.worktreeBranch!]).trim()
   assert.equal(branches, '', 'clean branch is deleted as before')
 })
+test('landing uses the session repository and recorded worktree origin rather than sidecar default', () => {
+  const other = mkdtempSync(join(tmpdir(), 'rivet-landing-other-'))
+  initGitRepo(other)
+  const manager = makeManager()
+  try {
+    const plain = manager.createSession({ cwd: other })
+    writeFileSync(join(other, 'selected.txt'), 'selected\n'); writeFileSync(join(other, 'untouched.txt'), 'untouched\n')
+    git(other, ['add', '--', 'selected.txt'])
+    assert.equal(manager.commitSessionChanges(plain.id, 'selected')?.ok, true)
+    assert.equal(git(other, ['log', '-1', '--format=%s']).trim(), 'selected')
+    assert.match(git(other, ['status', '--porcelain']), /\?\? untouched.txt/)
+    rmSync(join(other, 'untouched.txt'))
+    const isolated = manager.createSession({ cwd: other, isolatedWorktree: true })
+    assert.equal(isolated.worktreeOriginCwd, other)
+    writeFileSync(join(isolated.worktreePath!, 'work.txt'), 'work\n')
+    git(isolated.worktreePath!, ['add', '--', 'work.txt']); git(isolated.worktreePath!, ['commit', '-m', 'work'])
+    const defaultHead = git(repo, ['rev-parse', 'HEAD'])
+    assert.equal(manager.mergeSessionBack(isolated.id)?.ok, true)
+    assert.equal(existsSync(join(other, 'work.txt')), true)
+    assert.equal(git(repo, ['rev-parse', 'HEAD']), defaultHead)
+    manager.archiveSession(isolated.id)
+    assert.equal(existsSync(isolated.worktreePath!), false)
+  } finally { rmSync(other, { recursive: true, force: true }) }
+})
 
 test('session-scoped git context: worktree cwd + baseline diff keeps committed work visible', async () => {
   const manager = makeManager()
@@ -144,6 +168,7 @@ test('landing: commitSessionChanges commits the worktree and emits a landing eve
   assert.ok(rec.worktreePath)
 
   writeFileSync(join(rec.worktreePath!, 'feature.txt'), 'x\n')
+  git(rec.worktreePath!, ['add', '--', 'feature.txt'])
   const result = manager.commitSessionChanges(rec.id, 'add feature file')
   assert.ok(result)
   assert.equal(result!.ok, true)
@@ -164,7 +189,7 @@ test('landing: commitSessionChanges commits the worktree and emits a landing eve
   git(repo, ['branch', '-D', rec.worktreeBranch!])
 })
 
-test('landing: mergeSessionBack squash-merges committed + uncommitted work into main', () => {
+test('landing: mergeSessionBack refuses implicit checkpoint and merges explicitly committed work', () => {
   const manager = makeManager()
   const rec = manager.createSession({ isolatedWorktree: true })
   assert.ok(rec.worktreePath)
@@ -174,6 +199,9 @@ test('landing: mergeSessionBack squash-merges committed + uncommitted work into 
   git(rec.worktreePath!, ['commit', '-m', 'part one'])
   writeFileSync(join(rec.worktreePath!, 'uncommitted.txt'), 'b\n')
 
+  assert.equal(manager.mergeSessionBack(rec.id)!.ok, false, 'uncommitted work must not be auto-committed')
+  git(rec.worktreePath!, ['add', '--', 'uncommitted.txt'])
+  assert.equal(manager.commitSessionChanges(rec.id, 'part two')!.ok, true)
   const result = manager.mergeSessionBack(rec.id)
   assert.ok(result)
   assert.equal(result!.error, undefined)
@@ -199,6 +227,8 @@ test('landing: mergeSessionBack refuses when the main workspace is dirty', () =>
   const manager = makeManager()
   const rec = manager.createSession({ isolatedWorktree: true })
   writeFileSync(join(rec.worktreePath!, 'w.txt'), 'w\n')
+  git(rec.worktreePath!, ['add', '--', 'w.txt'])
+  manager.commitSessionChanges(rec.id, 'worktree changes')
   writeFileSync(join(repo, 'dirty-main.txt'), 'dirty\n')
   try {
     const result = manager.mergeSessionBack(rec.id)
@@ -258,6 +288,7 @@ test('routes: session-scoped git endpoints dispatch and land changes', async () 
   const router = createRouter(buildSessionRoutes(manager, TOKEN))
   const rec = manager.createSession({ isolatedWorktree: true })
   writeFileSync(join(rec.worktreePath!, 'via-route.txt'), 'r\n')
+  git(rec.worktreePath!, ['add', '--', 'via-route.txt'])
 
   const tree = await router('GET', `/sessions/${rec.id}/git/working-tree`, {}, AUTH)
   assert.equal(tree.status, 200)

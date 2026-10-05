@@ -57,7 +57,7 @@ describe('delivery-gate-v2 — ownership-aware delivery gate with GREEN/YELLOW/R
 
   it('returns RED when owned verification fails', () => {
     const { gate, ledger } = makeGate(['src/tools/git.ts'])
-    ledger.record({ type: 'verification', command: 'npx tsx --test', status: 'failed' })
+    ledger.record({ type: 'verification', command: 'npx tsx --test', status: 'failed', meta: { scope: 'targeted', targetFiles: ['src/tools/git.ts'] } })
 
     const result = gate.assess([])
     assert.equal(result.state, 'RED')
@@ -116,7 +116,7 @@ describe('delivery-gate-v2 — ownership-aware delivery gate with GREEN/YELLOW/R
 
   it('getReport includes RED state with blocking reason', () => {
     const { gate, ledger } = makeGate(['src/tools/git.ts'])
-    ledger.record({ type: 'verification', command: 'npx tsx --test', status: 'failed' })
+    ledger.record({ type: 'verification', command: 'npx tsx --test', status: 'failed', meta: { scope: 'targeted', targetFiles: ['src/tools/git.ts'] } })
 
     const report = gate.getReport([])
     assert.equal(report.state, 'RED')
@@ -185,14 +185,14 @@ describe('delivery-gate-v2 — ownership-aware delivery gate with GREEN/YELLOW/R
     assert.match(result.reason!, /unresolved full-suite failure/)
   })
 
-  it('keeps failed ledger verifications targeted by default for backward compatibility', () => {
+  it('does not infer owned failure from missing legacy scope metadata', () => {
     const { gate, ledger } = makeGate(['src/tools/git.ts'])
     ledger.record({ type: 'verification', command: 'run_tests src/tools/__tests__/git.test.ts', status: 'failed' })
 
     const result = gate.assess([])
-    assert.equal(result.state, 'RED')
-    assert.equal(result.canDeliver, false)
-    assert.equal(result.isBlocked, true)
+    assert.equal(result.state, 'YELLOW')
+    assert.equal(result.canDeliver, true)
+    assert.equal(result.isBlocked, false)
   })
 
   it('getReport separates current owned dirty files from historical owned files', () => {
@@ -299,6 +299,7 @@ describe('W1 回归防线 — assessImpactedTestCoverage', () => {
     command: 'npx tsx --test',
     status: 'passed',
     scope: 'targeted',
+    kind: 'test',
     exitCode: 0,
     passed: 1,
     failed: 0,
@@ -307,10 +308,10 @@ describe('W1 回归防线 — assessImpactedTestCoverage', () => {
     ...over,
   })
 
-  it('a passed full-scope verification covers everything', () => {
+  it('a full-scope verification covers its explicitly recorded test files', () => {
     const coverage = assessImpactedTestCoverage(
       ['src/a/__tests__/a.test.ts', 'src/b/__tests__/b.test.ts'],
-      [meta({ scope: 'full' })],
+      [meta({ scope: 'full', targetFiles: ['src/a/__tests__/a.test.ts', 'src/b/__tests__/b.test.ts'] })],
       () => true,
     )
     assert.deepEqual(coverage.uncovered, [])
@@ -368,7 +369,7 @@ describe('W1 回归防线 — assessImpactedTestCoverage', () => {
 describe('W1 回归防线 — gate module_unverified', () => {
   it('downgrades GREEN to YELLOW (module_unverified) when impacted tests exist but were never covered', () => {
     const { gate, ledger } = makeGate(['src/tools/git.ts'])
-    ledger.record({ type: 'verification', command: 'npx tsx --test src/tools/__tests__/git.test.ts', status: 'passed', meta: { scope: 'targeted' } })
+    ledger.record({ type: 'verification', command: 'npx tsx --test src/tools/__tests__/git.test.ts', status: 'passed', meta: { scope: 'targeted', kind: 'test' } })
 
     const result = gate.assess([], undefined, undefined, {
       impactedTests: ['src/tools/__tests__/git.test.ts', 'src/agent/__tests__/consumer.test.ts'],
@@ -381,9 +382,9 @@ describe('W1 回归防线 — gate module_unverified', () => {
     assert.ok(result.reason?.includes('consumer.test.ts'))
   })
 
-  it('stays GREEN when a full-scope verification passed', () => {
+  it('stays GREEN when a full-scope verification records coverage for the impacted test', () => {
     const { gate, ledger } = makeGate(['src/tools/git.ts'])
-    ledger.record({ type: 'verification', command: 'npm test', status: 'passed', meta: { scope: 'full' } })
+    ledger.record({ type: 'verification', command: 'npm test', status: 'passed', meta: { scope: 'full', kind: 'test', targetFiles: ['src/agent/__tests__/consumer.test.ts'] } })
 
     const result = gate.assess([], undefined, undefined, {
       impactedTests: ['src/agent/__tests__/consumer.test.ts'],
@@ -395,7 +396,7 @@ describe('W1 回归防线 — gate module_unverified', () => {
 
   it('stays GREEN when uncovered tests no longer exist — uncoverable 留痕不阻断', () => {
     const { gate, ledger } = makeGate(['src/tools/git.ts'])
-    ledger.record({ type: 'verification', command: 'npx tsx --test src/tools/__tests__/git.test.ts', status: 'passed', meta: { scope: 'targeted' } })
+    ledger.record({ type: 'verification', command: 'npx tsx --test src/tools/__tests__/git.test.ts', status: 'passed', meta: { scope: 'targeted', kind: 'test' } })
 
     const result = gate.assess([], undefined, undefined, {
       impactedTests: ['src/tools/__tests__/git.test.ts', 'src/deleted/__tests__/old.test.ts'],
@@ -418,7 +419,7 @@ describe('W1 回归防线 — gate module_unverified', () => {
 
   it('no moduleCoverage input → unchanged GREEN behavior', () => {
     const { gate, ledger } = makeGate(['src/tools/git.ts'])
-    ledger.record({ type: 'verification', command: 'npx tsx --test src/tools/__tests__/git.test.ts', status: 'passed', meta: { scope: 'targeted' } })
+    ledger.record({ type: 'verification', command: 'npx tsx --test src/tools/__tests__/git.test.ts', status: 'passed', meta: { scope: 'targeted', kind: 'test' } })
 
     const result = gate.assess([])
     assert.equal(result.state, 'GREEN')
@@ -467,5 +468,105 @@ describe('delivery gate — verification_timeout', () => {
     const result = gate.assess([], ['src/tools/git.ts'])
     assert.equal(result.attributionClass, undefined, 'invocation failure has no explicit attributionClass')
     assert.deepEqual(result.toolInvocationFailureCandidates, ['run_tests src/tools/__tests__/git.test.ts'])
+  })
+})
+
+describe('8784b64b8 审查 P2 — 覆盖义务不受聚合归因影响', () => {
+  const coverageInput = (): Parameters<typeof assessImpactedTestCoverage>[0] =>
+    ['src/agent/__tests__/consumer.test.ts']
+
+  it('external_blocked 归因下，未覆盖的 impacted tests 仍被拦为 module_unverified', () => {
+    const { gate, ledger } = makeGate(['src/tools/git.ts'])
+    ledger.record({ type: 'verification', command: 'npx tsx --test src/tools/__tests__/git.test.ts', status: 'passed', meta: { scope: 'targeted', kind: 'test' } })
+    // 负面证据：一条 blocked 会把聚合抬出 verified（修复前因此整段跳过覆盖检查）
+    ledger.record({ type: 'verification', command: 'npm test', status: 'blocked', meta: { scope: 'full' } })
+
+    const result = gate.assess([], undefined, undefined, { impactedTests: coverageInput(), testExists: () => true })
+
+    assert.equal(result.attributionClass, 'module_unverified', '加负面证据不得放宽覆盖义务')
+    assert.deepEqual(result.uncoveredImpactedTests, coverageInput())
+    assert.equal(result.state, 'YELLOW')
+  })
+
+  it('unattributed_failure 归因下同样被拦（审查者对照实验的最小复现）', () => {
+    const { gate, ledger } = makeGate(['src/tools/git.ts'])
+    ledger.record({ type: 'verification', command: 'npm test', status: 'failed', meta: { scope: 'full', failed: 3 } })
+
+    const result = gate.assess([], undefined, undefined, { impactedTests: coverageInput(), testExists: () => true })
+
+    assert.equal(result.attributionClass, 'module_unverified')
+    assert.deepEqual(result.uncoveredImpactedTests, coverageInput())
+  })
+
+  it('no_test_infra does not waive coverage for existing impacted tests', () => {
+    const { gate, ledger } = makeGate(['src/tools/git.ts'])
+    ledger.record({ type: 'verification', command: 'npm test', status: 'blocked', meta: { scope: 'full', blockedReason: 'no_test_framework' } })
+
+    const result = gate.assess([], undefined, undefined, { impactedTests: coverageInput(), testExists: () => true })
+
+    assert.equal(result.attributionClass, 'module_unverified')
+    assert.deepEqual(result.uncoveredImpactedTests, coverageInput())
+    assert.equal(result.state, 'YELLOW')
+  })
+})
+
+describe('8784b64b8 审查 P3 — 只有测试类的 full 才算覆盖', () => {
+  const meta2 = (over: Partial<VerificationMetadata>): VerificationMetadata => ({
+    command: 'npx tsx --test',
+    status: 'passed',
+    scope: 'targeted',
+    kind: 'test',
+    exitCode: 0,
+    passed: 1,
+    failed: 0,
+    skipped: 0,
+    durationMs: 10,
+    ...over,
+  })
+  const impacted = ['src/agent/__tests__/consumer.test.ts']
+
+  it('passed full typecheck 不清空 uncovered（种类≠范围）', () => {
+    const coverage = assessImpactedTestCoverage(impacted, [meta2({ scope: 'full', kind: 'typecheck' })], () => true)
+    assert.deepEqual(coverage.uncovered, impacted, 'typecheck 跑遍全仓也不证明任何测试被执行过')
+  })
+
+  it('passed full build / lint 同样不清空', () => {
+    for (const kind of ['build', 'lint', 'check'] as const) {
+      const coverage = assessImpactedTestCoverage(impacted, [meta2({ scope: 'full', kind })], () => true)
+      assert.deepEqual(coverage.uncovered, impacted, `${kind} 不构成测试覆盖`)
+    }
+  })
+
+  it('passed full test with explicit test files can satisfy coverage', () => {
+    const coverage = assessImpactedTestCoverage(impacted, [meta2({ scope: 'full', kind: 'test', targetFiles: impacted })], () => true)
+    assert.deepEqual(coverage.uncovered, [])
+  })
+
+  it('missing kind stays unknown and supplies no test coverage', () => {
+    const coverage = assessImpactedTestCoverage(impacted, [meta2({ scope: 'full', kind: undefined, targetFiles: impacted })], () => true)
+    assert.deepEqual(coverage.uncovered, impacted)
+  })
+})
+
+describe('runner boundaries preserve impacted-test obligations', () => {
+  it('root full execution does not cover desktop tests without explicit evidence', () => {
+    const { gate, ledger } = makeGate(['src/tools/git.ts'])
+    ledger.record({ type: 'verification', command: 'npm test', status: 'passed', meta: { scope: 'full', kind: 'test' } })
+    const path = 'desktop/scripts/__tests__/check-boundary.test.ts'
+    const result = gate.assess([], undefined, undefined, { impactedTests: [path], testExists: () => true })
+    assert.equal(result.attributionClass, 'module_unverified')
+    assert.deepEqual(result.uncoveredImpactedTests, [path])
+    assert.equal(result.uncoverableImpactedTests, undefined)
+  })
+
+  it('separate targeted test runs can cover multiple suites without one global full run', () => {
+    const { gate, ledger } = makeGate(['src/tools/git.ts'])
+    const paths = ['src/agent/__tests__/consumer.test.ts', 'desktop/scripts/__tests__/check-boundary.test.ts']
+    for (const path of paths) {
+      ledger.record({ type: 'verification', command: `node --test ${path}`, status: 'passed', meta: { scope: 'targeted', kind: 'test', targetFiles: [path] } })
+    }
+    const result = gate.assess([], undefined, undefined, { impactedTests: paths, testExists: () => true })
+    assert.equal(result.state, 'GREEN')
+    assert.equal(result.uncoveredImpactedTests, undefined)
   })
 })

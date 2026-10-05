@@ -11,9 +11,10 @@
  */
 import { describe, it, after, mock } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { defaultRivetHome, projectSlug } from '../../config/paths.js'
 import { AgentLoop } from '../loop.js'
 import { SessionContext } from '../context.js'
 import { PromptEngine } from '../../prompt/engine.js'
@@ -26,6 +27,14 @@ import type { StreamCallbacks, StreamClient } from '../../api/stream-client.js'
 import type { ContentBlock } from '../../api/types.js'
 
 const TEST_CWD = mkdtempSync(join(tmpdir(), 'b2-mode-test-'))
+// 直接 `node --test` 跑本文件时没有 run-node-tests 的 RIVET_HOME 隔离，loop 会把
+// cache-log / 信息素按 TEST_CWD 的 slug 写进真实 ~/.rivet/sessions。
+process.env.RIVET_SESSION_DIR = mkdtempSync(join(tmpdir(), 'b2-mode-sessions-'))
+
+after(() => {
+  assert.equal(existsSync(join(defaultRivetHome(), 'sessions', projectSlug(TEST_CWD))), false,
+    '测试会话不得落进真实 ~/.rivet/sessions')
+})
 
 // 真实执行写类工具会触发 edit-diff → cpuPool 懒加载 worker，其 MessagePort
 // 保持 ref 阻止 node:test 进程退出（Worker.unref() 不覆盖 MessagePort）。

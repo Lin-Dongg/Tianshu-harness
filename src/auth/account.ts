@@ -18,12 +18,13 @@
  * token + Rust 验签负责（`desktop/src-tauri/src/activation.rs`）。两者分开存储：
  * `<RIVET_HOME>/account.json` vs `<RIVET_HOME>/license.json`。
  */
-import { TokenStore, type AccountProfileSnapshot, type FoundingBadgeSnapshot, type TokenData } from './token-store.js'
+import { TokenStore, type AccountProfileSnapshot as StoredAccountProfile, type FoundingBadgeSnapshot, type TokenData } from './token-store.js'
 import { FOUNDING_USER_LIMIT, isFoundingBadge, tierOfBadgeCode, tierOfRank } from '../agent/founding-tiers.js'
 
 // 快照类型是消费方（sidecar 路由、桌面端镜像）要用的形状——从本模块再导出一次，
 // 免得每个调用方都绕到 token-store 去拿。
-export type { AccountProfileSnapshot, FoundingBadgeSnapshot }
+export type { FoundingBadgeSnapshot }
+export type AccountProfileSnapshot = StoredAccountProfile & { account?: AccountProfile | null; unconfirmed?: Array<'avatar' | 'founding'> }
 
 /** 官网 Supabase 项目（Edge Functions 基址）。 */
 const DEFAULT_ACCOUNT_API = 'https://grcedmhghzroqnirizcy.supabase.co'
@@ -44,7 +45,7 @@ const DEFAULT_ACCOUNT_SITE = 'https://tianshuharness.com'
 const DEFAULT_PUBLISHABLE_KEY = 'sb_publishable_9fLEHwAUNOLZpayKfPW1-g_bbcNNoCR'
 
 /** 单次 HTTP 调用的超时。轮询本身靠 deadline 控制，这里防的是单请求挂死。 */
-const HTTP_TIMEOUT_MS = 15_000
+const HTTP_TIMEOUT_MS = 10_000
 
 /**
  * `fetch` 注入点。
@@ -189,8 +190,12 @@ export async function requestDeviceCode(opts: RequestDeviceCodeOpts = {}): Promi
  * 必须由客户端补齐——三端都从 `requestDeviceCode` 取链接，补一次就够。
  */
 export function deviceAuthorizeUrl(verifyUrl: string, userCode: string): string {
-  const sep = verifyUrl.includes('?') ? '&' : '?'
-  return `${verifyUrl}${sep}code=${encodeURIComponent(userCode)}`
+  const url = new URL(verifyUrl)
+  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname))) {
+    throw new Error('device create: invalid authorization URL')
+  }
+  url.searchParams.set('code', userCode)
+  return url.toString()
 }
 
 // ── 轮询 ─────────────────────────────────────────────────────────────────
@@ -217,7 +222,8 @@ export interface DevicePollResult {
  * 用户下次启动发现自己「已登录」但什么都做不了。
  */
 export function parseDevicePoll(raw: Record<string, unknown>): DevicePollResult {
-  const status = String(raw.status ?? 'error') as PollStatus
+  const known: readonly string[] = ['pending', 'approved', 'denied', 'expired', 'already_consumed', 'error']
+  const status: PollStatus = typeof raw.status === 'string' && known.includes(raw.status) ? raw.status as PollStatus : 'error'
 
   if (status === 'approved') {
     const accessToken = raw.accessToken
@@ -354,11 +360,16 @@ export function saveAccountToken(store: TokenStore, poll: DevicePollResult): Tok
 export interface AccountProfile {
   email: string | null
   userId: string | null
+  displayName?: string | null
+  username?: string | null
+  joinedAt?: string | null
 }
 
 /**
  * 拉账号资料（邮箱 / 用户 id）。Supabase Auth 的 `/auth/v1/user` 要用户 JWT。
  *
+ * 设备凭据的 session_id 属于 tui_sessions，GoTrue 可能拒绝它；本人资料以
+ * PostgREST 验证过 JWT/RLS 的 profiles 行为准，Auth 用户资料只补充邮箱。
  * 失败返回 null 而不是抛：离线不该让「已登录」这个事实消失 —— 本地 token 还在，
  * 拉不到资料只说明网络不通，把状态报成「未登录」会误导用户重新登录一遍。
  */
@@ -368,20 +379,49 @@ export async function fetchAccountProfile(
 ): Promise<AccountProfile | null> {
   const doFetch = opts.fetchImpl ?? fetch
   try {
+    // 官网编辑昵称写 profiles.display_name，Auth metadata 可能仍是注册时的旧值。
+    const subject = jwtSubject(accessToken)
+    const websiteProfile = doFetch(`${accountApiBase()}/rest/v1/profiles?select=id,display_name,username,created_at&limit=1${subject ? `&id=eq.${encodeURIComponent(subject)}` : ''}`, {
+      method: 'GET',
+      headers: { ...accountHeaders(), Authorization: `Bearer ${accessToken}` },
+      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+    }).then(async res => res.ok ? await res.json() as unknown : null).catch(() => null)
     const res = await doFetch(`${accountApiBase()}/auth/v1/user`, {
       method: 'GET',
       headers: { ...accountHeaders(), Authorization: `Bearer ${accessToken}` },
       signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
-    })
-    if (!res.ok) return null
-    const raw = (await res.json()) as Record<string, unknown>
+    }).catch(() => null)
+    const raw = res?.ok ? (await res.json().catch(() => null)) as Record<string, unknown> | null : null
+    const rows = await websiteProfile
+    const row = (Array.isArray(rows) ? rows[0] : null) as Record<string, unknown> | null
+    const userId = subject ?? (typeof raw?.id === 'string' ? raw.id : null)
+    const ownProfile = row && userId && row.id === userId ? row : null
+    if (!ownProfile && !raw) return null
+    const metadata = raw?.user_metadata as Record<string, unknown> | undefined
+    const name = [ownProfile?.display_name, ownProfile?.username, metadata?.username, metadata?.full_name, metadata?.name].find(value => typeof value === 'string' && value.trim())
     return {
-      email: typeof raw.email === 'string' ? raw.email : null,
-      userId: typeof raw.id === 'string' ? raw.id : null,
+      username: typeof ownProfile?.username === 'string' ? ownProfile.username : typeof metadata?.username === 'string' ? metadata.username : null,
+      displayName: typeof name === 'string' ? name.trim() : null,
+      joinedAt: typeof ownProfile?.created_at === 'string' ? ownProfile.created_at : typeof raw?.created_at === 'string' && Number.isFinite(Date.parse(raw.created_at)) ? raw.created_at : null,
+      email: typeof raw?.email === 'string' ? raw.email : null,
+      userId,
     }
   } catch {
     return null
   }
+}
+
+/** Device grants rotate through the website EF, not GoTrue's browser-session endpoint. */
+export async function refreshAccountToken(refreshToken: string, opts: FetchInjection = {}): Promise<DevicePollResult | null> {
+  try {
+    const response = await (opts.fetchImpl ?? fetch)(`${accountApiBase()}/functions/v1/tui-auth-refresh`, {
+      method: 'POST', headers: { ...accountHeaders(), Authorization: `Bearer ${refreshToken}` },
+      body: '{}', signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+    })
+    if (!response.ok) return null
+    const result = parseDevicePoll({ ...await response.json() as Record<string, unknown>, status: 'approved' })
+    return result.refreshToken ? result : null
+  } catch { return null }
 }
 
 // ── 星籍（stellar identity）─────────────────────────────────────────────
@@ -563,7 +603,7 @@ export async function fetchFoundingBadge(
   const doFetch = opts.fetchImpl ?? fetch
   const headers = { ...accountHeaders(), Authorization: `Bearer ${accessToken}` }
 
-  const badgeCode = await (async (): Promise<string | null> => {
+  const [badgeCode, rankInfo] = await Promise.all([(async (): Promise<string | null> => {
     try {
       const res = await doFetch(`${accountApiBase()}/rest/v1/user_badges?select=badge_code`, {
         method: 'GET',
@@ -582,9 +622,7 @@ export async function fetchFoundingBadge(
     } catch {
       return null
     }
-  })()
-
-  const rankInfo = await (async (): Promise<{ rank: number | null; total: number } | null> => {
+  })(), (async (): Promise<{ rank: number | null; total: number } | null> => {
     try {
       const res = await doFetch(`${accountApiBase()}/rest/v1/rpc/get_my_founder_rank`, {
         method: 'POST',
@@ -604,7 +642,7 @@ export async function fetchFoundingBadge(
     } catch {
       return null
     }
-  })()
+  })()])
 
   if (!badgeCode && !rankInfo) return null
 
@@ -624,19 +662,34 @@ export async function fetchFoundingBadge(
 /**
  * 账号资料快照：头像 + 创始身份，一次并发取齐。
  *
- * 两者都取不到时回 null（不造"看起来有但是空的"壳）；任一取到就回快照，
- * 缺的那一半以 null 存在——客户端按"缺就不渲染"处理。
+ * 取数失败时回 null；已确认没有头像或创始铭牌时仍返回确认状态。
+ * 任一部分失败时保留 unconfirmed，避免联系人缓存把失败掩盖一整天。
  */
 export async function fetchAccountProfileSnapshot(
   accessToken: string,
   opts: FetchInjection = {},
 ): Promise<AccountProfileSnapshot | null> {
-  const [avatarUrl, founding] = await Promise.all([
-    fetchAccountAvatar(accessToken, opts),
-    fetchFoundingBadge(accessToken, opts),
-  ])
-  if (avatarUrl === null && founding === null) return null
-  return { avatarUrl, founding, fetchedAt: Date.now() }
+  const successes = new Set<string>()
+  const doFetch = opts.fetchImpl ?? fetch
+  const tracked: FetchInjection = { ...opts, fetchImpl: async (input, init) => {
+    const response = await doFetch(input, init)
+    if (response.ok) {
+      const valid = await response.clone().json().catch(() => null)
+      const url = String(input)
+      const subject = jwtSubject(accessToken)
+      if (url.includes('select=id,avatar_url') && Array.isArray(valid) && typeof valid[0]?.id === 'string' && (!subject || valid[0].id === subject)) successes.add('avatar')
+      if (url.includes('user_badges') && Array.isArray(valid)) successes.add('badges')
+      const rank = Array.isArray(valid) ? valid[0] : valid
+      if (url.includes('get_my_founder_rank') && rank && (typeof rank.is_founder === 'boolean' || Number.isInteger(rank.rank))) successes.add('rank')
+    }
+    return response
+  } }
+  const [avatarUrl, founding] = await Promise.all([fetchAccountAvatar(accessToken, tracked), fetchFoundingBadge(accessToken, tracked)])
+  if (avatarUrl === null && founding === null && (!successes.has('avatar') || !successes.has('badges') || !successes.has('rank'))) return null
+  const unconfirmed: Array<'avatar' | 'founding'> = []
+  if (!successes.has('avatar')) unconfirmed.push('avatar')
+  if (!successes.has('badges') || !successes.has('rank')) unconfirmed.push('founding')
+  return { avatarUrl, founding, unconfirmed, fetchedAt: Date.now() }
 }
 
 /**
@@ -658,7 +711,7 @@ export function saveAccountProfile(
 
 /** 读缓存副本；形状不全（老文件 / 坏数据）时回 null。 */
 export function cachedAccountProfile(token: TokenData | null): AccountProfileSnapshot | null {
-  const p = token?.profile
+  const p = token?.profile as AccountProfileSnapshot | undefined
   if (!p) return null
   const avatarUrl = typeof p.avatarUrl === 'string' && p.avatarUrl ? p.avatarUrl : null
   const founding =
@@ -671,7 +724,28 @@ export function cachedAccountProfile(token: TokenData | null): AccountProfileSna
           limit: typeof p.founding.limit === 'number' ? p.founding.limit : FOUNDING_USER_LIMIT,
         }
       : null
-  if (avatarUrl === null && founding === null) return null
-  return { avatarUrl, founding, fetchedAt: typeof p.fetchedAt === 'number' ? p.fetchedAt : 0 }
+  const account = p.account && typeof p.account === 'object' ? {
+    email: typeof p.account.email === 'string' ? p.account.email : null,
+    userId: typeof p.account.userId === 'string' ? p.account.userId : null,
+    username: typeof p.account.username === 'string' ? p.account.username : null,
+    displayName: typeof p.account.displayName === 'string' ? p.account.displayName : null,
+    joinedAt: typeof p.account.joinedAt === 'string' ? p.account.joinedAt : null,
+  } : null
+  if (avatarUrl === null && founding === null && account === null && !Array.isArray(p.unconfirmed)) return null
+  return { avatarUrl, founding, account, unconfirmed: p.unconfirmed, fetchedAt: typeof p.fetchedAt === 'number' ? p.fetchedAt : 0 }
 }
 
+/** Cancellation and logout are capabilities scoped to this request/session. */
+async function endAccountRequest(body: {deviceCode?: string; accessToken?: string}, opts: FetchInjection): Promise<boolean> {
+  const response = await (opts.fetchImpl ?? fetch)(`${accountApiBase()}/functions/v1/tui-auth-end`, {
+    method: 'POST', headers: accountHeaders(), body: JSON.stringify(body),
+    signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+  })
+  return response.ok
+}
+export function cancelDeviceCode(deviceCode: string, opts: FetchInjection = {}): Promise<boolean> {
+  return endAccountRequest({deviceCode}, opts)
+}
+export function revokeAccountSession(accessToken: string, opts: FetchInjection = {}): Promise<boolean> {
+  return endAccountRequest({accessToken}, opts)
+}

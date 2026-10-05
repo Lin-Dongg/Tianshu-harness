@@ -323,48 +323,47 @@ export function createDeliveryGateV2(opts: {
     // Check attribution
     const aggregate = attribution.getAggregateAttribution(allVerifications)
 
+    // Negative evidence never cancels coverage obligations. Preserve existing
+    // RED conclusions; missing infrastructure only remains a caveat when no
+    // existing impacted test is awaiting verification.
+    const coverage = moduleCoverage && moduleCoverage.impactedTests.length > 0
+      && aggregate.attribution !== 'unverified'
+      && aggregate.attribution !== 'owned_failure'
+      ? assessImpactedTestCoverage(moduleCoverage.impactedTests, allVerifications, moduleCoverage.testExists)
+      : undefined
+    if (coverage && coverage.uncovered.length > 0) {
+      const sample = coverage.uncovered.slice(0, 5)
+      return {
+        state: 'YELLOW',
+        canDeliver: true,
+        isBlocked: false,
+        reason: `${ownedFiles.length} owned file(s) lack coverage for ${coverage.uncovered.length} impacted test file(s) (Meridian blast radius): ${sample.join(', ')}${coverage.uncovered.length > sample.length ? ` (+${coverage.uncovered.length - sample.length} more)` : ''}. Run these tests with explicit file targets; a full-scope label alone does not establish their coverage.`,
+        ownedFileCount: ownedFiles.length,
+        externalFileCount: externalFiles.length,
+        verificationCount: allVerifications.length,
+        ...diagnostics,
+        latestVerificationTotals,
+        attributionClass: 'module_unverified',
+        uncoveredImpactedTests: coverage.uncovered,
+        ...(coverage.uncoverable.length > 0 ? { uncoverableImpactedTests: coverage.uncoverable } : {}),
+      }
+    }
+
     switch (aggregate.attribution) {
       case 'verified': {
-        // W1 回归防线: "有 passed 验证" ≠ "改动波及面被验证过"。Meridian 波及
-        // 的测试若存在于磁盘且从未被任何 passed 验证覆盖 → 降为 YELLOW
-        // (module_unverified)。deliver_task(commit=true) 时升 RED 硬拦。
-        if (moduleCoverage && moduleCoverage.impactedTests.length > 0) {
-          const coverage = assessImpactedTestCoverage(
-            moduleCoverage.impactedTests,
-            allVerifications,
-            moduleCoverage.testExists,
-          )
-          if (coverage.uncovered.length > 0) {
-            const sample = coverage.uncovered.slice(0, 5)
-            return {
-              state: 'YELLOW',
-              canDeliver: true,
-              isBlocked: false,
-              reason: `${ownedFiles.length} owned file(s) have passed verifications, but ${coverage.uncovered.length} impacted test file(s) (Meridian blast radius) were never covered by any passed run: ${sample.join(', ')}${coverage.uncovered.length > sample.length ? ` (+${coverage.uncovered.length - sample.length} more)` : ''}. Regression risk — run these tests or a full-scope verification.`,
-              ownedFileCount: ownedFiles.length,
-              externalFileCount: externalFiles.length,
-              verificationCount: allVerifications.length,
-              ...diagnostics,
-              latestVerificationTotals,
-              attributionClass: 'module_unverified',
-              uncoveredImpactedTests: coverage.uncovered,
-              ...(coverage.uncoverable.length > 0 ? { uncoverableImpactedTests: coverage.uncoverable } : {}),
-            }
-          }
-          if (coverage.uncoverable.length > 0) {
-            // 留痕不阻断：已删/重命名的测试只出现在报告里
-            return {
-              state: 'GREEN',
-              canDeliver: true,
-              isBlocked: false,
-              reason: `${ownedFiles.length} owned file(s) verified. Ready to deliver. (${coverage.uncoverable.length} impacted test path(s) no longer exist — deleted/renamed, excluded from coverage check.)`,
-              ownedFileCount: ownedFiles.length,
-              externalFileCount: externalFiles.length,
-              verificationCount: allVerifications.length,
-              ...diagnostics,
-              latestVerificationTotals,
-              uncoverableImpactedTests: coverage.uncoverable,
-            }
+        if (coverage && coverage.uncoverable.length > 0) {
+          // 留痕不阻断：已删/重命名的测试只出现在报告里
+          return {
+            state: 'GREEN',
+            canDeliver: true,
+            isBlocked: false,
+            reason: `${ownedFiles.length} owned file(s) verified. Ready to deliver. (${coverage.uncoverable.length} impacted test path(s) no longer exist — deleted/renamed, excluded from coverage check.)`,
+            ownedFileCount: ownedFiles.length,
+            externalFileCount: externalFiles.length,
+            verificationCount: allVerifications.length,
+            ...diagnostics,
+            latestVerificationTotals,
+            uncoverableImpactedTests: coverage.uncoverable,
           }
         }
         return {

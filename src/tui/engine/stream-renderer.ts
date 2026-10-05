@@ -19,7 +19,8 @@
 import { formatMarkdown } from '../format/markdown.js'
 import { capLiveTailMarkdownSafe } from '../live-tail-cap.js'
 import { wrapReadingText } from '../format/reading-layout.js'
-import { hardWrapToDisplayWidth } from '../width.js'
+import { color } from './ansi.js'
+import { hardWrapToDisplayWidth, truncateToDisplayWidth } from '../width.js'
 import type { RivetTheme } from '../theme.js'
 import type { TuiPerfMonitor } from './perf-monitor.js'
 
@@ -154,9 +155,13 @@ export class StreamRenderer {
   }
 
   /** Format only the bounded live window; the raw tail remains available for boundary diagnostics. */
-  getLiveTailView(maxRows: number, extraTail = ''): string[] {
+  getLiveTailView(maxRows: number, extraTail = '', disclosure = false): string[] {
+    return this.getLiveTailProjection(maxRows, extraTail, disclosure).lines
+  }
+
+  getLiveTailProjection(maxRows: number, extraTail = '', disclosure = false): { lines: string[]; notice: boolean } {
     let tail = this.getLiveTailLines(maxRows, extraTail).join('\n')
-    if (!tail) return []
+    if (!tail) return { lines: [], notice: false }
     const source = (this.pending + extraTail).split('\n')
     let fence = false, separator = -1
     for (let i = 0; i < source.length; i++) {
@@ -167,8 +172,15 @@ export class StreamRenderer {
       tail = [source[separator - 1]!, source[separator]!, ...source.slice(Math.max(separator + 1, source.length - maxRows))].join('\n')
     }
     const columns = this.options.getColumns()
-    return formatMarkdown({ text: tail, columns }, this.options.getTheme())
-      .flatMap(line => wrapReadingText(line, Math.max(1, columns - 1))).slice(-maxRows)
+    const rendered = formatMarkdown({ text: tail, columns }, this.options.getTheme())
+      .flatMap(line => wrapReadingText(line, Math.max(1, columns - 1)))
+    const truncated = capLiveTailMarkdownSafe(this.pending + extraTail, columns, maxRows) !== this.pending + extraTail
+      || rendered.length > maxRows
+    const visible = rendered.slice(-maxRows)
+    if (!disclosure || !truncated) return { lines: visible, notice: false }
+    const hint = columns < 80 ? `仅展示末 ${visible.length} 行 · 完成后 /pager 全文`
+      : `当前仅展示末 ${visible.length} 行，完成后可查看完整历史 · /pager`
+    return { lines: [color(truncateToDisplayWidth(hint, Math.max(1, columns - 1), { ambiguousAsWide: true }), this.options.getTheme().muted), ...visible], notice: true }
   }
 
   private commitText(text: string): boolean {

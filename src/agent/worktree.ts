@@ -1,4 +1,5 @@
 import { spawnGitSync, spawnGit } from '../tools/spawn-git.js'
+import { detectSensitiveFile } from '../tools/sensitive-file-detector.js'
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -299,6 +300,19 @@ export interface UnlandedWork {
   dirty: boolean
   /** Commits on the worktree branch not reachable from the main workspace HEAD. */
   unmergedCommits: number
+}
+
+/** Desktop commits exactly the index; file selection is a separate action. */
+export function commitIndex(cwd: string, message: string): CommitAllResult {
+  const staged = git(cwd, ['diff', '--cached', '--name-only', '-z'])
+  if (!staged.ok) return { ok: false, error: staged.stderr || 'cannot read index' }
+  const files = staged.stdout.split('\0').filter(Boolean)
+  if (!files.length) return { ok: true, nothingToCommit: true }
+  if (files.some(file => detectSensitiveFile(file).sensitive)) return { ok: false, error: 'sensitive files cannot be committed from desktop' }
+  const result = git(cwd, ['commit', '-m', message])
+  if (!result.ok) return { ok: false, error: result.stderr || result.stdout || 'git commit failed' }
+  const sha = git(cwd, ['rev-parse', 'HEAD'])
+  return { ok: true, sha: sha.ok ? sha.stdout.trim() : undefined }
 }
 
 /**

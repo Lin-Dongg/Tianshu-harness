@@ -144,6 +144,7 @@ export const HELP_TEXT = `天枢帮助
 /pager — 分页浏览历史输出（滚走的内容可回看）
 /palette — 打开命令面板（模糊搜索全部命令与界面动作，同 Ctrl+P）
 /glance [compact|full] — 切换概览栏密度（单行 / 完整）
+/metrics — 查看会话缓存 / 上下文 / 计价来源 / 分支 / 推理档位
 /panel [on|off] — 开关右侧面板（无参切换）
 /rewind — 打开 rewind 浮层：回退到历史消息点（只回对话 / 只回代码 / 两者）
 /starmap — 星图总览浮层 — 看整张星图与你的位置

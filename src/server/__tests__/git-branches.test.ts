@@ -22,6 +22,16 @@ import type { OaiMessage } from '../../api/oai-types.js'
 const TOKEN = 'tok'
 const AUTH = { authorization: `Bearer ${TOKEN}` }
 
+test('GET /git/graph returns an identifiable empty state for a non-repository', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'rivet-nonrepo-graph-'))
+  try {
+    const manager = new RuntimeSessionManager({ createAgent: () => new BranchAgent(), defaultCwd: dir })
+    const response = await createRouter(buildSessionRoutes(manager, TOKEN))('GET', '/git/graph', {}, AUTH)
+    assert.equal(response.status, 200)
+    assert.deepEqual(response.body, { graph: [], notARepo: true })
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
 class BranchAgent implements ManagedAgent {
   run(_prompt: string): Promise<void> { return Promise.resolve() }
   finish(): void {}

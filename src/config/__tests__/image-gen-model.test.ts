@@ -145,6 +145,56 @@ describe('image generation model config (issue #8)', () => {
     assert.deepEqual(second, first)
   })
 
+  // D2a：重注册/重选模型走的是「槽整体替换」——用户配好的 prompt/size/timeoutMs
+  // 会在一次兼容重注册里被清空。同 provider 重注册必须把这些通用生成参数留下。
+  it('preserves prompt/size/timeoutMs/sizeField across a compatible re-registration (D2a)', () => {
+    registerImageGenModelConfig({
+      providerName: 'imagegen-preserve',
+      baseUrl: 'https://api.siliconflow.com/v1',
+      apiKeyEnv: 'IMAGE_GEN_API_KEY',
+      modelId: 'flux-pro',
+    })
+    // 槽上附加生成参数（桌面端保存路径：只写槽，不碰 provider）。
+    setImageGenModelConfig({
+      provider: 'imagegen-preserve',
+      model: 'flux-pro',
+      prompt: 'a cinematic photo of',
+      size: '1024x1024',
+      timeoutMs: 60_000,
+      sizeField: 'image_size',
+    })
+    const saved = registerImageGenModelConfig({
+      providerName: 'imagegen-preserve',
+      baseUrl: 'https://api.siliconflow.com/v1',
+      apiKeyEnv: 'IMAGE_GEN_API_KEY',
+      modelId: 'flux-pro',
+    })
+    assert.equal(saved.prompt, 'a cinematic photo of', 'prompt 保留')
+    assert.equal(saved.size, '1024x1024', 'size 保留')
+    assert.equal(saved.timeoutMs, 60_000, 'timeoutMs 保留')
+    assert.equal(saved.sizeField, 'image_size', '同 provider 重注册继承 sizeField')
+    assert.deepEqual(getImageGenModelConfig(), saved, '落盘与返回值同为合并后的完整槽')
+  })
+
+  // sizeField 是线上 wire name，跟 provider 绑定：跨 provider 沿用旧值会发错字段名。
+  it('does not inherit sizeField across providers on a fresh registration (D2a)', () => {
+    registerImageGenModelConfig({
+      providerName: 'imagegen-a',
+      baseUrl: 'https://api.siliconflow.com/v1',
+      apiKeyEnv: 'IMAGE_GEN_API_KEY',
+      modelId: 'flux-pro',
+      sizeField: 'image_size',
+    })
+    const saved = registerImageGenModelConfig({
+      providerName: 'imagegen-b',
+      baseUrl: 'https://api.openai.com/v1',
+      apiKeyEnv: 'IMAGE_GEN_API_KEY',
+      modelId: 'gpt-image-1',
+    })
+    assert.equal(saved.provider, 'imagegen-b')
+    assert.equal('sizeField' in saved, false, '跨 provider 不继承旧 provider 的 sizeField wire name')
+  })
+
   // ── setImageGenModelConfig：只写槽，provider 必须已存在 ────────────────────
   // 与 register 的分工：register 负责"注册一个专用 provider 并选它"（一次写入），
   // set 负责"从一个已存在的 provider 里选模型"（桌面端下拉框路径）。

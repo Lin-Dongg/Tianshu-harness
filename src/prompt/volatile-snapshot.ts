@@ -9,7 +9,7 @@ import { generateCodebaseIndexBlock, getHeadSha } from '../repo/codebase-index.j
 import { detectCwdRelation } from './self-recognition.js'
 import type { VolatileContext } from './volatile.js'
 import { standardPromptBlocks, type PromptBlockPolicy } from './block-policy.js'
-import { projectInstructionsAllowed } from '../config/project-trust.js'
+import { projectInstructionsAllowed, projectStateAllowed } from '../config/project-trust.js'
 
 export interface SnapshotInput {
   cwd: string
@@ -66,13 +66,19 @@ export function createVolatileSnapshot(input: SnapshotInput): VolatileContext {
 
   // 显式传入的块（调用方已备好内容）不受档位开关影响——档位只管「自动加载什么」，
   // 不越权丢弃调用方明确要求注入的内容。
+  // 自动加载过 #218 信任门的 .rivet 状态面扩展（projectStateAllowed，2026-10-03
+  // 安全报告链 A/B）：memory/manifest 随仓库分发，未受信目录不读不注入。
   const projectMemoryBlock = input.projectMemoryBlock
-    ?? (policy.blocks.projectMemory ? loadProjectMemory(input.cwd).content : undefined)
+    ?? (policy.blocks.projectMemory && projectStateAllowed(input.cwd)
+      ? loadProjectMemory(input.cwd).content
+      : undefined)
 
   // Wave 4b（知识重构）：manifest 路由地图——"何时该召回什么"的索引，
   // 会话启动快照一次，进 frozen base，知识本文一律走 recall。
   const knowledgeManifestBlock = input.knowledgeManifestBlock
-    ?? (policy.blocks.knowledgeManifest ? loadKnowledgeManifestBlock(input.cwd) : undefined)
+    ?? (policy.blocks.knowledgeManifest && projectStateAllowed(input.cwd)
+      ? loadKnowledgeManifestBlock(input.cwd)
+      : undefined)
 
   // 常驻注入的是 gist 索引，不是正文（943414c2）：每星一行摘要进 frozen，
   // 完整方法论经 recall_capsule 按需拉取。行为护栏本身不在这里——V3.1

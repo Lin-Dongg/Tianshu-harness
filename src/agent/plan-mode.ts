@@ -1,6 +1,6 @@
 /** Plan Mode — 只读探索→执行的二态控制 */
 
-import { resolve } from 'node:path'
+import { isAbsolute, relative, resolve, win32 } from 'node:path'
 import { formatPermissionChrome } from './approval-vocabulary.js'
 import type { ApprovalMode } from './loop-types.js'
 
@@ -114,6 +114,25 @@ export interface PlanModeResult {
 /** 生成新的活动计划草稿路径（相对 cwd） */
 export function createActivePlanDraftPath(): string {
   return `.rivet/plans/draft-${Date.now()}.md`
+}
+
+/**
+ * 瞬态计划草稿判据——`createActivePlanDraftPath()` 产出的形状。
+ *
+ * 两个消费方共用同一判据（避免各自内联正则漂移）：
+ * - `loop.ts::releasePlanModeArtifacts` 释放草稿（删事件 + 清归属）；
+ * - `task-state-persist.ts` 的证据口径——草稿不是代码证据，它的写入/删除
+ *   都不得让代码验证失效（否则在 plan mode 里写草稿会连带作废此前跑过的
+ *   测试，退出后仍留 stale 标记）。
+ */
+export function isTransientPlanDraftPath(p: string | null | undefined, cwd?: string): boolean {
+  if (!p) return false
+  let path = p.replace(/\\/g, '/')
+  if (isAbsolute(path) || win32.isAbsolute(path)) {
+    if (!cwd) return false
+    path = (win32.parse(cwd).root.length > 1 ? win32.relative(cwd, p) : relative(cwd, path)).replace(/\\/g, '/')
+  }
+  return /^\.rivet\/plans\/draft-\d+\.md$/.test(path.replace(/^\.\//, ''))
 }
 
 /**

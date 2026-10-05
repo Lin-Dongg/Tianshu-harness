@@ -6,7 +6,7 @@ import { validatePath } from './path-validate.js'
 import { syntaxCheck, checkSyntax } from './syntax-check.js'
 import { detectPointerPlaceholder, pointerPlaceholderError, resolveIdempotentPointer } from './pointer-guard.js'
 import { asBool } from './write-tool-helpers.js'
-import { getFileReadMtime, noteFileObserved, recordSuccessfulEdit, wasFileEditedBySession, incrementEditFailCount, resetEditFailCount } from './read-file.js'
+import { getFileReadContentHash, noteFileObserved, recordSuccessfulEdit, incrementEditFailCount, resetEditFailCount } from './read-file.js'
 import { landingWriteFile, delegatedToToolResult, isDelegateRejected } from './client-delegate.js'
 import { trackFileChange, restoreLatestBackup } from '../agent/recovery-stack.js'
 import { detectEol, chooseEol, toLf, applyEol } from './line-endings.js'
@@ -91,8 +91,11 @@ async function finalizeHashEdit(
     if (restored) {
       try {
         const s = await stat(filePath)
-        noteFileObserved(filePath, s.mtimeMs, s.size, sessionId)
-      } catch { /* stat 失败不影响主流程 */ }
+        // 回滚恢复的是编辑前内容：读回重建内容哈希基线——否则位置锚点检查
+        // （要求完整观察且内容未变）会因 mtime 变化误报为「文件已变化」。
+        const content = await readFile(filePath, 'utf8')
+        noteFileObserved(filePath, s.mtimeMs, s.size, sessionId, content)
+      } catch { /* stat/readFile 失败不影响主流程 */ }
     }
     const fails = incrementEditFailCount(filePath)
     const gatePrefix = fails >= 3 ? `此文件已连续 hash_edit 失败 ${fails} 次，再次编辑前必须先重新 read_file。\n\n` : ''
@@ -188,6 +191,8 @@ function recoverStaleAnchors(anchors: Anchor[], lines: string[]): Anchor[] | nul
   for (let i = 0; i < anchors.length; i++) {
     const anchor = anchors[i]!
     if (anchor.hash === null) continue // position-only anchors are not recovered by content
+    const candidates = lines.flatMap((line, n) => hashLine(line) === anchor.hash ? [n + 1] : [])
+    if (candidates.length !== 1) return null
 
     const found =
       findAnchorLine(anchor.hash, anchor.line, lines, usedLines, RECOVERY_NEAR_WINDOW)
@@ -214,11 +219,12 @@ function findAnchorLine(
 ): number | null {
   const searchStart = Math.max(1, expectedLine - window)
   const searchEnd = window === Infinity ? lines.length : Math.min(lines.length, expectedLine + window)
+  let found: number | null = null
   for (let i = searchStart; i <= searchEnd; i++) {
     if (usedLines.has(i)) continue
-    if (hashLine(lines[i - 1]!) === hash) return i
+    if (hashLine(lines[i - 1]!) === hash) { if (found !== null) return null; found = i }
   }
-  return null
+  return found
 }
 
 function findShiftedAnchorLine(
@@ -256,21 +262,6 @@ function formatStaleDiagnostic(
 
   const all_anchors = anchors.map(a => `  L${a.line}:${a.hash}`).join('\n')
 
-  // Ready-to-use retry anchors: for each original anchor, substitute the
-  // CURRENT hash at the same line (the diagnostic already computed it for
-  // mismatches; verified anchors keep their hash). Only offered when every
-  // anchor line still exists — an <eof> mismatch has no valid substitute.
-  // Without this, the model has no recovery path in-context: "re-read" is a
-  // dead end because read_file output carries no line hashes (only grep does),
-  // so models loop on remembered dead anchors (2026-07-06 TDX session).
-  const retryable = mismatches.every(m => m.actualHash !== '<eof>')
-  const retryAnchors = retryable
-    ? anchors.map(a => {
-        const mismatch = mismatches.find(m => m.anchor === a)
-        const hash = mismatch ? mismatch.actualHash : (a.hash ?? hashLine(lines[a.line - 1] ?? ''))
-        return `"L${a.line}:${hash}"`
-      }).join(', ')
-    : null
 
   return [
     `hash_edit 在 ${filePath} 上失败：${mismatches.length} 个锚点已过期。`,
@@ -282,14 +273,8 @@ function formatStaleDiagnostic(
     '过期锚点（该行当前哈希）：',
     lines_of_evidence,
     '',
-    ...(retryAnchors
-      ? [
-          `若上方所示 "content" 正是你要替换的行，请立即用以下锚点重试：anchors: [${retryAnchors}]`,
-          '若不是正确的行，请用 grep 重新定位目标（grep 输出含新鲜的 L<line>:<hash> 锚点提示；read_file 不会输出哈希）。',
-        ]
-      : [
-          '锚点行号超出当前文件长度。请用 grep 重新定位目标（grep 输出含新鲜的 L<line>:<hash> 锚点提示；read_file 不会输出哈希）。',
-        ]),
+    '请先重新 read_file 确认目标语义，或用 grep 重新定位目标并取得新鲜的 L<line>:<hash> 锚点。',
+    '禁止只把旧行号的哈希换成当前值后重试；同一位置可能已是别的内容。',
     '不要再用已经用过的锚点重试——它们是一次性坐标，完全相同的调用还会再次失败。',
   ].join('\n')
 }
@@ -377,9 +362,8 @@ new_string 必须是真实文件内容；把历史里的
     }
 
     // Check file exists asynchronously
-    let fileStat: Awaited<ReturnType<typeof stat>>
     try {
-      fileStat = await stat(filePath)
+      await stat(filePath)
     } catch {
       return { content: `错误：文件未找到：${filePath}`, isError: true }
     }
@@ -422,36 +406,15 @@ new_string 必须是真实文件内容；把历史里的
     const content = toLf(rawContent)
     const lines = content.split('\n')
 
-    // Staleness guard for position-only anchors: if every anchor omits the
-    // hash (fast-path mode), the file must not have been modified since the
-    // last read_file.  Without this check, consecutive position-only
-    // hash_edit calls on the same file silently operate on shifted line
-    // numbers — the first edit changes the file, and the second edit's
-    // L<num> anchors point to wrong locations because the tool never
-    // verifies content after the first mutation.
-    const currentMtime = fileStat.mtimeMs
-    const posOnly = anchors.every(a => a.hash === null)
-    let positionDriftWarning = false
-    if (posOnly) {
-      const lastReadMtime = getFileReadMtime(filePath, params.sessionId)
-      if (lastReadMtime !== null && currentMtime !== lastReadMtime) {
-        // File was modified since last read_file (likely by a prior hash_edit
-        // in this turn). Position-only anchors may have drifted — flag for
-        // warning, but still attempt the edit (line-existence check below
-        // catches out-of-bounds).
-        positionDriftWarning = true
-        noteFileObserved(filePath, currentMtime, fileStat.size, params.sessionId)
+    // Position anchors require a complete content observation, including mixed anchors.
+    // A write invalidates that observation; fresh full-hash anchors remain usable.
+    if (anchors.some(a => a.hash === null) && anchors.every(a => a.line <= lines.length)) {
+      const observed = getFileReadContentHash(filePath, params.sessionId)
+      const current = createHash('sha256').update(rawContent).digest('hex')
+      if (!observed || observed !== current) return {
+        content: '错误：仅位置锚点缺少有效读取基线或文件内容已变化。请重新 read_file 或使用内容哈希锚点；未写入文件。',
+        isError: true,
       }
-    }
-
-    // Position-only anchors after a session file edit: the first edit shifts
-    // line numbers. Don't hard-reject — still attempt the edit (line-existence
-    // check catches out-of-bounds), but surface a clear warning. The fresh
-    // anchor passback from the previous edit gives the model L<num>:<hash>
-    // anchors that sidestep this issue entirely.
-    if (posOnly && wasFileEditedBySession(filePath, params.sessionId)) {
-      positionDriftWarning = true
-      noteFileObserved(filePath, currentMtime, fileStat.size, params.sessionId)
     }
 
     // Verify all anchors — compute line hashes and match
@@ -507,15 +470,11 @@ new_string 必须是真实文件内容；把历史里的
           const recoveredInfo = recoveredCount > 0
             ? `（已自动恢复 ${recoveredCount} 个过期锚点）`
             : ''
-          const posDrift = positionDriftWarning
-            ? '⚠ 在上次读取后已修改的文件上使用了仅位置锚点——行号可能已漂移。请核实结果或改用 edit_file。'
-            : ''
-          const extraWarn = [posDrift].filter(Boolean).join('\n\n')
           const freshAnchors = buildFreshAnchors(newContent.split('\n'), before.length, newLines.length)
           return await finalizeHashEdit(
             filePath, params.cwd, newContent, params.sessionId,
             `hash_edit${recoveredInfo} 已应用到 ${filePath}：将 L${firstLine}-L${lastLine}（${lastLine - firstLine + 1} 行）替换为 ${newLines.length} 行${freshAnchors}`,
-            extraWarn,
+            '',
           )
         }
       }
@@ -554,15 +513,11 @@ new_string 必须是真实文件内容；把历史里的
         return delegatedToToolResult(land.delegated)
       }
     }
-    const posDrift = positionDriftWarning
-      ? '⚠ 在上次读取后已修改的文件上使用了仅位置锚点——行号可能已漂移。请核实结果或改用 edit_file。'
-      : ''
-    const extraWarn = [posDrift].filter(Boolean).join('\n\n')
     const freshAnchors = buildFreshAnchors(newContent.split('\n'), before.length, newLines.length)
     return await finalizeHashEdit(
       filePath, params.cwd, newContent, params.sessionId,
       `hash_edit 已应用到 ${filePath}：将 L${firstLine}-L${lastLine}（${lastLine - firstLine + 1} 行）替换为 ${newLines.length} 行${freshAnchors}`,
-      extraWarn,
+      '',
     )
   },
 

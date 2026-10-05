@@ -10,9 +10,9 @@
  * 2) 终值小于盘上值时不得倒扣（"仅补写、无守卫"的修法下 RED）；
  * 3) listener 快照同样只增不减（修补前 RED——倒扣会把尾账连同更早的账一起吃掉）。
  */
-import { describe, it } from 'node:test'
+import { describe, it, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, writeFileSync, existsSync } from 'node:fs'
+import { mkdtempSync, readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { AgentLoop } from '../loop.js'
@@ -115,3 +115,7 @@ describe('收尾 tokenUsage 尾账：drain 终值快照 + 单调守卫（第四�
     assert.equal(after.tokenUsage?.prompt, 100_000, 'listener 快照不得倒扣——否则尾账会被反复吃掉')
   })
 })
+
+const isolatedHome = mkdtempSync(join(tmpdir(), 'worker-fixture-home-'))
+process.env.RIVET_HOME = isolatedHome
+after(() => rmSync(isolatedHome, { recursive: true, force: true }))

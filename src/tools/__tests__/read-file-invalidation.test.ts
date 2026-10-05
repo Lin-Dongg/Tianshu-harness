@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, utimesSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, utimesSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import {
@@ -295,11 +295,11 @@ describe('in-process concurrent session isolation', () => {
     assert.ok(!editB.content.includes('你在当前会话中曾编辑过'), `B did not edit this file: ${editB.content.slice(0, 160)}`)
   })
 
-  it('position-only hash_edit after edits warns about drift instead of hard-rejecting', async () => {
-    // ff25d68b 守卫减负：「仅位置锚点 + 已编辑」不再硬拒绝——仍尝试编辑
-    // （越界由行号存在性检查兜底），但必须带漂移警告。警告有两条触发路径：
-    // 本会话编辑过（session-scoped）与读后 mtime 变化（跨会话也触发——
-    // 文件确实被改了，行号漂移对 B 同样真实）。
+  it('position-only hash_edit after content drift is hard-rejected (G16: stale baseline refuses)', async () => {
+    // G16 收紧（落地计划第 3 节：已漂移/未知基线的位置锚点拒绝）：
+    // ff25d68b 的「警告 + 照常写入」被撤销——位置锚点的前提是「完整内容观察
+    // 且此后未变」，内容漂移后必须重新 read_file（或改用内容哈希锚点）。
+    // 两条漂移路径都必须拒绝：本会话编辑过 / 读后被其他会话改动。
     const fp = makeBigFile('src/pos.txt')
     await READ_FILE_TOOL.execute(params({ file_path: fp }, 'sessA'))
     await READ_FILE_TOOL.execute(params({ file_path: fp }, 'sessB'))
@@ -311,24 +311,28 @@ describe('in-process concurrent session isolation', () => {
     }, 'sessA'))
     assert.ok(!editA.isError)
 
-    // A edited the file → A's position-only hash_edit succeeds WITH drift warning
+    // A edited the file → A's position-only baseline is stale → hard reject
     const hA = await HASH_EDIT_TOOL.execute(params({
       file_path: fp,
       anchors: ['L5'],
       new_string: 'A POS EDIT'.padEnd(80, ' '),
     }, 'sessA'))
-    assert.ok(!hA.isError, `A must not be hard-rejected: ${hA.content.slice(0, 160)}`)
-    assert.ok(hA.content.includes('仅位置锚点'), `A gets a drift warning: ${hA.content.slice(0, 160)}`)
+    assert.ok(hA.isError, `A's stale position-only edit must be rejected: ${hA.content.slice(0, 160)}`)
+    assert.ok(hA.content.includes('仅位置锚点'), `A rejection cites position-only baseline: ${hA.content.slice(0, 160)}`)
 
-    // B did not edit, but the file changed under B's feet since its read →
-    // mtime drift path also warns (and the edit still goes through).
+    // B did not edit, but the file changed under B's feet since B's read → reject too
     const hB = await HASH_EDIT_TOOL.execute(params({
       file_path: fp,
       anchors: ['L5'],
       new_string: 'B POS EDIT'.padEnd(80, ' '),
     }, 'sessB'))
-    assert.ok(!hB.isError, `B must not be hard-rejected: ${hB.content.slice(0, 160)}`)
-    assert.ok(hB.content.includes('仅位置锚点'), `B gets a drift warning: ${hB.content.slice(0, 160)}`)
+    assert.ok(hB.isError, `B's stale position-only edit must be rejected: ${hB.content.slice(0, 160)}`)
+    assert.ok(hB.content.includes('仅位置锚点'), `B rejection cites position-only baseline: ${hB.content.slice(0, 160)}`)
+
+    // Rejected edits must not have written anything
+    const raw = readFileSync(fp, 'utf8')
+    assert.ok(raw.includes('A EDIT'), 'original A edit preserved')
+    assert.ok(!raw.includes('A POS EDIT') && !raw.includes('B POS EDIT'), 'no partial writes from rejected position-only edits')
   })
 })
 

@@ -97,8 +97,16 @@ test('GET /stream：从未收到相位变化的会话不发 zen_phase——不�
     undefined,
     '无镜像必须静默（禅未启用的会话不该凭空出现相位徽章）',
   )
-  assert.equal(frames[0]?.event, 'replay_window', '首帧仍是 replay_window')
-  assert.equal(frames[1]?.event, 'job_snapshot', '次帧仍是 job_snapshot')
+  const events = frames.map((f) => f.event)
+  assert.equal(events[0], 'replay_window', '首帧仍是 replay_window')
+  // 建连元事件前缀（都在回放主体之前）自 PR #353 起多了一条 delegation_snapshot：
+  //   replay_window → delegation_snapshot → job_snapshot。本会话没有 zen_phase，
+  // 但「没有 zen 相位」不等于「没有 job 快照」。
+  assert.deepEqual(
+    events.slice(0, 3),
+    ['replay_window', 'delegation_snapshot', 'job_snapshot'],
+    'job_snapshot 仍在回放主体之前',
+  )
 })
 
 test('GET /stream：有相位镜像时补发 zen_phase（seq=0，载荷逐字透传，帧序在回放主体之前）', async () => {
@@ -119,7 +127,13 @@ test('GET /stream：有相位镜像时补发 zen_phase（seq=0，载荷逐字透
   assert.deepEqual(frame!.payload.data, mirror, '镜像逐字透传，路由不重算不解码')
   // 帧序必须与另两条 seq=0 元事件一致：都在回放主体之前——否则客户端会在
   // 折叠完历史事件之后才收到快照，相位被历史里更早的 zen_phase 覆盖。
-  assert.deepEqual(frames.map((f) => f.event), ['replay_window', 'job_snapshot', 'zen_phase'])
+  // 元事件序：replay_window → delegation_snapshot（PR #353）→ job_snapshot → zen_phase；
+  // approval_snapshot 例外，刻意排在回放/补齐之后（见 approval-snapshot.test.ts）。
+  assert.deepEqual(
+    frames.map((f) => f.event),
+    ['replay_window', 'delegation_snapshot', 'job_snapshot', 'zen_phase', 'approval_snapshot'],
+    'zen_phase 与另两条建连快照同在回放主体之前',
+  )
 })
 
 test('getZenPhaseMirror：读会话 record 上的镜像；未知会话/新会话都是 undefined', () => {

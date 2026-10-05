@@ -71,7 +71,9 @@ describe('askSideQuestion', () => {
     const captured: { request?: OaiChatRequest } = {}
     await askSideQuestion(deps(replying('答案', captured)), { question: 'q' })
     assert.equal(captured.request?.tools, undefined)
-    assert.equal(captured.request?.tool_choice, 'none')
+    // 新骨架以「不提供 tools」表达无工具——协议上无 tools 则 tool_choice 缺席，
+    // 不再发旧的 tool_choice:'none' 形态。
+    assert.equal(captured.request?.tool_choice, undefined)
   })
 
   it('不携带 prefixProbe，主路径 wire 基线不被污染', async () => {
@@ -126,8 +128,11 @@ describe('askSidePath — 共享骨架的记账', () => {
     assert.deepEqual(booked, [900])
   })
 
-  it('usage 为空时不记账（别往账本里塞零行）', async () => {
-    const booked: number[] = []
+  it('usage 缺失时按未知观察上报（不伪造数字；归零/落盘由 recorder 决定）', async () => {
+    // 设计第 6 节：「不再以 input>0 作为有用量条件；未知 input 保留字段状态
+    // unknown，不能记为已知零」。丢弃守卫位于 side-path-usage-recorder
+    // （全空且无 observation 才丢），通道层不再吞掉空观察。
+    const booked: Array<Partial<import('../../api/types.js').Usage>> = []
     const client: StreamClient = {
       stream: async (_r: OaiChatRequest, cb: StreamCallbacks) => {
         cb.onTextDelta('x')
@@ -135,9 +140,10 @@ describe('askSidePath — 共享骨架的记账', () => {
       },
     }
     await askSidePath(
-      { ...deps(client), recordUsage: u => { booked.push(u.input_tokens ?? 0) } },
+      { ...deps(client), recordUsage: u => { booked.push(u) } },
       { instruction: 'q' },
     )
-    assert.equal(booked.length, 0)
+    assert.equal(booked.length, 1, '空 usage 也带身份上报——未覆盖请求数才能在聚合侧可见')
+    assert.equal(booked[0]!.input_tokens, undefined, '未知保持 unknown，不得记为已知零')
   })
 })

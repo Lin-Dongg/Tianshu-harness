@@ -1,3 +1,4 @@
+import { withWorkspaceRoots } from '../../../tools/workspace-context.js'
 import { test, describe, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
@@ -40,7 +41,7 @@ describe('NDJSON 帧解码', () => {
  *  - hang：init 后一声不吭（watchdog 击杀用）
  *  - crash：init 后 exit(1)
  *  - echo-steer：收到 steer 帧后把它放进 result.summary 证明下行通路 */
-function writeFixture(dir: string, mode: 'ok' | 'hang' | 'crash' | 'echo-steer' | 'big-frame' | 'grandchild-hang' | 'grandchild-survive'): string {
+function writeFixture(dir: string, mode: 'ok' | 'hang' | 'crash' | 'echo-steer' | 'big-frame' | 'grandchild-hang' | 'grandchild-survive' | 'echo-roots'): string {
   const src = `
 const { createInterface } = require('node:readline')
 const dec = (${createFrameDecoder.toString()})()
@@ -73,6 +74,7 @@ rl.on('line', (line) => {
         process.stdout.end(() => process.exit(0))
         return
       }
+      if (mode === 'echo-roots') { send({ t: 'result', run: { result: { workOrderId:'wo_test',status:'passed',summary:JSON.stringify(msg.payload.config.workspaceRoots),findings:[],artifacts:[],changedFiles:[],risks:[],nextActions:[],evidenceStatus:'verified' },transcript:{text:'',thinking:'',toolUses:[],toolResults:[],repairAttempts:0,errors:[]},usage:{input_tokens:0,output_tokens:0},messages:[],turnCount:0 }});process.stdout.end(()=>process.exit(0));return }
       if (mode === 'hang') return // 一声不吭
       if (mode === 'crash') { process.exit(1) }
       if (mode === 'big-frame') {
@@ -145,6 +147,13 @@ const baseOpts = (fixture: string): WorkerOopOptions => ({
 
 describe('OOP 运行器（真子进程假 agent）', () => {
   const dir = mkdtempSync(join(tmpdir(), 'worker-oop-test-'))
+
+  test('serializes all inherited workspace roots into the real child init frame', async () => {
+    const roots=[process.cwd(),join(process.cwd(),'desktop')]
+    const fixture=writeFixture(dir,'echo-roots')
+    const run=await withWorkspaceRoots(roots,()=>runWorkerSessionOop(makeConfig(),{...baseOpts(fixture),spawnOverride:(_e,script)=>spawn(process.execPath,[script],{stdio:['pipe','pipe','pipe']})}))
+    assert.deepEqual(JSON.parse(run.result.summary),roots)
+  })
 
   test('活动流 + mailbox 桥 + steer 下行 + result 映射', async () => {
     const activities: Array<[string, string | undefined]> = []

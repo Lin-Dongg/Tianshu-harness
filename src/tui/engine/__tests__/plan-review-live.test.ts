@@ -38,20 +38,22 @@ test('Esc 收起审阅卡，不调用结算', () => {
   const plain = visible(out)
   assert.equal(settled, undefined, 'Esc 不结算')
   assert.ok(!plain.includes('批准并执行'), `dismissed: ${plain}`)
-  assert.ok(plain.includes('❯'))
+  assert.match(plain, /待审批.*Tab 返回卡片/)
+  assert.equal(app.pendingPlanApproval?.slug, PLAN.slug)
 })
 
-test('数字键 1 结算批准', () => {
+test('数字键 1 结算批准', async () => {
   const { app, stdin } = makeApp({ cols: 80, rows: 24 })
   let settled: string | undefined
   app.onPlanReviewSettle = (id) => { settled = id }
   app.openPlanApprovalPanel(PLAN, { body: BODY, date: '2026-08-26' })
   stdin.dataHandler!('1')
   assert.equal(settled, 'approve')
+  await new Promise(r => setImmediate(r))
   assert.equal(app.pendingPlanApproval, undefined)
 })
 
-test('f 进入反馈，Enter 驳回并带上输入框文本', () => {
+test('f 进入反馈，Enter 驳回并带上输入框文本', async () => {
   const { app, out, stdin } = makeApp({ cols: 80, rows: 24 })
   let settled: string | undefined
   let comment = ''
@@ -68,5 +70,6 @@ test('f 进入反馈，Enter 驳回并带上输入框文本', () => {
   stdin.dataHandler!('\r')
   assert.equal(settled, '__reject_comment__')
   assert.equal(comment, '改一下')
+  await new Promise(r => setImmediate(r))
   assert.equal(app.pendingPlanApproval, undefined)
 })

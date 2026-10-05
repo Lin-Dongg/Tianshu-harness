@@ -7,8 +7,8 @@ function makeVitals(overrides: Partial<SessionVitalsData> = {}): SessionVitalsDa
   return {
     ctx: { estimatedTokens: 340_000, contextWindow: 1_000_000, ratio: 0.34 },
     cache: [
-      { turn: 10, cacheRead: 90_000, cacheCreation: 10_000 },
-      { turn: 11, cacheRead: 100_000, cacheCreation: 0 },
+      { turn: 10, cacheRead: 90_000, cacheCreation: 10_000, inputTokens: 100_000 },
+      { turn: 11, cacheRead: 100_000, cacheCreation: 0, inputTokens: 200_000 },
     ],
     sensorium: { momentum: 0.5, pressure: 0.3, confidence: 0.7, complexity: 0.4, freshness: 0.6, stability: 0.8 },
     cvm: { overheadRatio: 0.012, throttled: false, ceiling: false },

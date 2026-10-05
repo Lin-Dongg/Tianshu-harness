@@ -228,51 +228,33 @@ describe('worker prompts', () => {
         assert.ok(prompt.includes('只返回一个 JSON 对象'), 'inline 契约要求自产 JSON')
         assert.ok(prompt.includes('"workOrderId"'), 'inline 契约带结果卡 shape')
         assert.ok(prompt.includes('JSON 字符串纪律'), 'inline 契约带转义纪律')
-        assert.ok(!prompt.includes('无需自己输出报告 JSON'), 'inline 不出现收尾说明')
+        assert.ok(!prompt.includes('立即调用 submit_result'), 'inline 不出现收尾说明')
       }
     })
 
-    it('finalized 变体删掉契约段，换成收尾说明', () => {
+    it('finalized 从首轮要求 submit_result，完成时直接提交', () => {
       const prompt = buildWorkerPrompt(scoutOrder(), undefined, { reportContract: 'finalized' })
       assert.ok(!prompt.includes('只返回一个 JSON 对象'), 'finalized 不要求自产 JSON')
       assert.ok(!prompt.includes('JSON 字符串纪律'), 'finalized 不带转义纪律')
       assert.ok(!prompt.includes('"workOrderId"'), 'finalized 不带结果卡 shape')
-      assert.ok(prompt.includes('无需自己输出报告 JSON'), '说明系统会单独索取报告')
-      assert.ok(prompt.includes('系统会在收尾时基于完整会话记录单独索取结构化报告'), '说明收尾轮带历史')
+      assert.ok(prompt.includes('立即调用 submit_result'), '首轮可提交')
+      assert.ok(prompt.includes('不要用散文替代报告'), '同一报告通道')
       // 执行纪律（绿非证明）不属于报告契约，两种变体都保留
       assert.ok(prompt.includes('绿非证明，复现即证'), '执行纪律保留')
     })
 
-    it('buildFinalizationInstruction 引导唯一 submit_result 工具，不诱导散文 JSON', () => {
+    it('buildFinalizationInstruction 引导 submit_result 工具，不诱导散文 JSON', () => {
       const instruction = buildFinalizationInstruction(scoutOrder(), false)
       assert.ok(instruction.includes('工单 ID（原样复制）：wo_contract'), '带 order id')
       assert.ok(instruction.includes('只基于上方对话中实际发生的工具调用及其结果'), '只准基于实际工具调用与结果')
       assert.ok(instruction.includes('不得宣称跑过未执行的验证、读过未读的文件'), '不得编造未执行的验证/未读的文件')
-      assert.ok(instruction.includes('submit_result'), '引导唯一 submit_result 工具提交结果')
+      assert.ok(instruction.includes('submit_result'), '引导 submit_result 工具提交结果')
+      assert.ok(instruction.includes('不要再调用其他工具'), '收尾请求带着 worker 全部工具——必须明说只交报告')
       assert.ok(!instruction.includes('只输出一个 JSON 对象'), '正常路径不再要求裸 JSON——避免诱导散文 JSON')
     })
 
-    it('buildFinalizationInstruction 无工具 fallback 保留完整 JSON shape', () => {
-      const instruction = buildFinalizationInstruction(scoutOrder(), false)
-      assert.ok(instruction.includes('"workOrderId"'), 'fallback 带结果卡 shape')
-      assert.ok(instruction.includes('JSON 字符串纪律'), 'fallback 带转义纪律')
-    })
 
-    it('buildFinalizationInstruction 按写能力选 shape', () => {
-      const writeOrder = createWriteWorkOrder({
-        id: 'wo_contract_w',
-        parentTurnId: 'turn_1',
-        kind: 'patch_proposal',
-        objective: 'Patch a file.',
-        scope: { files: ['src/a.ts'] },
-      })
-      const writeInstruction = buildFinalizationInstruction(writeOrder, true)
-      assert.ok(writeInstruction.includes('patchSummary'), '写工 shape 带 patchSummary')
-      assert.ok(writeInstruction.includes('examinedFiles'), '写工 shape 带 examinedFiles')
-      const readInstruction = buildFinalizationInstruction(scoutOrder(), false)
-      assert.ok(!readInstruction.includes('patchSummary'), '只读 shape 无 patchSummary')
-      assert.ok(readInstruction.includes('必填：列出你读/查过但未修改的全部文件'), '只读 shape 的 examinedFiles 口径')
-    })
+
   })
 
   it('injects a memory knowledge packet for memory, prompt, and recall work orders', () => {
@@ -479,7 +461,7 @@ describe('worker prompts', () => {
     assert.ok(packet.includes('"summary"'))
   })
 
-  it('truncates non-diff artifact content to 2000 chars', async () => {
+  it('preserves complete artifact fields when within packet budget', async () => {
     const longContent = 'x'.repeat(3000)
     const packet = await buildPrimaryWorkerPacket([
       {
@@ -497,8 +479,8 @@ describe('worker prompts', () => {
 
     // Artifact content should be truncated
     assert.ok(packet.length < 4000)
-    assert.ok(packet.includes('…'))
-    assert.ok(!packet.includes('x'.repeat(3000)))
+    assert.ok(packet.includes('x'.repeat(3000)))
+    assert.equal(JSON.parse(packet.match(/<worker_results>([\s\S]*?)<\/worker_results>/)![1]!)[0].artifacts[0].content, longContent)
   })
 
   it('does not truncate diff artifacts', async () => {
@@ -808,9 +790,6 @@ describe('worker prompts', () => {
       assert.ok(writePrompt.includes('sourcesReviewed'), '写 shape 带 sourcesReviewed')
     })
 
-    it('buildFinalizationInstruction fallback shape 也带 sourcesReviewed', () => {
-      const instruction = buildFinalizationInstruction(scoutOrder(), false)
-      assert.ok(instruction.includes('sourcesReviewed'), 'finalization fallback shape 带 sourcesReviewed')
-    })
+
   })
 })

@@ -1,3 +1,4 @@
+import { requestAuditContext } from './call-audit.js'
 import type { StreamClient } from './stream-client.js'
 import type { OaiChatRequest } from './oai-types.js'
 import type { ContentBlock } from './types.js'
@@ -10,6 +11,8 @@ import { acquireRateLimitSlot } from './rate-limiter.js'
 import type { ProviderRetryConfig } from '../config/retry-schema.js'
 
 export interface CodexClientConfig {
+  sessionId?: string
+  providerName?: string
   baseUrl: string
   model: string
   maxTokens: number
@@ -69,6 +72,7 @@ export class CodexClient implements StreamClient {
   ): Promise<void> {
     const body = this.buildRequestBody(request)
 
+    const auditContext = requestAuditContext(this.config, request)
     await withStructuredRetry(async () => {
       const authHeaders = this.config.auth
         ? await this.config.auth.getHeaders()
@@ -97,7 +101,7 @@ export class CodexClient implements StreamClient {
         },
         body: JSON.stringify(body),
         signal: lifecycle.signal,
-      }, 180_000)
+      }, 180_000, undefined, auditContext)
 
       if (!response.ok) {
         const errorBody = await response.text().catch(() => '')

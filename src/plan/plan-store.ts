@@ -7,9 +7,10 @@
  * - 批准的 plan 载入 volatile context 供 agent 执行
  */
 
-import { mkdir, readdir, readFile, stat, writeFile, rm } from 'node:fs/promises'
+import { planRevision } from './plan-revision.js'
+import { mkdir, readdir, readFile, stat, rm } from 'node:fs/promises'
 import { join } from 'node:path'
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 
 export interface PlanDocument {
   /** 文件名 slug (不含 .md) */
@@ -35,6 +36,8 @@ export interface PlanDocument {
 }
 
 export interface PlanOption {
+  recommended?: boolean
+  recommendationReason?: string
   label: string
   description: string
 }
@@ -217,17 +220,24 @@ function buildPlanFrontmatter(options?: readonly PlanOption[]): string {
   return `---\nrivet-options: ${JSON.stringify(options)}\n---\n\n`
 }
 
+export class PlanConflictError extends Error {}
+
 /** 写计划文件。返回写入的文件路径（相对于 cwd） */
 export async function writePlan(
   cwd: string,
   slug: string,
   content: string,
   options?: readonly PlanOption[],
+  expectedContent?: string,
 ): Promise<string> {
   await ensurePlansDir(cwd)
   const filePath = planFilePath(cwd, slug)
   const body = buildPlanFrontmatter(options) + content.replace(PLAN_OPTIONS_FRONTMATTER_RE, '')
-  await writeFile(filePath, body, 'utf-8')
+  if (expectedContent !== undefined && readFileSync(filePath, 'utf-8') !== expectedContent) {
+    throw new PlanConflictError('Plan changed; reload before saving')
+  }
+  // Keep the compare and write together without yielding to another plan action.
+  writeFileSync(filePath, body, 'utf-8')
   return `${PLANS_DIR}/${slug}.md`
 }
 
@@ -359,16 +369,16 @@ export function listPlansSync(cwd: string): PlanDocument[] {
 }
 
 /** 标记计划为已批准（在文件头部插入状态标记） */
-export async function approvePlan(cwd: string, slug: string): Promise<PlanDocument | null> {
-  return markPlanStatus(cwd, slug, 'APPROVED')
+export async function approvePlan(cwd: string, slug: string, expectedRevision?: string, canCommit?: () => boolean): Promise<PlanDocument | null> {
+  return markPlanStatus(cwd, slug, 'APPROVED', expectedRevision, canCommit)
 }
 
 /**
  * 拒绝计划:写入 REJECTED 状态标记而非删除文件,保留原稿供 agent 在其上修订。
  * 返回更新后的文档,计划不存在时返回 null。
  */
-export async function rejectPlan(cwd: string, slug: string): Promise<PlanDocument | null> {
-  return markPlanStatus(cwd, slug, 'REJECTED')
+export async function rejectPlan(cwd: string, slug: string, expectedRevision?: string, canCommit?: () => boolean): Promise<PlanDocument | null> {
+  return markPlanStatus(cwd, slug, 'REJECTED', expectedRevision, canCommit)
 }
 
 /** 在第一个 H1 前插入状态标记，返回更新后的文本（纯函数，无 IO）。
@@ -392,9 +402,13 @@ async function markPlanStatus(
   cwd: string,
   slug: string,
   status: 'APPROVED' | 'REJECTED' | 'EXECUTED',
+  expectedRevision?: string,
+  canCommit?: () => boolean,
 ): Promise<PlanDocument | null> {
   const plan = await readPlan(cwd, slug)
   if (!plan) return null
+  if (canCommit && !canCommit()) return null
+  if (expectedRevision && (plan.status !== 'submitted' || planRevision(plan.content) !== expectedRevision)) return null
 
   const newContent = insertPlanStatusMarker(plan.content, status)
 
@@ -419,7 +433,7 @@ export async function deletePlan(cwd: string, slug: string): Promise<boolean> {
  * 从计划内容解析状态。
  * 查找 "Status: APPROVED" 等标记。
  */
-function parsePlanStatus(content: string): PlanDocument['status'] {
+export function parsePlanStatus(content: string): PlanDocument['status'] {
   if (/Status:\s*EXECUTED/i.test(content)) return 'executed'
   if (/Status:\s*APPROVED/i.test(content)) return 'approved'
   if (/Status:\s*REJECTED/i.test(content)) return 'rejected'

@@ -1,3 +1,4 @@
+import type { ContinuationPrefixProof } from '../../api/continuation-prefix.js'
 /**
  * worker-process 协议 — worker 子进程隔离 v1 的 stdio NDJSON 消息面。
  *
@@ -24,6 +25,7 @@ import type { WorkerActivityKind, WorkerTranscript, WorkerRuntimeDecision, Worke
 export interface SerializedWorkerConfig {
   order: WorkOrder
   cwd: string
+  workspaceRoots?: string[]
   maxTurns: number
   contextWindow: number
   compact: { enabled: boolean; model: string }
@@ -42,6 +44,9 @@ export interface SerializedWorkerConfig {
    *  构造 PromptEngine 时 inheritFrozenFrom 喂回，历史 user 消息恢复原始字节，
    *  前缀缓存只在新 user 边界断尾而非 byte-0 全 miss（2026-09-06 续跑冷启动
    *  全量重建根修；缺省/坏数据经 parseFrozenSnapshotData 降级为冷启动）。 */
+  priorPrefixProof?: ContinuationPrefixProof
+  continuationSource?: string
+  routeReason?: string
   priorFrozenSnapshot?: FrozenSnapshotData
   sessionNonce?: string
   checkpoint?: WorkerCheckpoint
@@ -89,6 +94,7 @@ export interface SerializedWorkerRun {
   messages: OaiMessage[]
   /** 本轮终态导出的冻结前缀快照——parent 侧随 WorkerSessionRun 带回，下一轮
    *  （续跑/复核/重试）经 priorFrozenSnapshot 回传给新进程继承。 */
+  prefixProof?: ContinuationPrefixProof
   frozenSnapshot?: FrozenSnapshotData
   /** worker 会话侧的最终 turn 数（诊断用）。 */
   turnCount: number

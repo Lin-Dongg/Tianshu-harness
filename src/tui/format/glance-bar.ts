@@ -10,6 +10,7 @@ import { formatPermissionChrome } from '../../agent/approval-vocabulary.js'
 import { STAR_DOMAINS } from '../../agent/star-domain.js'
 import { starDomainRegistry } from '../../agent/star-domain-registry.js'
 import { ANSI, color } from '../engine/ansi.js'
+import { formatOfficialUsageBadge, type CachePanelOfficial } from './cache-panel.js'
 
 /** 将绝对路径的 home 前缀替换为 ~（跨平台）。非 home 下原样返回。 */
 export function shortenCwd(cwd: string): string {
@@ -142,6 +143,8 @@ export interface GlanceBarInput {
   cacheStatus?: CacheStatus
   /** DeepSeek 计价时段（仅 provider 为 deepseek 时给出；缺省不渲染计价段） */
   pricingPhase?: 'peak' | 'offpeak'
+  /** 官方余额/用量快照（issue #98 常驻角标）；null/非 ready 不占位 */
+  officialUsage?: CachePanelOfficial | null
   /** 上下文占比 0-1 */
   contextRatio?: number
   /** API 实际 prompt token（用于颜色阈值，反映真实窗口压力） */
@@ -291,6 +294,9 @@ export function formatGlanceRight(input: GlanceBarInput, theme: RivetTheme): str
     }
     // DeepSeek 计价时段：与缓存段相邻（同为费用决策信息）；非 deepseek 缺省不占位
     if (input.pricingPhase) parts.push(formatPricingPhaseBadge(input.pricingPhase, true, theme))
+    // 常驻余额角标（issue #98）——与计价时段相邻（同属「钱」的信号）；
+    // 非 ready 时 formatOfficialUsageBadge 返回 null → 不占位。
+    if (input.officialUsage) { const b = formatOfficialUsageBadge(input.officialUsage, input.pricingPhase, theme); if (b) parts.push(b) }
     // CVM 拦截计数：与缓存/上下文% 同为「会话健康度」常驻指标（issue #247 补充项）
     if (input.cvmInterceptions !== undefined) parts.push(formatCvmBadge(input.cvmInterceptions, theme))
     const cRatio = (input.estimatedTokens && input.maxTokens && input.maxTokens > 0)
@@ -299,7 +305,13 @@ export function formatGlanceRight(input: GlanceBarInput, theme: RivetTheme): str
       const tokenColor = cRatio >= 0.9 ? theme.error : cRatio >= 0.75 ? theme.warning : theme.muted
       parts.push(color(`◧${(cRatio * 100).toFixed(0)}%`, tokenColor) + contextNewSessionHint(cRatio, theme, true))
     }
-    if (input.costSource === 'unknown') parts.push(color('暂无计价', theme.muted))
+    // 费用常驻（compact 档同样显示）：估/API 来源前缀——成本可见性契约。
+    if (input.costSource === 'unknown') {
+      parts.push(color('暂无计价', theme.muted))
+    } else if (input.cost !== undefined && (input.cost > 0 || input.costSource !== undefined)) {
+      const source = input.costSource === 'api' ? 'API ' : input.costSource === 'estimate' ? '≈' : ''
+      parts.push(color(`${source}¥${input.cost.toFixed(2)}`, theme.secondary))
+    }
     const zone = parts.join('  ')
     const elapsedStr = input.elapsedMs !== undefined ? formatElapsed(input.elapsedMs) : ''
     const elapsedColored = color(elapsedStr, input.stalled ? theme.warning : theme.muted)
@@ -349,6 +361,8 @@ export function formatGlanceRight(input: GlanceBarInput, theme: RivetTheme): str
   }
   // DeepSeek 计价时段：与缓存段相邻（同为费用决策信息）；非 deepseek 缺省不占位
   if (input.pricingPhase) parts.push(formatPricingPhaseBadge(input.pricingPhase, false, theme))
+  // 常驻余额角标（issue #98）——与计价时段相邻；非 ready 不占位。
+  if (input.officialUsage) { const b = formatOfficialUsageBadge(input.officialUsage, input.pricingPhase, theme); if (b) parts.push(b) }
   // CVM 拦截计数：与缓存/上下文% 同为「会话健康度」常驻指标（issue #247 补充项）
   if (input.cvmInterceptions !== undefined) parts.push(formatCvmBadge(input.cvmInterceptions, theme))
   const ratio = (input.estimatedTokens && input.maxTokens && input.maxTokens > 0)
@@ -363,7 +377,7 @@ export function formatGlanceRight(input: GlanceBarInput, theme: RivetTheme): str
     parts.push(color('暂无计价', theme.muted))
   } else if (input.cost !== undefined && (input.cost > 0 || input.costSource !== undefined)) {
     // cost > 0 用 secondary 高亮，让用户感知到花费
-    const source = input.costSource === 'api' ? 'API ' : input.costSource === 'estimate' ? '估算 ' : ''
+    const source = input.costSource === 'api' ? 'API ' : input.costSource === 'estimate' ? '≈' : ''
     parts.push(color(`${source}¥${input.cost.toFixed(2)}`, theme.secondary))
   }
   const zone3 = parts.join('  ')

@@ -21,6 +21,8 @@
  */
 
 import { fetchCauseDetail } from './error-classifier.js'
+import { beginCallAudit, auditConfigFingerprint, type CallAuditContext } from './call-audit.js'
+import { observeAuditResponse } from './transport-audit.js'
 
 const DEFAULT_TIMEOUT_MS = 45_000
 
@@ -30,8 +32,15 @@ export async function fetchWithTimeout(
   timeoutMs: number = DEFAULT_TIMEOUT_MS,
   /** undici dispatcher（如 ProxyAgent）——provider 级代理覆盖的透传槽位。 */
   dispatcher?: unknown,
+  auditContext?: CallAuditContext,
 ): Promise<Response> {
   const userSignal = init.signal
+  let model: string | undefined
+  let wireOptions: Record<string, unknown> = {}
+  try { const body = typeof init.body === 'string' ? JSON.parse(init.body) : {}; model = body.model; wireOptions = Object.fromEntries(['thinking', 'reasoning', 'reasoning_effort', 'max_tokens', 'max_output_tokens', 'temperature', 'tool_choice', 'response_format'].map(key => [key, body[key]])) } catch { /* non-model request */ }
+  // OpenAI chat has a richer attempt observer; other protocols use this transport observer.
+  const context = { ...auditContext, configFingerprint: auditConfigFingerprint(wireOptions), model, provider: auditContext?.provider ?? (() => { try { return new URL(url).hostname } catch { return undefined } })(), purpose: auditContext?.purpose ?? 'transport_completion', sessionId: auditContext?.sessionId ?? new Headers(init.headers).get('X-Request-Session') ?? undefined }
+  const audit = model && !String(url).includes('/chat/completions') ? beginCallAudit(context) : undefined
   // Own controller + timer instead of AbortSignal.timeout: AbortSignal.timeout
   // cannot be disarmed, so merging it into the fetch signal would keep counting
   // down through the entire body stream. A clearable timer lets us cover only
@@ -52,8 +61,10 @@ export async function fetchWithTimeout(
     // 重定向只剥 Authorization/Cookie——Anthropic 协议的 x-api-key 会原样转发
     // 到重定向目标（凭证泄漏）。显式传 init.redirect 的调用方不受影响。
     const redirect = init.redirect ?? 'error'
-    return await fetch(url, { ...init, redirect, signal: combinedSignal, ...(dispatcher ? { dispatcher } : {}) } as RequestInit)
+    const response = await fetch(url, { ...init, redirect, signal: combinedSignal, ...(dispatcher ? { dispatcher } : {}) } as RequestInit)
+    return audit ? observeAuditResponse(response, context, audit) : response
   } catch (err) {
+    audit?.finish({ status: userSignal?.aborted ? 'aborted' : 'failed', errorName: (err as Error).name })
     const name = (err as Error).name
     // Our pre-first-byte timeout fired. Always wrap with a descriptive message
     // so error-classifier detects it as a retryable timeout.

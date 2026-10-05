@@ -37,6 +37,7 @@ export interface LiveRegionLine {
   inputLine?: number
   inputStartCol?: number
   decisionPart?: 'title' | 'fact' | 'action' | 'footer'
+  livePart?: 'status' | 'disclosure' | 'tail'
   region?: 'identity' | 'mode' | 'composer'
 }
 
@@ -106,6 +107,25 @@ export function padDynamicRegion(
       if (!selected.has(index) && rows + cost <= budget) { selected.add(index); rows += cost }
     }
     kept = [...selected].sort((a, b) => a - b).map(index => dynamic[index]!)
+  }
+
+  if (!dynamic.some(line => line.decisionPart) && dynamic.some(line => line.livePart === 'status' || line.livePart === 'disclosure')) {
+    const selected = new Set<number>()
+    rows = 0
+    for (const [index, line] of dynamic.entries()) {
+      const cost = rowsForLine(line.text)
+      if ((line.livePart === 'status' || line.livePart === 'disclosure') && rows + cost <= budget) {
+        selected.add(index); rows += cost
+      }
+    }
+    for (let index = dynamic.length - 1; index >= 0; index--) {
+      const cost = rowsForLine(dynamic[index]!.text)
+      if (!selected.has(index) && rows + cost <= budget) { selected.add(index); rows += cost }
+    }
+    kept = [...selected].sort((a, b) => a - b).map(index => dynamic[index]!)
+    const tailRows = kept.filter(line => line.livePart === 'tail').length
+    kept = kept.map(line => line.livePart === 'disclosure'
+      ? { ...line, text: line.text.replace(/末 \d+ 行/, `末 ${tailRows} 行`) } : line)
   }
 
   const padCount = Math.max(0, budget - rows)

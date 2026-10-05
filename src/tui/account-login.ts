@@ -12,6 +12,7 @@
  * （account.json vs `<provider>.json`），登出互不影响。
  * （这里刻意不写出那个函数名：源码守卫断言会扫注释，写出来会被判成误用。）
  */
+import { accountDeviceFingerprint } from '../auth/account-device.js'
 import { hostname } from 'node:os'
 
 /**
@@ -43,7 +44,7 @@ export async function handleAccountLogin(app: StaticLineApp): Promise<boolean> {
 
   let created: Awaited<ReturnType<typeof requestDeviceCode>>
   try {
-    created = await requestDeviceCode({ deviceName: hostname() })
+    created = await requestDeviceCode({ deviceName: hostname(), deviceFingerprint: accountDeviceFingerprint(rivetHome()) })
   } catch (e) {
     // 连不上是最常见的失败（网络/自托管地址错配），单独提示——别让用户对着
     // 「授权未能完成」猜是网络问题还是自己操作错了
@@ -93,12 +94,15 @@ export async function handleAccountLogin(app: StaticLineApp): Promise<boolean> {
  * 所以清账号不会顺手把用户的 codex 登录也清掉。
  */
 export async function handleAccountLogout(app: StaticLineApp): Promise<boolean> {
-  const { accountStore } = await import('../auth/account.js')
+  const { accountStore, revokeAccountSession } = await import('../auth/account.js')
   const { rivetHome } = await import('../config/paths.js')
 
   const store = accountStore(rivetHome())
-  const had = store.load() !== null
+  const credential = store.load()?.accessToken
   store.clear()
-  app.commitStatic(had ? '✅ 已登出天枢账号。' : '当前未登录天枢账号。')
+  let revoked = !credential
+  try { if (credential) revoked = await revokeAccountSession(credential) } catch {}
+  app.commitStatic(credential ? '✅ 已登出天枢账号。重新连接请执行 /login account；设备绑定会保留。' : '当前未登录天枢账号。')
+  if (!revoked) app.commitStatic('⚠️ 远程会话注销未完成，可到官网账号页将旧会话下线。')
   return true
 }

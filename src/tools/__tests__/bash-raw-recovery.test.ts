@@ -28,6 +28,8 @@ describe('bash raw output recovery (bounded spool)', () => {
       assert.equal(result.isError, false)
       assert.ok(result.rawPath, 'rawPath must be present for persisted output')
       const raw = readFileSync(result.rawPath!, 'utf-8')
+      assert.equal(result.displayOutput, raw, 'desktop full display must use captured output, not the UI preview')
+      assert.equal(result.displayOutputTruncated, raw.includes('[raw capture capped'))
       assert.ok(raw.includes(TAIL_SENTINEL), 'recovery content must contain the tail sentinel')
       assert.ok(
         raw.includes(HEAD_SENTINEL),
@@ -52,6 +54,8 @@ describe('bash raw output recovery (bounded spool)', () => {
       assert.ok(result.content.includes(TAIL_SENTINEL), 'model preview keeps the tail')
       // Recovery completeness lives in rawPath.
       const raw = readFileSync(result.rawPath!, 'utf-8')
+      assert.equal(result.displayOutput, raw, 'desktop full display must use captured output, not the UI preview')
+      assert.equal(result.displayOutputTruncated, raw.includes('[raw capture capped'))
       assert.ok(raw.includes(HEAD_SENTINEL), 'rawPath must retain the head')
     } finally {
       rmSync(dir, { recursive: true, force: true })
@@ -75,6 +79,8 @@ describe('bash raw output recovery (bounded spool)', () => {
       assert.equal(result.isError, false)
       assert.ok((result.rawBytes ?? 0) > 9_000_000, 'raw byte accounting counts the full stream')
       const raw = readFileSync(result.rawPath!, 'utf-8')
+      assert.equal(result.displayOutput, raw, 'desktop full display must use captured output, not the UI preview')
+      assert.equal(result.displayOutputTruncated, raw.includes('[raw capture capped'))
       assert.ok(raw.includes(HEAD_SENTINEL), 'head retained up to the spool cap')
       assert.ok(
         raw.includes('[raw capture capped'),
@@ -105,6 +111,8 @@ describe('bash raw output recovery (bounded spool)', () => {
       const m = result.content.match(/@raw 行 (\d+)/)
       assert.ok(m, `智能摘要应输出锚行号，实际 content 片段: ${result.content.slice(0, 200)}`)
       const raw = readFileSync(result.rawPath!, 'utf-8')
+      assert.equal(result.displayOutput, raw, 'desktop full display must use captured output, not the UI preview')
+      assert.equal(result.displayOutputTruncated, raw.includes('[raw capture capped'))
       const rawLines = raw.split('\n')
       const anchorLine = rawLines[Number(m![1]) - 1] ?? ''
       assert.ok(

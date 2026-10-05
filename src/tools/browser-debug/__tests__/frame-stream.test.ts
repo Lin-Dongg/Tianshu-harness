@@ -52,6 +52,7 @@ test('引用计数：首个订阅启动，多订阅者共享一条流，最后�
   unsubA()
   assert.equal(driver.stopCount, 0, '仍有订阅者时不得停播')
   unsubB()
+  await new Promise(resolve => setImmediate(resolve))
   assert.equal(driver.stopCount, 1)
   assert.equal(stream.streaming, false)
 })
@@ -62,6 +63,7 @@ test('退订幂等：重复调用不会多停一次', async () => {
   const unsub = await stream.subscribe(() => {})
   unsub()
   unsub()
+  await new Promise(resolve => setImmediate(resolve))
   assert.equal(driver.stopCount, 1)
 })
 
@@ -81,14 +83,15 @@ test('W2.1 rebind：订阅迁移到新 driver、补一帧、退订停新 driver'
   const adopted = await stream.rebind(asDriver(second))
   assert.equal(adopted, 2)
   assert.equal(second.startCount, 1, '接管时必须在新 driver 上重启推流')
-  assert.deepEqual(got, [99], '接管时补一帧（静态页不会自己产帧）')
+  assert.deepEqual(got, [1], '接管时补一帧（静态页不会自己产帧）')
 
   second.emit(7)
-  assert.deepEqual(got, [99, 7])
+  assert.deepEqual(got, [1, 2])
 
   unsubA()
   assert.equal(second.stopCount, 0, '还有订阅者时不停播')
   unsubB()
+  await new Promise(resolve => setImmediate(resolve))
   assert.equal(second.stopCount, 1, '退订必须停在新 driver 上——旧实现会漏停')
   assert.equal(stream.streaming, false)
 })
@@ -126,7 +129,7 @@ test('rebind 到无能力 driver：订阅保留，不崩；后续接回有能力
   assert.equal(await stream.rebind(asDriver(third)), 1)
   assert.equal(third.startCount, 1)
   third.emit(3)
-  assert.deepEqual(got, [99, 3])
+  assert.deepEqual(got, [1, 2])
 })
 
 test('rebind 启动失败：不留下「正在推流」的假状态', async () => {

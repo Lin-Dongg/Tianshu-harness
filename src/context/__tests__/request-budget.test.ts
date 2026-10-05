@@ -10,12 +10,20 @@ test('multimodal CJK uses the same text accounting as plain text', () => {
   assert.ok(estimateOaiMessageTokens({ role: 'user', content: [{ type: 'text', text }, { type: 'image_url', image_url: { url: 'https://example.invalid/image.jpg' } }] }) > plain)
 })
 
-test('60 percent of the full window is already over the reserved input budget', () => {
+test('outputReserve 用现实预留而非能力上限：60% window 不再超预算（回归 566K 死锁）', () => {
   const policy = deepSeekBudgetPolicy('https://api.deepseek.com/v1', 'deepseek-flash')!
+  // max_tokens 传能力上限 384K——旧行为把它当 outputReserve，inputBudget 仅 612_147、
+  // 60% window 就 blocked；现封顶到 DEEPSEEK_OUTPUT_RESERVE=256_000。
   const budget = buildContextBudget({ model: 'deepseek-flash', max_tokens: 384_000, messages: [{ role: 'user', content: 'x'.repeat(Math.ceil(DEEPSEEK_WINDOW * 0.6) * 4) }] }, policy, { requestId: 'test', revision: 1 })
-  assert.equal(budget.inputBudget, 612_147)
-  assert.equal(budget.state, 'blocked')
-  assert.equal(budget.outputReserve, 384_000)
+  assert.equal(budget.outputReserve, 256_000)
+  assert.equal(budget.inputBudget, 740_147) // 1_048_576 − 256_000 − 52_429
+  assert.notEqual(budget.state, 'blocked', '60% window 应在输入预算内——不再被能力上限堵死')
+})
+
+test('outputReserve 只封顶、不放大：显式的小 max_tokens 原样保留', () => {
+  const policy = deepSeekBudgetPolicy('https://api.deepseek.com/v1', 'deepseek-flash')!
+  const budget = buildContextBudget({ model: 'deepseek-flash', max_tokens: 4_096, messages: [] }, policy, { requestId: 't', revision: 1 })
+  assert.equal(budget.outputReserve, 4_096)
 })
 
 test('unknown relays do not inherit official budgets and smaller configured windows survive', () => {

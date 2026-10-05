@@ -59,8 +59,7 @@ function hasDeliverable(result: WorkerResult): boolean {
  *
  * 只认「占位串」和「空白」两种，**不设长度阈值**：一句 20 字的中文结论
  * （「该函数无任何调用点，可安全删除」）是完全合格的交付，按长度卡会把它误杀。
- * 偏短但有内容的 summary 另有 `maybeExpandSummary` 负责扩写，那是质量问题
- * 不是正确性问题。
+ * 简短但有效的结论直接交付，不为长度再次调用模型。
  */
 function summaryIsEmpty(summary: string): boolean {
   const trimmed = summary.trim()

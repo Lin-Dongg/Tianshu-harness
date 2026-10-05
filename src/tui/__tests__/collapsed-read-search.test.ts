@@ -140,6 +140,17 @@ describe('entryDisplayName', () => {
   it('extracts file_path for read_file', () => {
     assert.equal(entryDisplayName('read_file', { file_path: 'src/foo.ts' }), 'src/foo.ts')
   })
+  it('shows paths from a multi-file read instead of an unknown file', () => {
+    assert.equal(entryDisplayName('read_file', { file_paths: ['src/甲.ts', 'src/乙.ts'] }), 'src/甲.ts, src/乙.ts')
+  })
+  it('keeps multi-file paths in the collapsed read card', () => {
+    const buffer = new CollapsedReadSearchBuffer()
+    buffer.pushUse('multi-read', 'read_file', { file_paths: ['src/甲.ts', 'src/乙.ts'] })
+    buffer.attachResult('multi-read', '读取完成', false)
+    const lines = formatCollapsedGroup({ group: buffer.flush()!, theme, columns: 80 })
+    assert.ok(lines[0]!.includes('src/甲.ts, src/乙.ts'))
+    assert.ok(!lines[0]!.includes('?'))
+  })
   it('extracts pattern and path for grep', () => {
     const name = entryDisplayName('grep', { pattern: 'TODO', path: 'src/' })
     assert.ok(name.includes('"TODO"'))

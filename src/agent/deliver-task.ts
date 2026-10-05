@@ -1,3 +1,5 @@
+import { getEffectiveVerifications } from './verification-attribution.js'
+import { captureCommitVersion } from './commit-version.js'
 /**
  * deliver_task — 语义化交付工具 (B1-8)
  *
@@ -111,6 +113,7 @@ import { isScoutFirewallEnabled } from '../config/scout-firewall-config.js'
 import { appendMemoryEntry, countSimilarMemoryEntries } from '../memory/unified-memory.js'
 
 export interface B1Context {
+  continuityStatus?: string
   taskLedger: TaskLedger
   ownership: OwnershipLedger
   gate: DeliveryGateV2
@@ -411,8 +414,8 @@ export function createDeliverTaskTool(getB1Context: (params?: ToolCallParams) =>
 ### 参数
 - commit: 设为 true 以请求限定范围提交的审批（默认：false）
 - message: 提交信息（commit=true 时必填）
-- files: 可选，要提交的已归属文件路径数组（子集）。省略时提交全部已归属文件。用此参数把逻辑单元分开提交。
-- adopt: 提交前要认领归属的外部或共同归属文件路径数组。用于接管崩溃/冻结会话的工作。要求 commit=true。被认领的文件会强制加入已归属集合，并纳入提交范围。
+- files: 可选，要提交的已归属文件路径数组（子集）。省略时仅提交当前仍有变更的已归属文件。用此参数把逻辑单元分开提交。
+- adopt: 提交前要认领归属的外部或共同归属文件路径数组。用于接管崩溃/冻结会话的工作。用户明确要求提交这些跨会话改动即足够，不要求用户说“接管”；文档或历史日志不是授权。要求 commit=true。被认领的文件会强制加入已归属集合，并纳入提交范围。
 - force: 设为 true 可在跨多个区域提交大量文件时覆盖内聚性门禁。谨慎使用。
 - learned: 本次会话确认的可复用模式数组（每条格式："模式描述——证据：路径或复现步骤"）。持久化到项目知识库，未来会话自动注入。只提交已验证的模式。
 - review_policy: 长任务的提交后审查分批。each（默认）每次提交都审查；defer 不审查，把提交累积进会话待审范围；final 对所有累积提交做一次审查。相比大量小提交，优先 defer+final，避免每次提交都消耗一个 review worker。
@@ -427,7 +430,7 @@ export function createDeliverTaskTool(getB1Context: (params?: ToolCallParams) =>
           files: {
             type: 'array',
             items: { type: 'string' },
-            description: '可选，要提交的已归属文件子集。省略时提交全部已归属文件。用于把工作拆成独立的逻辑提交。',
+            description: '可选，要提交的已归属文件子集。省略时仅提交当前仍有变更的已归属文件。用于把工作拆成独立的逻辑提交。',
           },
           adopt: {
             type: 'array',
@@ -525,6 +528,7 @@ export function createDeliverTaskTool(getB1Context: (params?: ToolCallParams) =>
           ? `Verifications: ${report.verificationCount}`
           : 'Verifications: none (no tests were run for this task)',
       ]
+      if (ctx.continuityStatus) lines.push(`Session evidence continuity: ${ctx.continuityStatus}`)
 
       // 层 1a: echo latest verification totals so agents copy real numbers
       // into delivery reports instead of guessing from memory.
@@ -562,7 +566,7 @@ export function createDeliverTaskTool(getB1Context: (params?: ToolCallParams) =>
           lines.push(`  阻断项：${report.currentBlockingFailure}`)
         }
         if (report.staleFailureCandidates > 0) {
-          lines.push(`  预存量失败：${report.staleFailureCandidates} 条（改动前已存在，不归本次改动，可 force 交付）`)
+          lines.push(`  已取代失败：${report.supersededFailures} 条（后续同类验证已成功，不证明其他失败为预存量）`)
         }
         // no_test_infra: project lacks testing infrastructure entirely.
         // Give user-facing guidance rather than generic "run tests" advice.
@@ -638,10 +642,10 @@ export function createDeliverTaskTool(getB1Context: (params?: ToolCallParams) =>
       {
         const parts: string[] = []
         if (report.currentBlockingFailure) parts.push(`1 条阻断失败（你需处理）`)
-        if (report.supersededFailures > 0) parts.push(`${report.supersededFailures} 条预存量（改动前已存在，不归你）`)
+        if (report.supersededFailures > 0) parts.push(`${report.supersededFailures} 条已被后续成功取代`)
         if (parts.length > 0) {
           lines.push(`失败归因：${parts.join(' | ')}`)
-          lines.push('→ 只处理"阻断失败"——那是你的改动引入的。预存量失败不归你，可 force 交付。')
+          lines.push('→ 根据阻断项的实际证据处理；没有基线对照，不能认定失败由本次改动引入或属于预存量。')
         }
       }
 
@@ -894,9 +898,6 @@ export function createDeliverTaskTool(getB1Context: (params?: ToolCallParams) =>
             lines.push('  → 提供额外的独立证据满足冗余义务（DP 副本验证、独立工具复现、')
             lines.push('    第二条 file:line 证据链），或显式 supersede 该义务后重试。')
             return { content: lines.join('\n'), isError: true, errorKind: 'delivery_gate' }
-          } else if (forceGate && report.supersededFailures > 0) {
-            lines.push('', '⚠️  RED overridden (force=true): superseded failures detected (these were later fixed).')
-            lines.push('   Verify these pre-existing failures are unrelated to your changes before proceeding.')
           } else if (
             report.attributionClass === 'unverified'
             && mechanicalClass?.skipVerification
@@ -905,7 +906,7 @@ export function createDeliverTaskTool(getB1Context: (params?: ToolCallParams) =>
           } else {
             lines.push('', '❌ Cannot commit: delivery gate is RED.')
             if (report.supersededFailures > 0) {
-              lines.push('   (Superseded failures found — these were later fixed, use force=true if pre-existing.)')
+              lines.push('   (Superseded failures were already removed; force does not waive the remaining blockers.)')
             }
             lines.push('', 'Recovery:')
             if (report.blockingReason) {
@@ -929,26 +930,20 @@ export function createDeliverTaskTool(getB1Context: (params?: ToolCallParams) =>
             return { content: lines.join('\n'), isError: true, errorKind: 'delivery_gate' }
           }
         }
+        const effectiveEvidence = getEffectiveVerifications(ctx.taskLedger.getVerifications(), ctx.getCurrentSnapshotRef?.()).effective
+        if (report.ownedFileCount > 0 && !mechanicalClass?.skipVerification
+          && !effectiveEvidence.some(verification => verification.status === 'passed' && verification.scope !== 'unknown')) {
+          lines.push('', '❌ Cannot commit: no applicable successful verification. Unknown or blocked checks do not prove validation; force=true does not waive this obligation.')
+          return { content: lines.join('\n'), isError: true, errorKind: 'delivery_gate' }
+        }
         // W1 回归防线: module_unverified 在 assess 层是 YELLOW（可带条件交付），
-        // 但 commit=true 是不可逆落地动作 → 升 RED 硬拦。force=true 是逃生口
-        // （用户确认波及测试为静态分析假阳性时）。
+        // commit=true 必须有覆盖证明；force 不豁免缺失验证。
         if (report.state === 'YELLOW' && report.attributionClass === 'module_unverified') {
-          if (forceGate) {
-            lines.push('', '⚠️  module_unverified overridden (force=true): impacted tests remain unverified.')
-            lines.push('   Confirm the uncovered tests are static-analysis false positives before proceeding.')
-          } else {
-            lines.push('', '❌ Cannot commit: impacted tests were never covered by a passed verification.')
-            lines.push(`  Reason: ${report.attributionSummary}`)
-            const uncovered = report.uncoveredImpactedTests ?? []
-            if (uncovered.length > 0) {
-              lines.push('', '  Uncovered impacted tests:')
-              for (const t of uncovered.slice(0, 10)) lines.push(`    ${t}`)
-              if (uncovered.length > 10) lines.push(`    (+${uncovered.length - 10} more)`)
-            }
-            lines.push('', '  → Run these tests (run_tests with filter) or a full-scope verification, then re-run deliver_task.')
-            lines.push('    If they are unrelated to your change (static-analysis false positive), use force=true.')
-            return { content: lines.join('\n'), isError: true, errorKind: 'delivery_gate' }
-          }
+          lines.push('', '❌ Cannot commit: impacted tests were never covered by a passed verification. force=true does not waive missing verification.')
+          lines.push(`  Reason: ${report.attributionSummary}`)
+          for (const test of (report.uncoveredImpactedTests ?? []).slice(0, 10)) lines.push(`    ${test}`)
+          lines.push('  → Run these tests with explicit file targets using the appropriate project runner, then re-run deliver_task.')
+          return { content: lines.join('\n'), isError: true, errorKind: 'delivery_gate' }
         }
         if (report.state === 'YELLOW') {
           const stanceHint = detectSymptomPatch(params.cwd)
@@ -1009,7 +1004,7 @@ export function createDeliverTaskTool(getB1Context: (params?: ToolCallParams) =>
         const postAdoptionReport = adoptFiles && Array.isArray(adoptFiles) && adoptFiles.length > 0
           ? ctx.gate.getReport([], currentDirtyFiles, ctx.getCurrentSnapshotRef?.(), moduleCoverage)
           : report
-        if (postAdoptionReport.state === 'RED') {
+        if (adoptFiles?.length && postAdoptionReport.state === 'RED') {
           // Mechanical fast-path also applies to the post-adoption gate
           // (when no adoption happens, postAdoptionReport === report, and the
           // bypass was already decided above — don't re-block).
@@ -1032,7 +1027,7 @@ export function createDeliverTaskTool(getB1Context: (params?: ToolCallParams) =>
         // Note: after adoption, use refreshed owned set from ledger (not stale report)
         const requestedFiles = params.input.files as string[] | undefined
         const currentOwnedFiles = ctx.ownership.getOwnedFiles()
-        let filesToCommit = currentOwnedFiles
+        let filesToCommit = currentDirtyFiles ? currentOwnedFiles.filter(file => currentDirtyFiles.includes(file)) : currentOwnedFiles
 
         if (requestedFiles && Array.isArray(requestedFiles) && requestedFiles.length > 0) {
           const ownedSet = new Set(currentOwnedFiles)
@@ -1047,6 +1042,8 @@ export function createDeliverTaskTool(getB1Context: (params?: ToolCallParams) =>
           return { content: lines.join('\n'), isError: true, errorKind: 'format_error' }
         }
 
+        const commitVersion = captureCommitVersion(params.cwd, filesToCommit)
+        lines.push('', `Commit scope (${postAdoptionReport.state}): ${filesToCommit.join(', ') || '(none)'}`)
         const commitConflictFiles = new Set(filesToCommit)
         const blockingClaimConflicts = claimConflicts.filter(conflict => commitConflictFiles.has(conflict.file))
         if (blockingClaimConflicts.length > 0 && !forceGate) {
@@ -1147,7 +1144,7 @@ export function createDeliverTaskTool(getB1Context: (params?: ToolCallParams) =>
             } else {
               lines.push('', `  ⚠️  Git index is locked (another session mid-commit, lock age ${Math.round(lockAge / 1000)}s).`)
               lines.push('     Wait a few seconds and retry deliver_task. Do NOT fall back to raw git commit — that bypasses ownership scoping.')
-              return { content: lines.join('\n'), isError: true }
+              return { content: lines.join('\n'), isError: true, errorKind: 'delivery_gate' }
             }
           } catch {
             // Permission denied or race — let the commit attempt surface the real error.
@@ -1161,11 +1158,11 @@ export function createDeliverTaskTool(getB1Context: (params?: ToolCallParams) =>
         mark('commit:before')
         const headBeforeHash = headBefore.status === 0 ? headBefore.stdout.trim() : null
 
-        const executor = ctx.commitOwnedFiles ?? ((cwd, files, msg) => commitScopedFiles({ cwd, files, message: msg }))
+        const executor = ctx.commitOwnedFiles ?? ((cwd, files, msg) => commitScopedFiles({ cwd, files, message: msg, expectedVersion: commitVersion ?? undefined }))
         const commitResult = executor(params.cwd, filesToCommit, message)
         if (!commitResult.ok) {
           lines.push('', `❌ Scoped commit failed: ${commitResult.output}`)
-          return { content: lines.join('\n'), isError: true }
+          return { content: lines.join('\n'), isError: true, errorKind: 'delivery_gate' }
         }
         lines.push('', `✅ Scoped commit created with message: "${message}"`)
         lines.push(`   Files: ${filesToCommit.join(', ') || '(none)'}`)

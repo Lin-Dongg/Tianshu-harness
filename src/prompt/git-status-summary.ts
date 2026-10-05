@@ -152,7 +152,9 @@ function renderSummary(summary: GitStatusSummary): string {
   const completeness = foldedTotal > 0
     ? `共 ${total} 个任务相关文件（完整列表），另有 ${foldedTotal} 个无关项已折叠`
     : `共 ${total} 个文件（完整列表）`
-  const parts: string[] = [`[${summary.branch}] ${completeness} — 此状态即当前工作区全貌，无需再跑 git status`]
+  // 既诚实（承认是 ≤30s 缓存快照，与实时 git status 可能差几十秒）又不邀请重跑——
+  // 「无需再跑 git status」必须保留，否则重开 doom-loop（见上方注释，会话 43443098）。
+  const parts: string[] = [`[${summary.branch}] ${completeness} — 此状态为 ≤30s 缓存快照，任务相关文件已完整列出，无需再跑 git status`]
 
   if (summary.staged.length > 0) {
     parts.push(`${summary.staged.length} staged: ${summary.staged.join(', ')}`)

@@ -1,4 +1,4 @@
-import { describe, it, mock } from 'node:test'
+import { describe, it, mock, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -14,7 +14,6 @@ import { SessionPersist } from '../session-persist.js'
 import { isTruncationStopReason } from '../worker-repair-route.js'
 import {
   runWorkerSession,
-  createSoftLandingDrain,
   detectApprovalDeadlock,
   buildMaxTurnsExhaustedResult,
   HEADLESS_DENY_MARKER,
@@ -235,35 +234,6 @@ describe('runWorkerSession', () => {
     assert.equal(run.transcript.repairAttempts, 0)
   })
 
-  it('runs one repair prompt after invalid worker JSON', async () => {
-    const order = createReadOnlyWorkOrder({
-      id: 'wo_3',
-      parentTurnId: 'turn_1',
-      kind: 'plan',
-      profile: 'planner',
-      objective: 'Plan coordinator tests.',
-      scope: {},
-      budget: { maxRetries: 1 },
-    })
-
-    const client = clientFromTexts(['not valid json', validPacket('wo_3')])
-    const run = await runWorkerSession({
-      order,
-      client,
-      promptEngine: makePromptEngine(),
-      toolRegistry: new ToolRegistry(),
-      cwd: '/repo',
-      maxTurns: 2,
-      contextWindow: 1_000_000,
-      compact: { enabled: false, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash' },
-      // 修复梯专用用例——钉旧契约（无收尾轮），否则终型轮先把报告救回、
-      // repairAttempts 恒为 0。终型失败再走修复梯的情形由终轮定型 describe 覆盖。
-      finalizeReport: false,
-    })
-
-    assert.equal(run.result.status, 'passed')
-    assert.equal(run.transcript.repairAttempts, 1)
-  })
 
   it('returns blocked after retry budget is exhausted', async () => {
     const order = createReadOnlyWorkOrder({
@@ -291,59 +261,7 @@ describe('runWorkerSession', () => {
     assert.ok(run.result.risks.includes('Worker did not return schema-valid JSON'))
   })
 
-  it('forceJsonRepair sends response_format on the repair request and recovers', async () => {
-    const order = createReadOnlyWorkOrder({
-      id: 'wo_json',
-      parentTurnId: 'turn_1',
-      kind: 'plan',
-      profile: 'planner',
-      objective: 'Plan json repair.',
-      scope: {},
-      budget: { maxRetries: 1 },
-    })
 
-    // Capture whether the repair request carried response_format.
-    let sawResponseFormat = false
-    let repairCallCount = 0
-    const client = {
-      stream: mock.fn(async (req: { response_format?: unknown }, cb: StreamCallbacks) => {
-        // First call: invalid output (no response_format — normal turn via AgentLoop).
-        // Second call: json-mode repair (response_format set).
-        if (req.response_format) {
-          sawResponseFormat = true
-          repairCallCount++
-          cb.onTextDelta(validPacket('wo_json'))
-          cb.onContentBlock(textBlock(validPacket('wo_json')))
-          cb.onStopReason('end_turn', { input_tokens: 10, output_tokens: 5 })
-          return
-        }
-        // The AgentLoop also issues calls without response_format; only emit
-        // invalid text the first time so repair triggers.
-        cb.onTextDelta('definitely not json at all')
-        cb.onContentBlock(textBlock('definitely not json at all'))
-        cb.onStopReason('end_turn', { input_tokens: 10, output_tokens: 5 })
-      }),
-    } as unknown as StreamClient
-
-    const run = await runWorkerSession({
-      order,
-      client,
-      promptEngine: makePromptEngine(),
-      toolRegistry: new ToolRegistry(),
-      cwd: '/repo',
-      maxTurns: 2,
-      contextWindow: 1_000_000,
-      compact: { enabled: false, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash' },
-      forceJsonRepair: true,
-      // 钉旧契约：本用例验证的是「修复轮」带 response_format——终型轮同样
-      // 带 response_format 且会先跑，不钉死会让计数误把终型轮当修复轮。
-      finalizeReport: false,
-    })
-
-    assert.equal(run.result.status, 'passed', 'json-mode repair should recover to passed')
-    assert.ok(sawResponseFormat, 'repair request must carry response_format: json_object')
-    assert.equal(repairCallCount, 1, 'exactly one json-mode repair call')
-  })
 })
 
 describe('buildMaxTurnsExhaustedResult (2026-07-24 假 summary 事故)', () => {
@@ -624,10 +542,6 @@ describe('worker finalization turn (B：终轮定型)', () => {
     })
   }
 
-  function messageTexts(req: CapturedRequest): string {
-    return req.messages.map(m => typeof m.content === 'string' ? m.content : JSON.stringify(m.content)).join('\n')
-  }
-
   type BlockScriptEntry = string | { blocks: ContentBlock[] }
 
   /** 支持任意 block 序列（散文 + 多 tool_use + argsTruncated）的捕获 client——
@@ -669,197 +583,12 @@ describe('worker finalization turn (B：终轮定型)', () => {
     }
   }
 
-  it('收尾轮 max_tokens 取报告档：未声明 = 16384；显式档（format_checker 4096）不被改写', async () => {
-    // 审查补遗（0926f5b8d）：「报告实际拿到多少预算」原先只在工厂层有断言
-    // （work-order.test.ts），消费端三处实参被改写不会变红——这里钉生产端实际值。
-    const scoutReport =
-      '{"workOrderId":"wo_budget_scout","status":"passed","summary":"报告档探针","findings":[],"artifacts":[],"changedFiles":[],"risks":[],"nextActions":[]}'
-    const c1 = capturingClient(['prose only', scoutReport])
-    await runWorkerSession(finalizeConfig(scoutOrder('wo_budget_scout'), c1.client))
-    assert.equal(c1.requests[1]?.max_tokens, 16384, '未声明档（code_scout）收尾轮应发报告档 16384')
-    assert.equal(c1.requests[2]?.max_tokens, 16384, '无工具 fallback 轮同档')
 
-    const fmtOrder = createReadOnlyWorkOrder({
-      id: 'wo_budget_fmt',
-      parentTurnId: 'turn_1',
-      kind: 'review',
-      profile: 'format_checker',
-      objective: 'probe format budget',
-      scope: {},
-    })
-    const fmtReport =
-      '{"workOrderId":"wo_budget_fmt","status":"passed","summary":"报告档探针","findings":[],"artifacts":[],"changedFiles":[],"risks":[],"nextActions":[]}'
-    const c2 = capturingClient(['prose only', fmtReport])
-    await runWorkerSession(finalizeConfig(fmtOrder, c2.client))
-    assert.equal(c2.requests[1]?.max_tokens, 4096, '显式档（format_checker）不被兜底改写')
-  })
 
-  it('探索后发起终型轮：带完整会话历史、无 tools、json_object 随 forceJsonRepair', async () => {
-    const order = scoutOrder('wo_fin')
-    const { client, requests } = capturingClient([
-      'I read src/agent/loop.ts and found the constructor seam.', // 探索：无 JSON 散文
-      validPacket('wo_fin'), // 终型：合规报告
-    ])
-    const activities: Array<[WorkerActivityKind, string | undefined]> = []
-    const run = await runWorkerSession(finalizeConfig(order, client, {
-      forceJsonRepair: true,
-      onActivity: (kind, detail) => activities.push([kind, detail]),
-    }))
 
-    assert.equal(run.result.status, 'passed', '自然输出无 JSON 也能经终型轮产出合规结果')
-    assert.equal(requests.length, 3, '探索 + 终型工具轮 + fallback（工具轮零 tool-call 时）')
-    // 阶段 1：唯一 submit_result 工具轮（带完整历史 + 收尾指令）
-    const toolReq = requests[1]!
-    const last = toolReq.messages.at(-1)!
-    assert.equal(last.role, 'user')
-    assert.ok(String(last.content).includes('工单 ID（原样复制）：wo_fin'), '尾消息是收尾指令')
-    assert.ok(String(last.content).includes('只基于上方对话中实际发生的工具调用及其结果'))
-    assert.deepEqual(
-      toolReq.messages.slice(0, -1),
-      run.session.getMessages(),
-      '终型轮 messages 前缀必须等于 worker 会话历史（前缀缓存命中 + 只准如实总结）',
-    )
-    assert.ok(Array.isArray(toolReq.tools) && toolReq.tools.length === 1, '工具轮带唯一 submit_result 定义')
-    assert.deepEqual(toolReq.tool_choice, { type: 'function', function: { name: 'submit_result' } })
-    // 阶段 2（fallback）：零 tool-call → 无工具 json_object 终型
-    const fallbackReq = requests[2]!
-    assert.equal(fallbackReq.tools, undefined, 'fallback 轮不带 tools')
-    assert.deepEqual(fallbackReq.response_format, { type: 'json_object' }, 'json_object 随 forceJsonRepair 门')
-    // 主提示词已切 finalized 契约（不再要求探索轮自产 JSON）
-    assert.ok(messageTexts(requests[0]!).includes('无需自己输出报告 JSON'), '探索轮主提示词是 finalized 契约')
-    // 保活：收尾开始发 lifecycle，delta 转发 text（stall clock 不吃空）
-    assert.ok(activities.some(([k, d]) => k === 'lifecycle' && d === 'finalizing report'))
-    assert.ok(activities.some(([k]) => k === 'text'))
-  })
 
-  it('forceJsonRepair 未开时终型轮退化为无 json_object 的收尾（仍无工具+带历史）', async () => {
-    const order = scoutOrder('wo_fin_gate')
-    const { client, requests } = capturingClient(['exploration prose', validPacket('wo_fin_gate')])
-    const run = await runWorkerSession(finalizeConfig(order, client))
 
-    assert.equal(run.result.status, 'passed')
-    assert.equal(requests.length, 3, '探索 + 工具轮 + fallback')
-    assert.equal(requests[2]!.response_format, undefined, 'provider 门未开时 fallback 不带 response_format')
-    assert.equal(requests[2]!.tools, undefined, 'fallback 仍是无工具收尾')
-    assert.ok(String(requests[1]!.messages.at(-1)!.content).includes('工单 ID'), '工具轮收尾指令照发')
-  })
 
-  it('provider 拒绝 response_format：立即不带它重试收尾轮，并关闭本会话 json 通道', async () => {
-    const order = scoutOrder('wo_probe')
-    const requests: CapturedRequest[] = []
-    let call = 0
-    const client = {
-      stream: mock.fn(async (req: CapturedRequest, cb: StreamCallbacks) => {
-        requests.push(req)
-        call++
-        if (call === 1) {
-          // 探索轮：散文无 JSON
-          cb.onTextDelta('exploration prose')
-          cb.onContentBlock(textBlock('exploration prose'))
-          cb.onStopReason('end_turn', { input_tokens: 10, output_tokens: 5 })
-        } else if (call === 2) {
-          // 终型工具轮：模型没调 submit_result（纯文本）→ 零 tool-call → fallback
-          cb.onTextDelta('model refused tool call')
-          cb.onContentBlock(textBlock('model refused tool call'))
-          cb.onStopReason('end_turn', { input_tokens: 10, output_tokens: 5 })
-        } else if (call === 3) {
-          // fallback 轮带 response_format——严格 provider 直接 400 拒绝未知参数
-          cb.onError(new Error('HTTP 400: Unknown parameter: `response_format` is not supported'))
-        } else {
-          // 探针重试（不带 response_format）成功产出合规报告
-          cb.onTextDelta(validPacket('wo_probe'))
-          cb.onContentBlock(textBlock(validPacket('wo_probe')))
-          cb.onStopReason('end_turn', { input_tokens: 10, output_tokens: 5 })
-        }
-      }),
-    } as unknown as StreamClient
-    const activities: Array<[WorkerActivityKind, string | undefined]> = []
-    const config = finalizeConfig(order, client, {
-      forceJsonRepair: true,
-      onActivity: (kind, detail) => activities.push([kind, detail]),
-    })
-    const run = await runWorkerSession(config)
-
-    assert.equal(run.result.status, 'passed', '探针重试救回收尾轮——被拒的整轮不白烧')
-    assert.equal(requests.length, 4, '探索 + 工具轮 + 被拒 fallback + 无 response_format 重试')
-    assert.ok(Array.isArray(requests[1]!.tools), '工具轮先发 submit_result 定义')
-    assert.deepEqual(requests[2]!.response_format, { type: 'json_object' }, 'fallback 乐观带 json_object')
-    assert.equal(requests[3]!.response_format, undefined, '被拒后立即不带 response_format 重试')
-    assert.equal(config.forceJsonRepair, false, '会话级关闭 json 通道——后续 repair 轮不再白试')
-    assert.ok(activities.some(([k, d]) => k === 'lifecycle' && String(d).includes('rejected response_format')))
-  })
-
-  it('瞬断不误判为 response_format 拒绝：json 通道保持开启', async () => {
-    const order = scoutOrder('wo_probe_net')
-    // 收尾轮网络错误（无 response_format 字样）→ 探针不触发，回退旧路径
-    const requests: CapturedRequest[] = []
-    let call = 0
-    const client = {
-      stream: mock.fn(async (req: CapturedRequest, cb: StreamCallbacks) => {
-        requests.push(req)
-        call++
-        if (call === 1) {
-          const natural = JSON.stringify({
-            workOrderId: 'wo_probe_net',
-            status: 'passed',
-            summary: 'report from exploration text after finalize network failure',
-            findings: [],
-            artifacts: [],
-            changedFiles: [],
-            risks: [],
-            nextActions: [],
-          })
-          cb.onTextDelta(natural)
-          cb.onContentBlock(textBlock(natural))
-          cb.onStopReason('end_turn', { input_tokens: 10, output_tokens: 5 })
-        } else {
-          cb.onError(new Error('socket hang up'))
-        }
-      }),
-    } as unknown as StreamClient
-    const config = finalizeConfig(order, client, { forceJsonRepair: true })
-    const run = await runWorkerSession(config)
-
-    assert.equal(requests.length, 3, '工具轮 + fallback 都瞬断，不再重试（回退 parse 自然输出）')
-    assert.equal(config.forceJsonRepair, true, '网络错误不关闭 json 通道')
-    assert.equal(run.result.status, 'passed')
-  })
-
-  it('终型输出 parse 失败 → 落入原有修复梯', async () => {
-    const order = scoutOrder('wo_fin_repair', { maxRetries: 1 })
-    const { client, requests } = capturingClient([
-      'exploration prose, no JSON',
-      'finalized but still not json', // 终型工具轮：零 tool-call → fallback
-      'finalized but still not json', // fallback 轮：parse 失败 → 落入修复梯
-      validPacket('wo_fin_repair'), // 修复轮救回
-    ])
-    const run = await runWorkerSession(finalizeConfig(order, client))
-
-    assert.equal(run.result.status, 'passed')
-    assert.equal(run.transcript.repairAttempts, 1, '终型失败后的修复梯照走')
-    assert.equal(requests.length, 4, '探索 + 工具轮 + fallback + 修复')
-  })
-
-  it('终型返回空 → 回退旧路径（parse 自然输出）', async () => {
-    const order = scoutOrder('wo_fin_empty')
-    const natural = JSON.stringify({
-      workOrderId: 'wo_fin_empty',
-      status: 'passed',
-      summary: 'report recovered from exploration text',
-      findings: [],
-      artifacts: [],
-      changedFiles: [],
-      risks: [],
-      nextActions: [],
-    })
-    const { client, requests } = capturingClient([natural, '   ']) // 终型空输出
-    const run = await runWorkerSession(finalizeConfig(order, client))
-
-    assert.equal(run.result.status, 'passed')
-    assert.equal(run.result.summary, 'report recovered from exploration text', '结果来自自然输出而非终型')
-    assert.equal(requests.length, 3, '工具轮 + fallback 各试过一次才回退 parse 自然输出')
-    assert.equal(run.transcript.repairAttempts, 0, '自然输出本就合规，不进修复梯')
-  })
 
   it('max-turns 非自愿耗尽 → 终型成功即正常返回（不再一律 blocked）', async () => {
     const order = scoutOrder('wo_fin_mt', { maxTurns: 1, maxRetries: 0 })
@@ -871,7 +600,7 @@ describe('worker finalization turn (B：终轮定型)', () => {
 
     assert.equal(run.result.status, 'passed', '终型成功即正常返回')
     assert.equal(run.result.failureReason, undefined, '不再盖章 max_turns')
-    assert.equal(requests.length, 3, '探索 1 次 + 工具轮 + fallback 各 1 次（旧路径此处直接 blocked）')
+    assert.equal(requests.length, 2, '探索一次 + 同前缀收尾一次')
   })
 
   it('max-turns 非自愿耗尽 + 终型失败 → 回退确定性 max-turns 阶梯', async () => {
@@ -885,7 +614,7 @@ describe('worker finalization turn (B：终轮定型)', () => {
     assert.equal(run.result.status, 'blocked')
     assert.equal(run.result.failureReason, 'max_turns')
     assert.match(run.result.summary, /max-turns: exhausted without a final turn/)
-    assert.equal(requests.length, 3, '探索 + 工具轮 + fallback 失败后才回退，不进修复梯')
+    assert.equal(requests.length, 2, '探索 + 一次同前缀收尾；不进修复梯')
   })
 
   it('abort → 不发起终型调用（abort 绝对优先）', async () => {
@@ -917,33 +646,9 @@ describe('worker finalization turn (B：终轮定型)', () => {
     assert.equal(streamCalls, 1, 'abort 后不再花 API——终型轮也没有')
   })
 
-  it('finalizeReport: false → 完全旧行为（inline 契约、无收尾轮、修复梯照旧）', async () => {
-    const order = scoutOrder('wo_fin_off', { maxRetries: 1 })
-    const { client, requests } = capturingClient(['prose, no json', validPacket('wo_fin_off')])
-    const run = await runWorkerSession(finalizeConfig(order, client, { finalizeReport: false }))
 
-    assert.equal(run.result.status, 'passed')
-    assert.equal(run.transcript.repairAttempts, 1, '旧路径：parse 失败走修复梯')
-    assert.equal(requests.length, 2, '无终型轮：探索 + 修复')
-    for (const req of requests) {
-      assert.ok(!String(req.messages.at(-1)!.content).includes('只基于上方对话中实际发生的工具调用及其结果'), '任何请求都不含收尾指令')
-    }
-    assert.ok(messageTexts(requests[0]!).includes('只返回一个 JSON 对象'), '主提示词回到 inline 契约')
-  })
 
-  it('soft-landing steer 按契约分体', () => {
-    const finalized = createSoftLandingDrain(undefined, 'finalized')
-    finalized.requestWrapUp()
-    const steer = finalized.drain()
-    assert.ok(steer?.includes('requested separately'), 'finalized：报告由系统单独索取')
-    assert.ok(!steer!.includes('emit your final report as a single valid JSON object'), 'finalized 不再催自产 JSON')
-
-    const inline = createSoftLandingDrain()
-    inline.requestWrapUp()
-    assert.ok(inline.drain()?.includes('emit your final report as a single valid JSON object'), 'inline 契约文案不变')
-  })
-
-  it('终型轮强制 submit_result：唯一工具调用参数过权威校验即成功，伴随散文忽略', async () => {
+  it('收尾请求经 submit_result 交报告：唯一工具调用参数过权威校验即成功，伴随散文忽略', async () => {
     const order = scoutOrder('wo_submit')
     const { client, requests } = blockClient([
       'exploration prose',
@@ -956,105 +661,84 @@ describe('worker finalization turn (B：终轮定型)', () => {
 
     assert.equal(run.result.status, 'passed')
     assert.equal(run.result.summary, 'Report submitted via submit_result tool.', '结果来自工具参数而非散文')
-    assert.equal(requests.length, 2, '工具路径成功：探索 + 终型工具轮，无 fallback 轮')
+    assert.equal(requests.length, 2, '工具路径成功：探索 + 收尾请求，无 fallback 轮')
     const finalizeReq = requests[1]!
-    // 唯一工具定义 + forced tool_choice（OAI 对象形式）
-    assert.ok(Array.isArray(finalizeReq.tools) && finalizeReq.tools.length === 1, '恰好一个工具定义')
-    const tool = (finalizeReq.tools as Array<{ function: { name: string; parameters: Record<string, unknown> } }>)[0]!
-    assert.equal(tool.function.name, 'submit_result')
+    const tool = (finalizeReq.tools as Array<{ function: { name: string; parameters: Record<string, unknown> } }>)
+      .find(t => t.function.name === 'submit_result')!
     const params = tool.function.parameters as { type: string; properties: Record<string, unknown>; required?: string[] }
     assert.equal(params.type, 'object')
     assert.ok(params.properties.workOrderId, 'parameters 是 ingest 同源 JSON Schema（含 workOrderId）')
     assert.ok(params.properties.status, 'parameters 含 status 枚举')
-    assert.deepEqual(finalizeReq.tool_choice, { type: 'function', function: { name: 'submit_result' } })
-    // 收尾指令照发 + 带完整会话历史
+    assert.equal(finalizeReq.tool_choice, 'auto')
+    // 收尾指令照发 + 逐字节延续探索轮请求
     assert.ok(String(finalizeReq.messages.at(-1)!.content).includes('工单 ID（原样复制）：wo_submit'))
-    assert.deepEqual(finalizeReq.messages.slice(0, -1), run.session.getMessages(), '终型轮 messages 前缀仍等于会话历史')
+    assert.deepEqual(finalizeReq.messages.slice(0, requests[0]!.messages.length), requests[0]!.messages)
   })
 
-  it('终型轮零 tool-call → 回退无工具 json_object 终型（fallback 一次）', async () => {
-    const order = scoutOrder('wo_submit_zero')
+  it('多轮探索后收尾请求仍逐字节延续最后一次探索请求，工具表三处一致', async () => {
+    const order = scoutOrder('wo_submit_prefix')
     const { client, requests } = blockClient([
-      'exploration prose',
-      'model emitted prose instead of calling submit_result', // 工具轮零 tool-call
-      validPacket('wo_submit_zero'), // fallback 轮合规产出
-    ])
-    const run = await runWorkerSession(finalizeConfig(order, client, { forceJsonRepair: true }))
-
-    assert.equal(run.result.status, 'passed')
-    assert.equal(requests.length, 3, '探索 + 工具轮 + fallback 轮')
-    const toolReq = requests[1]!
-    assert.ok(Array.isArray(toolReq.tools) && toolReq.tools.length === 1, '工具轮带唯一 submit_result 定义')
-    const fallbackReq = requests[2]!
-    assert.equal(fallbackReq.tools, undefined, 'fallback 轮无工具')
-    assert.deepEqual(fallbackReq.response_format, { type: 'json_object' }, 'fallback 走 json_object 终型')
-  })
-
-  it('终型轮多 tool-call → 回退无工具终型', async () => {
-    const order = scoutOrder('wo_submit_multi')
-    const { client, requests } = blockClient([
-      'exploration prose',
-      { blocks: [
-        { type: 'tool_use', id: 'tu_grep', name: 'grep', input: { pattern: 'x' } } as ContentBlock,
-        { type: 'tool_use', id: 'tu_submit', name: 'submit_result', input: toolPacket('wo_submit_multi') } as ContentBlock,
-      ] },
-      validPacket('wo_submit_multi'),
+      { blocks: [{ type: 'tool_use', id: 'tu_grep', name: 'grep', input: { pattern: 'seam' } } as ContentBlock] },
+      'exploration done',
+      { blocks: [{ type: 'tool_use', id: 'tu_submit', name: 'submit_result', input: toolPacket('wo_submit_prefix') } as ContentBlock] },
     ])
     const run = await runWorkerSession(finalizeConfig(order, client))
 
     assert.equal(run.result.status, 'passed')
-    assert.equal(requests.length, 3, '探索 + 工具轮(多调用) + fallback 轮')
-    assert.equal(requests[2]!.tools, undefined)
+    assert.equal(requests.length, 3, '两轮探索 + 收尾请求')
+    const [first, lastLoop, closing] = requests as [CapturedRequest, CapturedRequest, CapturedRequest]
+    assert.equal(closing.messages[0]!.role, 'system', '收尾请求带 system——旧形态缺它，整段前缀失配')
+    assert.deepEqual(closing.messages.slice(0, lastLoop.messages.length), lastLoop.messages)
+    assert.equal(closing.messages.length, lastLoop.messages.length + 2, '只多出探索末轮的回答与收尾指令')
+    assert.deepEqual(closing.tools, lastLoop.tools)
+    assert.deepEqual(lastLoop.tools, first.tools)
   })
 
-  it('终型轮截断参数（argsTruncated）→ 回退无工具终型', async () => {
-    const order = scoutOrder('wo_submit_trunc')
+  it('探索循环内 submit_result：报告直接收下，不再发收尾请求', async () => {
+    const order = scoutOrder('wo_submit_inloop')
     const { client, requests } = blockClient([
-      'exploration prose',
-      { blocks: [
-        { type: 'tool_use', id: 'tu_submit', name: 'submit_result', input: { workOrderId: 'wo_submit_trunc' }, argsTruncated: true } as ContentBlock,
-      ] },
-      validPacket('wo_submit_trunc'),
+      { blocks: [{ type: 'tool_use', id: 'tu_submit', name: 'submit_result', input: toolPacket('wo_submit_inloop') } as ContentBlock] },
+    ])
+    const activities: Array<[WorkerActivityKind, string | undefined]> = []
+    const run = await runWorkerSession(finalizeConfig(order, client, {
+      onActivity: (kind, detail) => activities.push([kind, detail]),
+    }))
+
+    assert.equal(run.result.status, 'passed')
+    assert.equal(run.result.summary, 'Report submitted via submit_result tool.')
+    assert.equal(requests.length, 1, 'endTurn 结束循环，零额外请求')
+    assert.ok(!activities.some(([k, d]) => k === 'lifecycle' && d === 'finalizing report'), '没有收尾请求')
+  })
+
+  it('探索循环内 submit_result 参数不合格：错误回给模型，修正后重交', async () => {
+    const order = scoutOrder('wo_submit_retry')
+    const { client, requests } = blockClient([
+      { blocks: [{ type: 'tool_use', id: 'tu_bad', name: 'submit_result', input: { summary: 'done', status: 'passed' } } as ContentBlock] },
+      { blocks: [{ type: 'tool_use', id: 'tu_good', name: 'submit_result', input: toolPacket('wo_submit_retry') } as ContentBlock] },
     ])
     const run = await runWorkerSession(finalizeConfig(order, client))
 
     assert.equal(run.result.status, 'passed')
-    assert.equal(requests.length, 3, '探索 + 工具轮(截断) + fallback 轮')
-    assert.equal(requests[2]!.tools, undefined)
+    assert.equal(requests.length, 2, '重交成功即结束，不发收尾请求')
+    const toolResult = requests[1]!.messages.find(m => m.role === 'tool')
+    assert.ok(String(toolResult?.content).includes('报告未通过校验'), '校验错误作为工具结果回给模型')
   })
 
-  it('终型工具轮 provider 拒绝 → 回退无工具终型，forceJsonRepair 通道保留', async () => {
-    const order = scoutOrder('wo_submit_reject')
-    const requests: CapturedRequest[] = []
-    let call = 0
-    const client = {
-      stream: mock.fn(async (req: CapturedRequest, cb: StreamCallbacks) => {
-        requests.push(req)
-        call++
-        if (call === 1) {
-          cb.onTextDelta('exploration prose')
-          cb.onContentBlock(textBlock('exploration prose'))
-          cb.onStopReason('end_turn', { input_tokens: 10, output_tokens: 5 })
-        } else if (call === 2) {
-          // 工具轮：provider 拒绝 tools/tool_choice 参数。
-          cb.onError(new Error('HTTP 400: Unknown parameter: `tools` is not supported by this endpoint'))
-        } else {
-          cb.onTextDelta(validPacket('wo_submit_reject'))
-          cb.onContentBlock(textBlock(validPacket('wo_submit_reject')))
-          cb.onStopReason('end_turn', { input_tokens: 10, output_tokens: 5 })
-        }
-      }),
-    } as unknown as StreamClient
-    const config = finalizeConfig(order, client, { forceJsonRepair: true })
-    const run = await runWorkerSession(config)
+  it('收尾请求的用量记进 worker 总账（此前整段不计）', async () => {
+    const order = scoutOrder('wo_submit_usage')
+    const { client } = blockClient([
+      'exploration prose',
+      { blocks: [{ type: 'tool_use', id: 'tu_submit', name: 'submit_result', input: toolPacket('wo_submit_usage') } as ContentBlock] },
+    ])
+    const run = await runWorkerSession(finalizeConfig(order, client))
 
-    assert.equal(run.result.status, 'passed', '工具被拒后 fallback 救回收尾轮')
-    assert.equal(requests.length, 3, '探索 + 工具轮(被拒) + fallback 轮')
-    assert.ok(Array.isArray(requests[1]!.tools), '工具轮带 submit_result 定义')
-    assert.equal(requests[2]!.tools, undefined, 'fallback 轮无工具')
-    assert.deepEqual(requests[2]!.response_format, { type: 'json_object' })
-    assert.equal(config.forceJsonRepair, true, '工具被拒不关闭 json 通道——json 通道只管 response_format')
+    assert.equal(run.usage.input_tokens, 20, '探索 10 + 收尾 10')
+    assert.equal(run.usage.output_tokens, 10)
   })
+
+
+
+
 
   it('submit_result 路径不绕过证据门：自报 changedFiles 无系统捕获痕迹 → verified 降级', async () => {
     const order = scoutOrder('wo_submit_ev')
@@ -1110,11 +794,6 @@ describe('finalize truncation (2026-09-13 json_parse 事故)', () => {
           // 探索轮：无 JSON 散文
           cb.onTextDelta('Let me read the diff first.')
           cb.onContentBlock(textBlock('Let me read the diff first.'))
-          cb.onStopReason('end_turn', { input_tokens: 10, output_tokens: 5 })
-          return
-        }
-        if (call === 2) {
-          // 终型阶段 1（submit_result 工具轮）：零 tool-call → 回退阶段 2
           cb.onStopReason('end_turn', { input_tokens: 10, output_tokens: 5 })
           return
         }
@@ -1264,6 +943,43 @@ describe('worker long-tool keepalive（P0-3：tool_use→tool_result 静默窗�
       __setToolKeepaliveMs(30_000)
     }
   })
+
+  it('收尾请求静默期间也发 lifecycle 心跳（报告写进工具参数时没有文本可上行）', async () => {
+    __setToolKeepaliveMs(15)
+    try {
+      let call = 0
+      const client = {
+        stream: mock.fn(async (_req: unknown, cb: StreamCallbacks) => {
+          call++
+          if (call === 1) {
+            cb.onTextDelta('exploration prose')
+            cb.onContentBlock(textBlock('exploration prose'))
+            cb.onStopReason('end_turn', { input_tokens: 10, output_tokens: 5 })
+            return
+          }
+          await new Promise(resolve => setTimeout(resolve, 120))
+          cb.onContentBlock({ type: 'tool_use', id: 'tu_submit', name: 'submit_result', input: JSON.parse(validPacket('wo_fin_keep')) } as ContentBlock)
+          cb.onStopReason('tool_use', { input_tokens: 10, output_tokens: 5 })
+        }),
+      } as unknown as StreamClient
+      const order = createReadOnlyWorkOrder({
+        id: 'wo_fin_keep', parentTurnId: 'turn_1', kind: 'code_search', profile: 'code_scout',
+        objective: 'Probe keepalive during the closing request.', scope: {}, budget: { maxTurns: 2, maxRetries: 0 },
+      })
+      const activities: Array<[WorkerActivityKind, string | undefined]> = []
+      const run = await runWorkerSession({
+        order, client, promptEngine: makePromptEngine(), toolRegistry: new ToolRegistry(),
+        cwd: '/repo', maxTurns: 2, contextWindow: 1_000_000,
+        compact: { enabled: false, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash' },
+        onActivity: (kind, detail) => activities.push([kind, detail]),
+      })
+      assert.equal(run.result.status, 'passed')
+      const beats = activities.filter(([k, d]) => k === 'lifecycle' && String(d).startsWith('finalizing report still running'))
+      assert.ok(beats.length >= 2, `120ms 收尾请求 + 15ms 节拍应产出多次心跳，实际 ${beats.length} 次`)
+    } finally {
+      __setToolKeepaliveMs(30_000)
+    }
+  })
 })
 
 describe('runWorkerSession · priorUsage 回种（usage-ledger 对齐）', () => {
@@ -1324,3 +1040,7 @@ describe('runWorkerSession · priorUsage 回种（usage-ledger 对齐）', () =>
     }
   })
 })
+
+const isolatedHome = mkdtempSync(join(tmpdir(), 'worker-fixture-home-'))
+process.env.RIVET_HOME = isolatedHome
+after(() => rmSync(isolatedHome, { recursive: true, force: true }))

@@ -27,7 +27,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { BASH_TOOL } from '../bash.js'
-import { isTypecheckCommand, resolveCallerTimeoutBudget, TYPECHECK_CALLER_BUDGET_MS } from '../../lsp/typecheck-cache.js'
+import { isTypecheckCommand, isTestRunnerCommand, resolveCallerTimeoutBudget, resolveWatchdogTimeout, TEST_RUNNER_CALLER_BUDGET_MS, TYPECHECK_CALLER_BUDGET_MS, TYPECHECK_WATCHDOG_MARGIN_MS } from '../../lsp/typecheck-cache.js'
 import type { ToolCallParams } from '../types.js'
 
 /** 闸门等待上限（typecheck-cache.ts 的 STALE_LOCK_MS = 10 分钟）。 */
@@ -66,10 +66,25 @@ test('typecheck 形态拿到的工具级预算必须覆盖闸门等待上限', (
   }
 })
 
-test('普通命令保持默认预算，不因这次修复被放大', () => {
-  for (const cmd of ['ls -la', 'npm run build', 'npm test', 'git status']) {
-    assert.equal(timeoutFor(cmd), 120_000, `${cmd} 不该拿到 typecheck 的长预算`)
+test('普通命令保持默认预算；测试运行拿到有界专用预算（2026-10-05）', () => {
+  // `npm test` 从此表移出：全量约 52s，只拿 120s 默认预算时，多会话共享工作区的
+  // CPU 竞争下必被超时杀掉 → 结果被超时占位替换 → 无 exitCode、无输出计数 →
+  // verification 恒 blocked → 交付门禁的 full-scope 覆盖义务不可满足。
+  // 它拿到的是**有界**的 TEST_RUNNER_CALLER_BUDGET_MS（5 分钟），不是 typecheck 的
+  // 13 分钟闸门预算——「不因修复被放大」这条原则仍成立，只是边界从「只有 typecheck」
+  // 收窄为「typecheck + 测试运行，且测试那一档显著更小」。
+  for (const cmd of ['ls -la', 'npm run build', 'git status']) {
+    assert.equal(timeoutFor(cmd), 120_000, `${cmd} 不该拿到闸门长预算`)
   }
+  assert.equal(
+    timeoutFor('npm test'),
+    TEST_RUNNER_CALLER_BUDGET_MS + TYPECHECK_WATCHDOG_MARGIN_MS,
+    '测试运行拿有界专用预算（timeoutFor 读的是声明侧 = 执行侧 + 看门狗余量）',
+  )
+  assert.ok(
+    TEST_RUNNER_CALLER_BUDGET_MS < TYPECHECK_CALLER_BUDGET_MS,
+    '测试预算必须显著小于 typecheck 的闸门预算（后者长是因为要等跨进程共享锁）',
+  )
 })
 
 test('tsc --watch 是长跑形态，不算 typecheck 收口对象', () => {
@@ -98,8 +113,11 @@ test('声明侧与执行侧同源：两侧都覆盖闸门等待，且都不压�
   assert.equal(budgetFor(incident, 900_000), 900_000, '调用方给的更大预算不被压低')
 })
 
-test('执行侧不误伤普通命令：非 typecheck 形态照旧用默认或传入预算', () => {
-  assert.equal(budgetFor('npm test', 5_000), 5_000)
+test('执行侧不误伤普通命令：只有闸门形态（typecheck / 测试运行）才抬升', () => {
+  // `npm test` 从「普通命令」移出（2026-10-05）：它是闸门形态，拿有界专用预算。
+  // 普通命令的代表改用 npm run build（非测试、非 typecheck）。
+  assert.equal(budgetFor('npm test', 5_000), TEST_RUNNER_CALLER_BUDGET_MS, '测试运行属闸门形态，抬到专用预算')
+  assert.equal(budgetFor('npm run build', 5_000), 5_000, '非闸门形态原样用传入预算')
   assert.equal(budgetFor('ls -la', NaN), 120_000, '非正数/NaN 走默认预算')
   assert.equal(budgetFor('tsc --noEmit --watch', 5_000), 5_000, 'watch 形态不进闸门，也不该被抬升')
 })
@@ -159,4 +177,80 @@ test('闸门关闭（RIVET_TYPECHECK_SHARE=0）时声明侧仍严格大于执行
     if (prev === undefined) delete process.env.RIVET_TYPECHECK_SHARE
     else process.env.RIVET_TYPECHECK_SHARE = prev
   }
+})
+
+// ── 测试运行形态：与 typecheck 同等的闸门预算（2026-10-05 清红批） ──────────
+//
+// 取证：`npm test` 全量约 52s，只拿 120s 默认预算时，在多会话共享工作区的 CPU
+// 竞争下必然撞超时被杀 → 结果被超时占位替换 → 无 exitCode、无计数 →
+// verification 恒 blocked → 交付门禁的 full-scope 覆盖义务永远无法满足
+// （核心改动结构性无法提交）。实测锚点：`npm test` 记录 `scope:full, kind:test`
+// 但无 `exitCode` 字段且 `passed:0`，而同一条 `npm run typecheck`（13.7s 跑得完）
+// 带 `exitCode:2`。
+//
+// 三条用例分别钉：识别面（含 watch/构造误判）、预算抬升、看门狗严格大于执行侧。
+
+test('isTestRunnerCommand 认得全量测试形态；watch 与普通构造不误判', () => {
+  for (const cmd of [
+    'npm test',
+    'npm run test',
+    'npm run test:unit',
+    'pnpm test',
+    'npx tsx --test',
+    'tsx --test src/agent/__tests__/loop.test.ts',
+    'node --test',
+    'npx vitest run',
+    'jest',
+    'pytest',
+  ]) {
+    assert.ok(isTestRunnerCommand(cmd), `应判为测试运行形态：${cmd}`)
+  }
+  for (const cmd of [
+    'npm test -- --watch',
+    'npx vitest --watch',
+    'npm run build',
+    'npx tsc --noEmit',
+    'ls src/test-fixtures',
+  ]) {
+    assert.equal(isTestRunnerCommand(cmd), false, `不该判为测试运行形态：${cmd}`)
+  }
+})
+
+test('测试运行形态走有界专用预算：抬升但显著小于 typecheck，且只抬不压', () => {
+  assert.equal(
+    resolveCallerTimeoutBudget('npm test', 0, 120_000),
+    TEST_RUNNER_CALLER_BUDGET_MS,
+    'npm test 必须拿到专用预算，否则 52s 的全量测试在竞争下必被 120s 默认预算杀掉',
+  )
+  assert.ok(
+    TEST_RUNNER_CALLER_BUDGET_MS < TYPECHECK_CALLER_BUDGET_MS,
+    '测试预算有界——不套用 typecheck 的 13 分钟（那档是为等跨进程共享锁而设）',
+  )
+  const explicit = TEST_RUNNER_CALLER_BUDGET_MS + 60_000
+  assert.equal(resolveCallerTimeoutBudget('npm test', explicit, 120_000), explicit, '调用方给更大值时不压')
+  assert.equal(resolveCallerTimeoutBudget('npm run build', 0, 120_000), 120_000, '非闸门形态不参与抬升')
+})
+
+test('测试运行形态的看门狗预算同样抬升且严格大于执行侧', () => {
+  const exec = resolveCallerTimeoutBudget('npm test', 0, 120_000)
+  const watch = resolveWatchdogTimeout('npm test', 0, 120_000)
+  assert.ok(watch > exec, '声明侧必须严格大于执行侧，否则专用超时文案不可达')
+  assert.equal(resolveWatchdogTimeout('npm run build', 0, 120_000), 120_000, '非闸门形态原样返回')
+})
+
+test('跨链契约：full 形态两链对齐，派生形态刻意分叉（预算多认、验证记 unknown）', async () => {
+  const { inferBashVerificationScope } = await import('../../agent/bash-verification.js')
+  // full 形态对齐：预算抬升 ↔ 验证记 full+test（只抬预算换不来 passed 记录 = 空转）。
+  for (const cmd of ['npm test', 'node --test', 'npx vitest run']) {
+    assert.ok(isTestRunnerCommand(cmd), `预算链应认：${cmd}`)
+    assert.deepEqual(
+      inferBashVerificationScope(cmd),
+      { scope: 'full', kind: 'test' },
+      `验证链应记 full+test：${cmd}`,
+    )
+  }
+  // 派生形态刻意不同：子集也可能跑得久（预算照抬），但子集不满足 full-scope
+  // 覆盖义务（验证记 unknown 而非 full）——语义差异，不是漂移。
+  assert.ok(isTestRunnerCommand('npm run test:unit'), '预算链认派生形态')
+  assert.notEqual(inferBashVerificationScope('npm run test:unit').scope, 'full', '派生形态不得记 full')
 })

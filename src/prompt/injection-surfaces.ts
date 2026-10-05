@@ -561,6 +561,7 @@ export const INJECTION_SURFACES: readonly InjectionSurface[] = [
  * 改字节 0 之后的字节，整段前缀每轮失效。
  */
 export const FROZEN_KEEP_FIELDS: readonly string[] = [
+  'workspaceRoots',
   'activeDomain',
   'cwdRelation',
   'knowledgeManifestBlock',

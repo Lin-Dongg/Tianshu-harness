@@ -80,12 +80,19 @@ test('GET /stream：注册表为空也发 job_snapshot（jobs: [] 清场信号�
   await routes['GET /sessions/:id/stream']!({}, { id, since: '0' }, AUTH, res)
 
   const frames = parseFrames(writes)
-  assert.equal(frames[0]?.event, 'replay_window', '首帧仍是 replay_window')
-  assert.equal(frames[1]?.event, 'job_snapshot', '次帧是 job_snapshot')
-  assert.equal(frames[1]!.payload.seq, 0, '合成事件 seq 恒为 0（不进 fold 幂等账本）')
-  assert.deepEqual(frames[1]!.payload.data, { jobs: [] }, '空注册表 = 空快照（重启悬挂对账信号）')
-  // 该会话无任何领域事件——快照之后不应再有别的帧。
-  assert.equal(frames.length, 2)
+  // 建连元事件前缀（都在回放主体之前）自 PR #353 起多了一条 delegation_snapshot：
+  //   replay_window → delegation_snapshot → job_snapshot →（可选）zen_phase
+  // 本条锁前缀次序；approval_snapshot 例外，刻意排在回放主体之后
+  // （见 approval-snapshot.test.ts）。
+  const events = frames.map((f) => f.event)
+  assert.equal(events[0], 'replay_window', '首帧仍是 replay_window')
+  assert.equal(events[1], 'delegation_snapshot', '次帧是 delegation_snapshot（PR #353 的兄弟快照）')
+  assert.equal(events[2], 'job_snapshot', 'job_snapshot 紧随其后，仍在回放主体之前')
+  const snap = frames[2]!
+  assert.equal(snap.payload.seq, 0, '合成事件 seq 恒为 0（不进 fold 幂等账本）')
+  assert.deepEqual(snap.payload.data, { jobs: [] }, '空注册表 = 空快照（重启悬挂对账信号）')
+  // 该会话无任何领域事件——回放主体为空：除 seq=0 元事件外一帧真事件都没有。
+  assert.deepEqual(frames.filter((f) => f.payload.seq > 0), [], '回放主体为空（无 seq>0 事件）')
 })
 
 test('GET /stream：job_snapshot 只携带 running 任务（终态过滤），字段完整', async () => {

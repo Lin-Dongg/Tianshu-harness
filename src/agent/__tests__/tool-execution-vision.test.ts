@@ -1,3 +1,6 @@
+import { SessionContext } from '../context.js'
+import { buildPrimaryWorkerPacket } from '../worker-prompts.js'
+import { createDelegateBatchTool } from '../../tools/delegate-batch.js'
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { ToolExecutionController, type ToolExecutionDeps, type ToolExecBatchInput } from '../tool-execution.js'
@@ -21,12 +24,14 @@ describe('ToolExecutionController vision-channel injection', () => {
     uiPayloads?: unknown[][]
     sanitized?: Array<{ raw: string; sanitized: string; filterId?: string }>
     registered?: string[][]
+    history?: SessionContext
     observability?: TurnCacheObservability
   }
 
   function makeController(
     captured: Captured,
     opts: {
+      execute?: () => Promise<import('../../tools/types.js').ToolResult>
       supportsVision: boolean
       images?: string[]
       wireInjector?: boolean
@@ -41,7 +46,7 @@ describe('ToolExecutionController vision-channel injection', () => {
     const deps = {
       config: {
         toolRegistry: {
-          execute: async () => ({ content: 'Accessibility tree for Safari', isError: false, images: opts.images }),
+          execute: opts.execute ?? (async () => ({ content: 'Accessibility tree for Safari', isError: false, images: opts.images })),
           get: () => {
             if (throwRegistryGet) {
               throwRegistryGet = false
@@ -60,7 +65,7 @@ describe('ToolExecutionController vision-channel injection', () => {
         lspEnabled: false,
         contextClaimStore: undefined,
         sessionId: 'test-session',
-        contextWindow: 200_000,
+        contextWindow: opts.execute ? 1_000_000 : 200_000,
         promptEngine: { getModel: () => 'test-model' },
       },
       cwd: '/tmp/test',
@@ -87,7 +92,7 @@ describe('ToolExecutionController vision-channel injection', () => {
       getDoomLoopLevel: () => 'none' as const,
       getSessionTurnCount: () => 1,
       getSessionId: () => 'test-session',
-      addToolResults: () => { captured.events.push('addToolResults') },
+      addToolResults: (results: import('../../api/types.js').ContentBlock[]) => { captured.history?.addToolResults(results); captured.events.push('addToolResults') },
       getSupportsVision: () => opts.supportsVision,
       registerImages: opts.registerImages === false
         ? undefined
@@ -150,6 +155,23 @@ describe('ToolExecutionController vision-channel injection', () => {
       latestRisk: { level: 'none', reasons: [], suggestedAction: '' } as any,
     }
   }
+
+  it('delegate_batch packet stays valid and covers all orders through pipeline, tiering and SessionContext', async () => {
+    const results = Array.from({ length: 8 }, (_, i) => ({ workOrderId: `packet:${i}`, status: 'passed' as const, summary: 'complete', findings: [{ claim: 'long finding '.repeat(6000), evidence: 'src/a.ts:1', confidence: 'high' as const }], artifacts: [], changedFiles: [], risks: [], nextActions: [], evidenceStatus: 'unverified' as const }))
+    const packet = await buildPrimaryWorkerPacket(results)
+    const tool = createDelegateBatchTool({ delegateBatch: async () => ({ status: 'completed', results, packet }) } as any)
+    const captured: Captured = { injected: [], events: [], history: new SessionContext() }
+    const controller = makeController(captured, { supportsVision: false, execute: () => tool.execute({ cwd: process.cwd(), toolUseId: 't1', input: { tasks: [{ objective: 'Inspect packet byte stability through all result consumers' }] } }) })
+    const input = makeInput(captured); input.toolUses = [{ id: 't1', name: 'delegate_batch', input: { tasks: [] } }]
+    await controller.executeBatch(input)
+    const message = captured.history!.getMessages().find(m => m.role === 'tool')!
+    const view = String(message.content)
+    const parsed = JSON.parse(view.match(/<worker_results>([\s\S]*?)<\/worker_results>/)![1]!)
+    assert.equal(parsed.length, results.length)
+    assert.deepEqual(parsed.map((r: any) => r.workOrderId), results.map(r => r.workOrderId))
+    assert.ok(view.length <= 34_000)
+    assert.equal((view.match(/<worker_results>/g) ?? []).length, 1)
+  })
 
   const IMG = 'data:image/png;base64,AAAA'
 
@@ -293,6 +315,7 @@ describe('ToolExecutionController vision-channel injection', () => {
       false,
       undefined,
       undefined,
+      { command: undefined, exitCode: undefined, images: undefined, lossiness: undefined, outputText: 'Accessibility tree for Safari', outputTruncated: undefined },
     ])
     assert.deepEqual(captured.sanitized, [{
       raw: 'Accessibility tree for Safari',

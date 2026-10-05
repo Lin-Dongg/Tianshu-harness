@@ -62,6 +62,7 @@ function createCoordinator(runWorker: () => Promise<WorkerSessionRun>): Delegati
 
 function workerRun(over: Record<string, unknown> = {}, transcript?: Record<string, unknown>): WorkerSessionRun {
   return {
+    session: { getMessages: () => [{ role: 'user', content: 'fixture objective' }, { role: 'assistant', content: 'fixture observations' }] },
     result: {
       workOrderId: 'test',
       status: 'passed' as const,
@@ -112,6 +113,7 @@ describe('coordinator: 目标对账接线', () => {
     const run = await coordinator.delegate(req('审查 request-freezer 的字节稳定性') as any)
 
     assert.equal(sole(run).status, 'blocked', 'aggregateResults 不该把对账判出的 blocked 抹回去')
+    assert.equal(coordinator.getState().getEvents().filter(e => ['passed', 'failed', 'blocked'].includes(e.type)).at(-1)?.type, 'blocked')
     assert.match(sole(run).risks.join('\n'), /空壳/)
   })
 

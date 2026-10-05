@@ -2,7 +2,7 @@ import { UIHistory, historyText, readHistorySource, type UIRecord } from '../ui-
 import { getTheme, getActiveThemeName } from '../theme.js'
 import { formatMarkdown, parseBlocks, highlightLine, keywordsForLang, type Block } from '../format/markdown.js'
 import { formatToolCard } from '../format/tool-card.js'
-import { displayWidth, ambiguousWideEnabled } from '../width.js'
+import { displayWidth, ambiguousWideEnabled, truncateToDisplayWidth } from '../width.js'
 import { useAsciiGlyphs } from '../term-caps.js'
 import { ANSI, ANSI_SEQ_RE, color, enforceTextContract } from './ansi.js'
 import type { KeyPress } from './input-handler.js'
@@ -58,7 +58,7 @@ function markdownSource(block: Block): string {
     case 'code': return `\`\`\`${block.language ?? ''}\n${block.content}\n\`\`\``
     case 'header': return `${'#'.repeat(block.level ?? 1)} ${block.content}`
     case 'blockquote': return block.content.split('\n').map(line => `> ${line}`).join('\n')
-    case 'list': return (block.items ?? []).map((line, i) => `${block.ordered ? `${i + 1}.` : '-'} ${line}`).join('\n')
+    case 'list': return (block.items ?? []).map((line, i) => `${block.itemPrefixes?.[i] ?? (block.ordered ? `${i + 1}. ` : '- ')}${line}`).join('\n')
     case 'math': return `$$${block.content}$$`
     case 'hr': return '---'
     default: return block.content
@@ -81,10 +81,13 @@ export class ConversationViewport {
   private priorAnchor?: ConversationAnchor
   private priorFollow = false
   private priorDetail?: DetailPage
+  private priorProcess?: { start: number; end: number }
   private following = true
   private observedCount = 0
   private streaming = false
   private detail?: DetailPage
+  private readingEpoch = 0
+  private expandedProcess?: { start: number; end: number }
   private position: ConversationAnchor = { recordId: 0, recordIndex: 0, block: 0, lineOffset: 0 }
   private cells: ViewportCell[] = []
   private failure = ''
@@ -103,14 +106,16 @@ export class ConversationViewport {
   get searchState(): { mode: SearchMode; query: string; matches: number; index: number; pending: boolean } {
     return { mode: this.searchMode, query: this.query, matches: this.matches.length, index: this.matchIndex, pending: !!this.controller }
   }
-  get status(): string {
+  get status(): string { return this.readingStatus(false) }
+  get inlineStatus(): string { return this.readingStatus(true) }
+  private readingStatus(inline: boolean): string {
     if (this.searchMode === 'query') return `/${this.query} · ${this.controller ? '搜索中' : `${this.matches.length}处匹配`} · Enter 结果 · Esc 返回`
     if (this.searchMode === 'results') return `${this.matches.length ? this.matchIndex + 1 : 0}/${this.matches.length}处匹配 · n/N 跳转 · / 编辑 · Esc 原位置`
-    const parts = ['↑↓/j/k 逐行 · PgUp/PgDn 半屏 · / 搜索 · Esc 返回']
+    const parts = [inline ? 'Enter 展开/收起 · ↑↓ 阅读 · PgUp/PgDn 翻页 · 输入返回对话' : '↑↓/j/k 逐行 · PgUp/PgDn 半屏 · / 搜索 · Esc 返回']
     if (this.newRecords) parts.unshift(`有${this.newRecords}条新记录 · Ctrl+End 回到底部`)
     if (this.streaming) parts.unshift('正在续写')
     if (this.detail) parts.unshift(`详情第${this.detail.page + 1}页 · ←/→ 换页 · Enter 折叠`)
-    if (this.failure || this.history.diagnostic) parts.unshift(this.failure || this.history.diagnostic)
+    if (this.failure || this.history.diagnostic) parts.unshift('历史记录异常（见提示）')
     return parts.join(' · ')
   }
 
@@ -120,10 +125,16 @@ export class ConversationViewport {
     this.following = false
   }
   stopReading(): void {
+    this.readingEpoch++
     this.controller?.abort()
     this.controller = undefined
     this.searchMode = 'closed'
     this.priorAnchor = undefined
+    this.priorDetail = undefined
+    this.priorProcess = undefined
+    this.detail = undefined
+    this.expandedProcess = undefined
+    this.blockCache.clear()
     this.following = true
     this.observedCount = this.history.count
     this.schedule(() => this.bottom())
@@ -186,7 +197,8 @@ export class ConversationViewport {
 
   selectRecord(index: number): void {
     this.startReading()
-    this.schedule(async () => { await this.load(index); this.setPosition(index, 0, 0) })
+    const epoch = this.readingEpoch
+    this.schedule(async () => { await this.load(index); if (epoch === this.readingEpoch) this.setPosition(index, 0, 0) })
   }
   selectCell(cell: ConversationAnchor): void {
     this.startReading()
@@ -227,7 +239,7 @@ export class ConversationViewport {
       return false
     }
     if (key.char === '/' && !key.ctrl && !key.meta) {
-      if (this.searchMode === 'closed') { this.priorAnchor = { ...this.position }; this.priorFollow = this.following; this.priorDetail = this.detail; this.query = ''; this.matches = []; this.matchIndex = -1 }
+      if (this.searchMode === 'closed') { this.priorAnchor = { ...this.position }; this.priorFollow = this.following; this.priorDetail = this.detail; this.priorProcess = this.expandedProcess; this.query = ''; this.matches = []; this.matchIndex = -1 }
       this.startReading()
       this.searchMode = 'query'
       this.onChange()
@@ -240,6 +252,9 @@ export class ConversationViewport {
       if (this.detail) this.blockCache.delete(this.detail.id)
       this.detail = this.priorDetail
       this.priorDetail = undefined
+      this.expandedProcess = this.priorProcess
+      this.priorProcess = undefined
+      this.blockCache.clear()
       if (this.priorAnchor) this.position = { ...this.priorAnchor }
       this.following = this.priorFollow
       this.priorAnchor = undefined
@@ -251,7 +266,7 @@ export class ConversationViewport {
     }
     if (key.ctrl && key.name === 'home') { this.startReading(); this.schedule(async () => { await this.load(0); this.setPosition(0, 0, 0) }); return true }
     if (key.ctrl && key.name === 'end') { this.following = true; this.observedCount = this.history.count; this.schedule(() => this.bottom()); return true }
-    if (key.name === 'return') { this.schedule(() => this.toggleDetail()); return true }
+    if (key.name === 'return') { const epoch = this.readingEpoch; this.schedule(() => this.toggleDetail(epoch)); return true }
     if (this.detail && (key.name === 'right' || key.name === 'left' || key.char === ']' || key.char === '[')) {
       this.schedule(() => this.pageDetail(key.name === 'left' || key.char === '[' ? -1 : 1)); return true
     }
@@ -279,7 +294,7 @@ export class ConversationViewport {
     this.startReading()
     this.schedule(async () => {
       await this.move(movement)
-      if (movement > 0 && this.searchMode === 'closed') {
+      if (movement > 0 && this.searchMode === 'closed' && !this.expandedProcess && !this.detail) {
         const cursor = { ...this.position }
         for (let i = 0; i < this.height; i++) {
           if (!this.stepLocal(cursor, 1)) {
@@ -304,7 +319,7 @@ export class ConversationViewport {
     const count = this.history.count
     const page = await this.history.page(start, 192)
     this.records = new Map(page.map((r, i) => [start + i, r]))
-    for (const id of this.blockCache.keys()) if (!page.some(record => record.id === id)) this.blockCache.delete(id)
+    this.blockCache.clear()
     this.loadedCount = count
   }
   private setPosition(index: number, block: number, lineOffset: number): void {
@@ -313,8 +328,13 @@ export class ConversationViewport {
     this.normalize()
   }
   private normalize(): void {
-    const record = this.records.get(this.position.recordIndex)
+    let record = this.records.get(this.position.recordIndex)
     if (!record) return
+    const group = this.processGroup(this.position.recordIndex)
+    if (group && !this.processExpanded(group) && this.position.recordIndex !== group.start) {
+      this.position.recordIndex = group.start; this.position.block = 0; this.position.lineOffset = 0
+      record = this.records.get(group.start)!
+    }
     const blocks = this.blocks(record)
     this.position.recordId = record.id
     this.position.block = Math.max(0, Math.min(blocks.length - 1, this.position.block))
@@ -325,9 +345,47 @@ export class ConversationViewport {
     if (appearance !== this.cacheAppearance) { this.blockCache.clear(); this.cacheAppearance = appearance }
     const cached = this.blockCache.get(record.id)
     if (cached) return cached
-    const result = this.renderBlocks(record)
+    const index = [...this.records].find(entry => entry[1].id === record.id)?.[0] ?? -1
+    const group = this.processGroup(index)
+    let result: string[][]
+    if (group && !this.processExpanded(group) && index !== group.start) result = []
+    else {
+      result = this.renderBlocks(record)
+      if (group && index === group.start) {
+        let tools = 0, thoughts = 0
+        for (let i = group.start; i <= group.end; i++) {
+          if (this.records.get(i)?.kind === 'tool') tools++
+          else thoughts++
+        }
+        const expanded = this.processExpanded(group)
+        const marker = useAsciiGlyphs() ? expanded ? '-' : '+' : expanded ? '▾' : '▸'
+        const historyFailure = record.kind === 'error'
+        const label = historyFailure ? `历史记录${record.name === 'history-corrupt' ? '损坏' : '不可用'} · ${group.end - group.start + 1} 条` : `执行过程 · ${tools} 工具 · ${thoughts} 思考`
+        const summary = color(`${marker} ${label} [${expanded ? '收起' : '展开'}]`, historyFailure ? getTheme().error : getTheme().muted)
+        result = [wrapViewportText(summary, this.width), ...(expanded ? result : [])]
+      }
+    }
     this.blockCache.set(record.id, result)
     return result
+  }
+  private processGroup(index: number): { start: number; end: number } | undefined {
+    const record = this.records.get(index)
+    const historyFailure = record?.kind === 'error' && ['history-corrupt', 'history-unavailable'].includes(record.name ?? '')
+    const foldable = (candidate?: UIRecord) => historyFailure ? candidate?.kind === 'error' && candidate.name === record.name : candidate?.kind === 'thinking' || candidate?.kind === 'tool' && !candidate.isError && !['ask_user_question', 'team_orchestrate', 'council_convene'].includes(candidate.name ?? '')
+    if (!foldable(this.records.get(index))) return
+    // Keep group discovery inside one payload page; long runs remain paged and bounded.
+    const page = Math.floor(index / 64) * 64
+    let start = index, end = index
+    while (start > page && foldable(this.records.get(start - 1))) start--
+    while (end < page + 63 && foldable(this.records.get(end + 1))) end++
+    return end > start ? { start, end } : undefined
+  }
+  private processExpanded(group: { start: number; end: number }): boolean { return this.expandedProcess?.start === group.start }
+  private disclosureTitle(text: string, expanded: boolean): string {
+    const action = ` [${expanded ? '收起' : '展开'}]`
+    const width = Math.max(0, this.width - displayWidth(action, wide()))
+    const label = historyText(text).split('\n')[0] ?? ''
+    return truncateToDisplayWidth(label, Math.max(0, width - (displayWidth(label, wide()) > width ? 1 : 0)), wide()) + (displayWidth(label, wide()) > width ? '…' : '') + action
   }
   private renderBlocks(record: UIRecord): string[][] {
     const theme = getTheme()
@@ -337,11 +395,16 @@ export class ConversationViewport {
     })
     if (record.kind === 'tool') {
       const card = formatToolCard({ toolName: record.name ?? 'tool', content: '', isError: record.isError, toolInput: record.input, rawPath: record.rawPath }, theme)
-      const title = wrap([`${card[0]} · Enter 查看`])
+      const title = wrap([color(this.disclosureTitle(card[0] ?? record.name ?? 'tool', this.detail?.id === record.id), record.isError ? theme.error : theme.secondary)])
       if (this.detail?.id !== record.id) return record.isError ? [title, wrap([historyText(record.text).split('\n')[0] ?? ''])] : [title]
       return [title, wrap(['参数', JSON.stringify(record.input ?? {}, null, 2)]), ...this.detailBlocks(record)]
     }
-    if (record.kind === 'thinking' && this.detail?.id !== record.id) return [wrap([color('思考（已记录）· Enter 查看', theme.dim)])]
+    if (record.kind === 'thinking' && this.detail?.id !== record.id) return [wrap([color('思考（已记录） [展开]', theme.dim)])]
+    if (record.kind === 'notice' && record.name !== 'turn-complete' && (this.detail?.id === record.id || wrap([record.text]).length > 1)) {
+      const label = /暂停保存|历史保存失败/.test(record.text) ? '提示 · 历史保存已暂停' : `提示 · ${record.text}`
+      const title = wrap([color(this.disclosureTitle(label, this.detail?.id === record.id), theme.warning)])
+      return this.detail?.id === record.id ? [title, ...this.detailBlocks(record)] : [title]
+    }
     const labels = { user: useAsciiGlyphs() ? '>' : '❯', assistant: '●', thinking: '思考', approval: '等待审批', error: '错误', boundary: '会话边界', notice: '提示' }
     const tint = record.kind === 'error' ? theme.error : record.kind === 'notice' ? theme.warning : record.kind === 'user' ? theme.userColor : record.kind === 'assistant' ? theme.assistantColor : theme.dim
     const conversation = record.kind === 'user' || record.kind === 'assistant'
@@ -352,7 +415,7 @@ export class ConversationViewport {
     else {
       const source = historyText(record.text)
       for (const block of parseBlocks(source)) {
-        const width = Math.max(1, (block.type === 'code' || block.type === 'table' ? this.width : Math.min(88, this.width)) - (conversation ? 2 : 0))
+        const width = Math.max(1, this.width - (conversation ? 2 : 0))
         let lines: string[]
         if (block.type === 'code') {
           const language = block.language ? keywordsForLang(block.language) : null
@@ -383,25 +446,31 @@ export class ConversationViewport {
     if (!r) return false
     const blocks = this.blocks(r)
     if (direction > 0) {
-      if (cursor.lineOffset + 1 < blocks[cursor.block]!.length) cursor.lineOffset++
+      if (blocks.length && cursor.lineOffset + 1 < blocks[cursor.block]!.length) cursor.lineOffset++
       else if (cursor.block + 1 < blocks.length) { cursor.block++; cursor.lineOffset = 0 }
       else {
-        if (cursor.recordIndex + 1 >= this.history.count || !this.records.has(cursor.recordIndex + 1)) return false
-        cursor.recordIndex++; cursor.recordId = this.records.get(cursor.recordIndex)!.id; cursor.block = 0; cursor.lineOffset = 0
+        do {
+          if (cursor.recordIndex + 1 >= this.history.count || !this.records.has(cursor.recordIndex + 1)) return false
+          cursor.recordIndex++
+        } while (!this.blocks(this.records.get(cursor.recordIndex)!).length)
+        cursor.recordId = this.records.get(cursor.recordIndex)!.id; cursor.block = 0; cursor.lineOffset = 0
       }
     } else {
       if (cursor.lineOffset > 0) cursor.lineOffset--
       else if (cursor.block > 0) { cursor.block--; cursor.lineOffset = blocks[cursor.block]!.length - 1 }
       else {
-        if (cursor.recordIndex <= 0 || !this.records.has(cursor.recordIndex - 1)) return false
-        cursor.recordIndex--; cursor.recordId = this.records.get(cursor.recordIndex)!.id
+        do {
+          if (cursor.recordIndex <= 0 || !this.records.has(cursor.recordIndex - 1)) return false
+          cursor.recordIndex--
+        } while (!this.blocks(this.records.get(cursor.recordIndex)!).length)
+        cursor.recordId = this.records.get(cursor.recordIndex)!.id
         const previous = this.blocks(this.records.get(cursor.recordIndex)!)
         cursor.block = previous.length - 1; cursor.lineOffset = previous[cursor.block]!.length - 1
       }
     }
     return true
   }
-  private async move(amount: number): Promise<void> {
+  private async move(amount: number, minimumIndex = 0): Promise<void> {
     this.resizeAnchor = undefined
     const direction = Math.sign(amount)
     for (let n = 0; n < Math.abs(amount); n++) {
@@ -410,10 +479,11 @@ export class ConversationViewport {
       const cursor = { ...this.position }
       if (!this.stepLocal(cursor, direction)) {
         const next = cursor.recordIndex + direction
-        if (next < 0 || next >= this.history.count) break
+        if (next < minimumIndex || next >= this.history.count) break
         await this.load(next)
         if (!this.stepLocal(cursor, direction)) break
       }
+      if (cursor.recordIndex < minimumIndex) break
       this.position = cursor
     }
   }
@@ -423,8 +493,8 @@ export class ConversationViewport {
     const record = this.records.get(index)
     if (!record) return
     const blocks = this.blocks(record)
-    this.setPosition(index, blocks.length - 1, blocks.at(-1)!.length - 1)
-    await this.move(-Math.max(0, this.height - 1))
+    this.setPosition(index, Math.max(0, blocks.length - 1), blocks.at(-1)?.length ? blocks.at(-1)!.length - 1 : 0)
+    await this.move(-Math.max(0, this.height - 1), Math.max(0, Math.floor(index / 64) * 64 - 64))
     if (this.following) this.observedCount = this.history.count
   }
   private search(): void {
@@ -449,6 +519,8 @@ export class ConversationViewport {
     if (this.searchMode !== 'results') return
     const record = this.records.get(index)
     if (!record) return
+    this.expandedProcess = this.processGroup(index)
+    this.blockCache.clear()
     const needle = this.query.replace(/\s/g, '').toLowerCase()
     const locate = (): boolean => {
       this.blockCache.delete(record.id)
@@ -481,10 +553,22 @@ export class ConversationViewport {
     } while (this.searchMode === 'results' && this.query.replace(/\s/g, '').toLowerCase() === needle)
     if (this.searchMode === 'results') this.setPosition(index, 0, 0)
   }
-  private async toggleDetail(): Promise<void> {
+  private async toggleDetail(epoch: number): Promise<void> {
+    if (epoch !== this.readingEpoch) return
     await this.load(this.position.recordIndex)
+    if (epoch !== this.readingEpoch) return
     const record = this.records.get(this.position.recordIndex)
-    if (!record || (record.kind !== 'tool' && record.kind !== 'thinking' && !record.rawPath)) return
+    if (!record) return
+    const group = this.processGroup(this.position.recordIndex)
+    if (group && (this.position.recordIndex === group.start && this.position.block === 0 || !this.processExpanded(group))) {
+      this.expandedProcess = this.processExpanded(group) ? undefined : group
+      this.detail = undefined
+      this.blockCache.clear()
+      this.position.block = 0; this.position.lineOffset = 0
+      this.startReading()
+      return
+    }
+    if (record.kind !== 'tool' && record.kind !== 'thinking' && record.kind !== 'notice' && !record.rawPath) return
     if (this.detail) this.blockCache.delete(this.detail.id)
     if (this.detail?.id === record.id) this.detail = undefined
     else {

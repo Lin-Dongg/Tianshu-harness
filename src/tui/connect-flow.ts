@@ -1234,8 +1234,8 @@ export class ConnectFlow {
           kind: 'input',
           title: '输入模型型号',
           subtitle: this.collected.existingProvider
-            ? '例如 deepseek-v4-flash'
-            : '探测未发现模型列表——手动填写一个模型型号（例如 deepseek-v4-flash）',
+            ? '例如 deepseek-flash'
+            : '探测未发现模型列表——手动填写一个模型型号（例如 deepseek-flash）',
           stepLabel: this.diyStepLabel(this.collected.existingProvider ? 2 : 6),
         }
       case 'diy-context':

@@ -3,6 +3,12 @@ export interface ThinkingRetryState {
   thinkingOnlyRetries: number
 }
 
+export function resetReasoningRecovery(state: ThinkingRetryState & { reasoningRecoveryPending: boolean }): void {
+  state.thinkingOnlyRetries = 0
+  state.lastThinkingContent = ''
+  state.reasoningRecoveryPending = false
+}
+
 export interface ThinkingRetryInput {
   streamedText: string
   collectedBlockCount: number
@@ -24,7 +30,7 @@ export function evaluateThinkingRetry(input: ThinkingRetryInput): ThinkingRetryR
   if (streamedText.length > 0 || collectedBlockCount > 0 || thinkingOnlyRetries >= 1) {
     return {
       shouldRetry: false, isLooping: false,
-      nextState: { lastThinkingContent: '', thinkingOnlyRetries: 0 },
+      nextState: { lastThinkingContent: '', thinkingOnlyRetries },
       retryMessage: '',
     }
   }

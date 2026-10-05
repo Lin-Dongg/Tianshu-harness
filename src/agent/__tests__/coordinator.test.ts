@@ -18,6 +18,7 @@ import { READ_ONLY_WORKER_TOOLS, WRITE_WORKER_TOOLS, type WorkerResult } from '.
 import { CollaborationProtocol } from '../collaboration-protocol.js'
 import { profileRegistry } from '../profile-registry.js'
 import { ProviderHealthTracker } from '../provider-health.js'
+import { LocalWorkerPolicyError } from '../../api/continuation-prefix.js'
 
 function fakeTool(name: string): Tool {
   return {
@@ -124,6 +125,33 @@ function resultFor(id: string): WorkerResult {
 }
 
 describe('DelegationCoordinator', () => {
+  it('actual delegate_task delivery contract rejects a read-only patch before model execution', async () => {
+    let calls = 0
+    const coordinator = new DelegationCoordinator({
+      baseToolRegistry: makeRegistry(), modelCards: cards, maxWorkers: 1,
+      runtimeFactory: (order, card, registry) => ({ order, client: {} as StreamClient, promptEngine: new PromptEngine({ model: card.model, maxTokens: 1024, staticCtx: { tools: registry.getDefinitions() }, volatileCtx: { cwd: process.cwd() } }), toolRegistry: registry, cwd: process.cwd(), maxTurns: 2, contextWindow: card.contextWindow, compact: { enabled: false, model: 'flash' } }),
+      runWorker: async () => { calls++; throw new Error('must not execute') },
+    })
+    const { createDelegateTaskTool } = await import('../../tools/delegate-task.js')
+    const tool = createDelegateTaskTool(coordinator)
+    const output = await tool.execute({ cwd: process.cwd(), toolUseId: 'missing-write', input: { objective: 'Apply an actual patch to the worker continuation boundary', profile: 'code_scout', delivery: 'patch', files: ['src/agent/coordinator.ts'] } })
+    assert.equal(calls, 0)
+    assert.match(output.content, /lacks file editing capability/)
+    assert.match(output.content, /policy_short_circuit/)
+  })
+  it('local prefix rejection makes no retry or model upgrade through the real coordinator', async () => {
+    let calls = 0
+    const coordinator = new DelegationCoordinator({
+      baseToolRegistry: makeRegistry(), modelCards: cards, maxWorkers: 1, escalationCap: 'strong',
+      retrySleepFn: async () => {},
+      runtimeFactory: (order, card, registry) => ({ order, client: {} as StreamClient, promptEngine: new PromptEngine({ model: card.model, maxTokens: 1024, staticCtx: { tools: registry.getDefinitions() }, volatileCtx: { cwd: '/repo' } }), toolRegistry: registry, cwd: '/repo', maxTurns: 2, contextWindow: card.contextWindow, compact: { enabled: false, model: 'flash' } }),
+      runWorker: async () => { calls++; throw new LocalWorkerPolicyError('worker continuation prefix diverged; request not sent') },
+    })
+    const run = await coordinator.delegate({ parentTurnId: 'local-refusal', objective: 'Inspect the actual worker continuation context and preserve all previous findings', kind: 'code_search', profile: 'code_scout', scope: { files: ['src/agent/coordinator.ts'] }, budget: { maxRetries: 3 } })
+    assert.equal(calls, 1)
+    assert.equal(run.results[0]?.failureReason, 'policy_short_circuit')
+    assert.equal(run.results[0]?.status, 'blocked')
+  })
   it('uses a budget gate for trivial objectives', () => {
     assert.equal(shouldDelegateObjective('tiny', {}), false)
     assert.equal(shouldDelegateObjective('compare routing seams across worker session and coordinator modules', {}), true)
@@ -2050,7 +2078,7 @@ describe('DelegationCoordinator', () => {
     assert.equal(modelsUsed.filter(m => m === 'cheap-flash').length, 4)
   })
 
-  it('P0-5: 契约失败（json_parse blocked 正常返回）→ Flash→Pro 升档，更好结果替换原结果', async () => {
+  it('P0-5: 报告契约失败保守交付，不升档重跑', async () => {
     const escalateCards: ModelCapabilityCard[] = [
       { model: 'cheap-flash', toolUseReliability: 0.7, jsonStability: 0.7, editSuccessRate: 0.5, testRepairRate: 0.5, contextWindow: 1_000_000, cacheEconomics: 'strong', recommendedTasks: ['code_search'] },
       { model: 'deepseek-pro', toolUseReliability: 0.95, jsonStability: 0.95, editSuccessRate: 0.9, testRepairRate: 0.85, contextWindow: 128_000, cacheEconomics: 'medium', recommendedTasks: ['patch_proposal'] },
@@ -2107,15 +2135,15 @@ describe('DelegationCoordinator', () => {
     })
 
     assert.equal(run.status, 'completed')
-    assert.equal(modelsUsed.join(','), 'cheap-flash,deepseek-pro', '契约失败后升档到 Pro 重跑一次')
-    assert.equal(workerCalls, 2)
-    assert.equal(run.selectedModel, 'deepseek-pro')
-    assert.equal(run.results[0]!.status, 'passed', '升档产出的合规结果替换原契约破碎结果')
+    assert.equal(modelsUsed.join(','), 'cheap-flash', '报告契约失败不迁移模型或重启探索')
+    assert.equal(workerCalls, 1)
+    assert.equal(run.selectedModel, 'cheap-flash')
+    assert.equal(run.results[0]!.status, 'blocked', '升档产出的合规结果替换原契约破碎结果')
     const shadow = run.modelTierShadows!.find(s => s.reason.includes('契约失败'))
-    assert.ok(shadow, '契约失败升档必须落 shadow（配额记账）')
+    assert.equal(shadow, undefined, '没有隐藏的模型升档')
   })
 
-  it('P0-5: 升档后契约仍碎 → 保留原结果、不替换 selectedModel', async () => {
+  it('P0-5: 报告仍碎时保留原结果和原模型', async () => {
     const escalateCards: ModelCapabilityCard[] = [
       { model: 'cheap-flash', toolUseReliability: 0.7, jsonStability: 0.7, editSuccessRate: 0.5, testRepairRate: 0.5, contextWindow: 1_000_000, cacheEconomics: 'strong', recommendedTasks: ['code_search'] },
       { model: 'deepseek-pro', toolUseReliability: 0.95, jsonStability: 0.95, editSuccessRate: 0.9, testRepairRate: 0.85, contextWindow: 128_000, cacheEconomics: 'medium', recommendedTasks: ['patch_proposal'] },
@@ -2163,7 +2191,7 @@ describe('DelegationCoordinator', () => {
       budget: { maxRetries: 1, maxTurns: 4, maxTokens: 4096, timeoutMs: 30000 },
     })
 
-    assert.equal(modelsUsed.join(','), 'cheap-flash,deepseek-pro', '仍尝试了一次升档')
+    assert.equal(modelsUsed.join(','), 'cheap-flash', '契约失败只保守交付')
     assert.equal(run.results[0]!.status, 'blocked', '升档无改善 → 原结果保留')
     assert.equal(run.results[0]!.failureReason, 'json_parse')
     assert.equal(run.selectedModel, 'cheap-flash', 'selectedModel 不切换到无改善的升档模型')

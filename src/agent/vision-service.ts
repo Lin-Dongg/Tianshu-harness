@@ -6,6 +6,8 @@
  * primary prompt so the main model still receives the image content.
  */
 
+import { createHash } from 'node:crypto'
+import type { Usage } from '../api/types.js'
 import type { StreamClient } from '../api/stream-client.js'
 import type { OaiChatRequest, OaiContentPart } from '../api/oai-types.js'
 
@@ -42,15 +44,14 @@ export function selectVisionPrompt(configuredPrompt?: string, accompanyingText?:
 }
 
 /**
- * 归一化一次视觉查询为缓存键：定向问题 → 折叠空白 + 小写的问题文本；
- * 无问题（首次描述）→ 按选中的模式（general/ocr）归类。同图同角度重复问命中缓存零调用。
- * 不做语义哈希/嵌入（评审纪律：只做字符串归一化，避免不稳定字节）。
+ * Cache the exact question or selected prompt digest. Callers bind this to
+ * the actual vision model and image identity; case differences stay distinct.
  */
 export function visionCacheKey(question?: string, configuredPrompt?: string, accompanyingText?: string): string {
   const q = question?.trim()
-  if (q) return `q:${q.replace(/\s+/g, ' ').toLowerCase()}`
+  if (q) return `q:${createHash('sha256').update(q).digest('hex')}`
   const prompt = selectVisionPrompt(configuredPrompt, accompanyingText)
-  return prompt === UI_PRECISE_VISION_PROMPT ? 'mode:ocr' : 'mode:general'
+  return `prompt:${createHash('sha256').update(prompt).digest('hex')}`
 }
 
 export interface DescribeImagesOptions {
@@ -62,6 +63,10 @@ export interface DescribeImagesOptions {
   maxTokens?: number
   /** Abort signal. */
   signal?: AbortSignal
+  model?: string
+  purpose?: 'vision_description' | 'vision_question'
+  recordUsage?: (usage: Partial<Usage>) => void
+  onOutcome?: (outcome: { complete: boolean; reason: string }) => void
 }
 
 /**
@@ -103,10 +108,11 @@ export async function describeImages(
   }
 
   const request: OaiChatRequest = {
-    model: '', // client already binds the model
+    model: options.model ?? '', // client binds the model when absent
     messages: [{ role: 'user', content: parts }],
     max_tokens: options.maxTokens ?? 1024,
     stream: true,
+    diagnostics: { purpose: options.purpose ?? 'vision_description' },
   }
 
   // 两个回调携带的是**同一段文本**，不是两半：onTextDelta 是流式增量（给 UI），
@@ -129,14 +135,16 @@ export async function describeImages(
       onContentBlock: (block) => {
         if (block.type === 'text' && block.text) blocks.push(block.text)
       },
-      onStopReason: (reason) => { stopReason = reason },
+      onStreamAttemptAborted: info => { if (info.usage) options.recordUsage?.(info.usage) },
+      onStopReason: (reason, usage) => { stopReason = reason; options.recordUsage?.(usage) },
       onError: (err) => { error = err },
     },
     options.signal,
   )
 
-  if (error) throw error
+  if (error) { options.onOutcome?.({ complete: false, reason: 'error' }); throw error }
   const text = blocks.length > 0 ? blocks.join('') : deltas.join('')
-
-  return (stopReason === 'length' ? `${text}\n[图片描述被截断]` : text).trim()
+  const complete = !!text.trim() && ['stop', 'end_turn', 'stop_sequence'].includes(stopReason)
+  options.onOutcome?.({ complete, reason: !text.trim() ? 'empty' : complete ? 'completed' : `stop:${stopReason || 'unknown'}` })
+  return (!complete && text.trim() ? `${text}\n[图片描述被截断]` : text).trim()
 }

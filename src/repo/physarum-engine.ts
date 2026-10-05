@@ -42,7 +42,7 @@ function isLoadablePhysarumEdge(edge: Pick<PhysarumEdgeState, 'fileA' | 'fileB'>
 
 export class PhysarumEngine {
   private edges = new Map<string, PhysarumEdgeState>()
-  private frozen = new Set<string>() // quarantined nodes
+  private frozen = new Map<string, number>() // node → exclusive expiry turn
   private avalanches: AvalancheStats = { sizes: [], lastCheckedTurn: 0 }
   private turnPruneHistory: number[] = []
   private turnGrowthHistory: number[] = []
@@ -71,7 +71,7 @@ export class PhysarumEngine {
   recordFileAccess(filePath: string, turn: number): void {
     if (!isIndexablePhysarumFile(filePath)) return
 
-    this.currentTurn = turn
+    this.advanceTurn(turn)
     this.observePrediction(filePath, turn)
 
     const existing = this.recentAccess.indexOf(filePath)
@@ -138,7 +138,7 @@ export class PhysarumEngine {
 
   /** Record flow on an edge (called on file access/co-edit) */
   recordFlow(fileA: string, fileB: string, turn: number): void {
-    this.currentTurn = turn
+    this.advanceTurn(turn)
     const key = this.edgeKey(fileA, fileB)
     let edge = this.edges.get(key)
     if (!edge) {
@@ -196,7 +196,7 @@ export class PhysarumEngine {
 
   /** Cold path: batch decay + prune all edges (call every N turns) */
   batchEvolve(turn: number): number {
-    this.currentTurn = turn
+    this.advanceTurn(turn)
     let pruned = 0
 
     for (const [key, edge] of this.edges) {
@@ -230,13 +230,24 @@ export class PhysarumEngine {
       nodeWeights.set(edge.fileB, (nodeWeights.get(edge.fileB) ?? 0) + edge.weight)
     }
 
+    const scales = new Map<string, { scale: number; order: number }>()
     for (const [node, total] of nodeWeights) {
       if (total <= this.config.synapticBudget) continue
-      const scale = this.config.synapticBudget / total
-      for (const edge of this.edges.values()) {
-        if (edge.fileA === node || edge.fileB === node) {
-          edge.weight *= scale
-        }
+      scales.set(node, { scale: this.config.synapticBudget / total, order: scales.size })
+    }
+    if (scales.size === 0) return
+
+    // Each edge has at most two factors. Preserve the previous node order,
+    // including floating-point rounding and scaling a self-edge only once.
+    for (const edge of this.edges.values()) {
+      const a = scales.get(edge.fileA)
+      const b = scales.get(edge.fileB)
+      if (a && b && b.order < a.order) {
+        edge.weight *= b.scale
+        edge.weight *= a.scale
+      } else {
+        if (a) edge.weight *= a.scale
+        if (b && b !== a) edge.weight *= b.scale
       }
     }
   }
@@ -256,20 +267,32 @@ export class PhysarumEngine {
     const n = totalNodes.size
     if (n === 0) return
 
+    const penalties = new Map<string, { penalty: number; order: number }>()
     for (const [node, connections] of nodeConnections) {
       const ratio = connections / n
       if (ratio <= this.config.ubiquityThreshold) continue
-      const penalty = 1 / (1 + Math.log(ratio / this.config.ubiquityThreshold))
-      for (const edge of this.edges.values()) {
-        if (edge.fileA === node || edge.fileB === node) {
-          edge.weight *= penalty
-        }
+      penalties.set(node, { penalty: 1 / (1 + Math.log(ratio / this.config.ubiquityThreshold)), order: penalties.size })
+    }
+    if (penalties.size === 0) return
+
+    // 与 applyHomeostaticScaling 同一两遍模式：保持旧算法的节点序浮点乘序，
+    // 自环只缩一次（a === b 时单因子）。
+    for (const edge of this.edges.values()) {
+      const a = penalties.get(edge.fileA)
+      const b = penalties.get(edge.fileB)
+      if (a && b && b.order < a.order) {
+        edge.weight *= b.penalty
+        edge.weight *= a.penalty
+      } else {
+        if (a) edge.weight *= a.penalty
+        if (b && b !== a) edge.weight *= b.penalty
       }
     }
   }
 
   /** Record spreading activation avalanche size for SOC monitoring */
   recordAvalanche(size: number, turn: number): void {
+    this.advanceTurn(turn)
     this.avalanches.sizes.push(size)
     if (this.avalanches.sizes.length > 100) this.avalanches.sizes.shift()
     this.avalanches.lastCheckedTurn = turn
@@ -337,8 +360,18 @@ export class PhysarumEngine {
   }
 
   /** Freeze a node (quarantine — immune response) */
-  freezeNode(file: string, _durationTurns: number): void {
-    this.frozen.add(file)
+  freezeNode(file: string, durationTurns: number): void {
+    if (!Number.isFinite(durationTurns) || durationTurns <= 0) return
+    const expiresAt = this.currentTurn + Math.ceil(durationTurns)
+    this.frozen.set(file, Math.max(this.frozen.get(file) ?? expiresAt, expiresAt))
+  }
+
+  private advanceTurn(turn: number): void {
+    if (turn === this.currentTurn) return
+    this.currentTurn = turn
+    for (const [file, expiresAt] of this.frozen) {
+      if (turn >= expiresAt) this.frozen.delete(file)
+    }
   }
 
   unfreezeNode(file: string): void {

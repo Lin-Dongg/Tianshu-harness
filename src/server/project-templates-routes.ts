@@ -6,6 +6,7 @@
  * so the desktop UI can drive the same flow with a modal/banner.
  */
 import type { RouteHandler } from './index.js'
+import { statSync } from 'node:fs'
 import { isAuthorizedRequest } from './auth.js'
 import { isKnownWorkspace, UNKNOWN_WORKSPACE_ERROR } from './workspace-guard.js'
 import {
@@ -17,6 +18,26 @@ import {
   type ApplyTemplatesOptions,
   type ApplyTemplatesResult,
 } from '../bootstrap/project-templates.js'
+
+/** 工作区已注册、但目录已从磁盘消失。 */
+export const WORKSPACE_MISSING_ERROR = 'workspace-missing'
+
+/**
+ * 已注册的工作区目录是否真的还在磁盘上。
+ *
+ * 「在册」来自存活会话 cwd + 默认工作区——测试临时目录被删后会话仍留在会话库
+ * 里，路径照样在册（现场：21 个 fac-* 测试会话）。此时 applyProjectTemplates 的
+ * writeFileSync 会抛 ENOENT；status 则会对不存在的目录回 needsInit=true，
+ * 诱导桌面端弹「初始化模板」从而踩中同一条崩溃路径。两处都先挡在门口。
+ * fail-closed：stat 失败（不存在 / 不是目录 / 权限）一律视为不可用。
+ */
+function workspaceDirAvailable(cwd: string): boolean {
+  try {
+    return statSync(cwd).isDirectory()
+  } catch {
+    return false
+  }
+}
 
 export interface ProjectTemplatesStatus {
   needsInit: boolean
@@ -48,6 +69,9 @@ export function buildProjectTemplatesRoutes(
       if (!isKnownWorkspace(cwd, knownWorkspaces())) {
         return { status: 403, body: { error: UNKNOWN_WORKSPACE_ERROR } }
       }
+      if (!workspaceDirAvailable(cwd)) {
+        return { status: 404, body: { error: WORKSPACE_MISSING_ERROR } }
+      }
       const status: ProjectTemplatesStatus = {
         needsInit: needsTemplatesInit(cwd),
         cwd,
@@ -70,6 +94,9 @@ export function buildProjectTemplatesRoutes(
       }
       if (!['overwrite', 'append', 'skip'].includes(agentsMode)) {
         return { status: 400, body: { error: 'Invalid agentsMode' } }
+      }
+      if (!workspaceDirAvailable(cwd)) {
+        return { status: 404, body: { error: WORKSPACE_MISSING_ERROR } }
       }
 
       const result: ApplyTemplatesResult = applyProjectTemplates(cwd, { agentsMode })

@@ -11,9 +11,9 @@ import type { RuntimeSelfModel } from '../agent/runtime-self-model.js'
 
 /** 运行时提供给工具的生命体征快照（AgentLoop.getSessionVitals 的返回形状） */
 export interface SessionVitalsData {
-  ctx: { estimatedTokens: number; contextWindow: number; ratio: number }
+  ctx: { estimatedTokens: number; contextWindow: number; ratio: number; wire?: { inputTokens: number; inputBudget: number; model: string; source?: string } }
   /** 近 5 轮缓存记录（cacheRead / cacheCreation 来自 API usage 回报） */
-  cache: Array<{ turn: number; cacheRead: number; cacheCreation: number }>
+  cache: Array<{ turn: number; cacheRead: number; cacheCreation: number; inputTokens?: number }>
   sensorium: {
     momentum: number; pressure: number; confidence: number
     complexity: number; freshness: number; stability?: number
@@ -26,6 +26,11 @@ export interface SessionVitalsData {
   }
   /** Read-only orchestration self-model; absent in worker/non-agent contexts. */
   runtime?: RuntimeSelfModel | null
+  diagnostics?: {
+    compact: Array<{ status?: string; reason: string; rewriteTransactionId?: string }>
+    mainUsageCoverage?: { observed: number; unknown: number }
+    mainPrefixBaseline: string
+  }
   turn: number
 }
 
@@ -40,17 +45,24 @@ export function formatVitals(v: SessionVitalsData): string {
   lines.push(`## 上下文`)
   lines.push(`- 占用 ${v.ctx.estimatedTokens.toLocaleString()} / ${v.ctx.contextWindow.toLocaleString()} token（${pct(v.ctx.ratio)}）`)
   lines.push('')
+  if (v.ctx.wire) lines.push(`- wire 估算输入 ${v.ctx.wire.inputTokens} / 输入预算 ${v.ctx.wire.inputBudget}（${v.ctx.wire.model}）；与会话历史估算分开` )
   lines.push('## 缓存（近 5 轮，API usage 回报）')
   if (v.cache.length === 0) {
     lines.push('- 无数据（尚无带 usage 的 API 轮次）')
   } else {
     for (const c of v.cache) {
-      const denom = c.cacheRead + c.cacheCreation
+      const denom = c.inputTokens ?? 0
       const rate = denom > 0 ? pct(c.cacheRead / denom) : 'n/a'
-      lines.push(`- turn ${c.turn}: read=${c.cacheRead.toLocaleString()} create=${c.cacheCreation.toLocaleString()} 命中≈${rate}`)
+      lines.push(`- turn ${c.turn}: read=${c.cacheRead.toLocaleString()} create=${c.cacheCreation.toLocaleString()} input=${c.inputTokens ?? 'unknown'} 命中≈${rate}`)
     }
   }
   lines.push('')
+  if (v.diagnostics) {
+    lines.push(`## 请求诊断`, `- 主轮前缀基线=${v.diagnostics.mainPrefixBaseline}（基线存在不等于已证明继承）`)
+    const coverage = v.diagnostics.mainUsageCoverage
+    lines.push(`- 主轮缓存用量覆盖：known=${coverage?.observed ?? 'unknown'} unknown=${coverage?.unknown ?? 'unknown'}（不包含侧路）`)
+    for (const event of v.diagnostics.compact) lines.push(`- compact=${event.status ?? 'legacy_unknown'} transaction=${event.rewriteTransactionId ?? 'unknown'} reason=${event.reason}`)
+  }
   lines.push('## sensorium')
   if (!v.sensorium) {
     lines.push('- 无数据（感知层未运行）')
@@ -95,7 +107,7 @@ export function createSessionVitalsTool(getVitals: () => SessionVitalsData | nul
   return {
     definition: {
       name: 'session_vitals',
-      description: `本会话运行时生命体征的只读快照：上下文占用（精确 token 数 + 窗口大小）、近期缓存命中数据、sensorium 各维度、CVM 开销/节流状态，以及 advisory 台账。
+      description: `本会话运行时生命体征的只读快照：上下文占用（会话估算 token 数 + 窗口大小）、近期缓存命中数据、sensorium 各维度、CVM 开销/节流状态，以及 advisory 台账。
 
 ### 何时调用
 在对会话自身状态下任何结论之前调用——上下文压力、缓存行为、信号噪声。引用这里的数字，不要凭感觉猜。诊断系统 advisory 为何反复触发时也可用。

@@ -64,7 +64,7 @@ test('band 按实际终端列数截断，窄终端不溢出', async () => {
     priv.renderLive()
     await flush()
 
-    for (const line of stripAnsi(out.chunks.join('')).split('\n')) {
+    for (const line of stripAnsi(out.chunks.join('')).split(/[\r\n]/)) {
       assert.ok(
         displayWidth(line, WIDE) <= cols,
         `cols=${cols} 有行超宽 ${displayWidth(line, WIDE)}: ${line}`,

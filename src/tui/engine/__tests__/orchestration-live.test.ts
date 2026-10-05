@@ -197,10 +197,11 @@ test('ask 面板：提交页选「取消」不提交、仅关面板', () => {
   assert.ok(app.pendingAskFlow, '取消只关面板，不清理流（与 Esc 同语义，可输入框作答）')
 })
 
-test('ask 面板：无选项问题不弹面板', () => {
+test('ask 卡片：无选项问题仍提供自定义输入', () => {
   const { app } = makeApp()
   app.openAskUserQuestionPanel({
     questions: [{ id: 'q1', prompt: 'Free text?', options: [], allowMultiple: false }],
   })
-  assert.equal(app.pendingAskFlow, undefined, '无选项 → 不建立面板流（走输入框作答）')
+  assert.ok(app.pendingAskFlow, '开放问题保留独立请求，可输入自定义回答')
+  assert.equal(app.activeOverlayId(), null)
 })

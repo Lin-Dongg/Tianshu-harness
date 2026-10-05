@@ -117,11 +117,17 @@ describe('vision model onboarding', () => {
 
 describe('vendor vision request metadata', () => {
   it('adds Agnes thinking metadata only for official endpoints and exact chat model IDs', () => {
+    // 现役域名（官方文档 Base URL 主机）——迁移后旧判断未覆盖它，extras 曾等于静默失效
+    assert.deepEqual(
+      vendorVisionRequestExtras('https://apihub.agnes-ai.com/v1', 'agnes-3.0-flash'),
+      { chat_template_kwargs: { enable_thinking: true, budget_tokens: 2048 } },
+    )
+    // 旧域名兼容（2026-07 迁移前；判断保留对存量配置零差异）
     assert.deepEqual(
       vendorVisionRequestExtras('https://api.agnes.ai/v1', 'agnes-2.5-flash'),
       { chat_template_kwargs: { enable_thinking: true, budget_tokens: 2048 } },
     )
-    assert.deepEqual(vendorVisionRequestExtras('https://api.agnes.ai/v1', 'agnes-image-2.0-flash'), {})
+    assert.deepEqual(vendorVisionRequestExtras('https://apihub.agnes-ai.com/v1', 'agnes-image-2.5-flash'), {})
     assert.deepEqual(vendorVisionRequestExtras('https://proxy.example/v1', 'agnes-2.5-flash'), {})
   })
 

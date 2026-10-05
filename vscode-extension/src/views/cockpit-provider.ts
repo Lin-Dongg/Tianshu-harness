@@ -63,6 +63,8 @@ export class CockpitProvider {
   private client: SidecarClient | undefined
   private unsubscribe: (() => void) | undefined
   private activeSessionId: string | undefined
+  private subscriptionGeneration = 0
+  private rewindRequestGeneration = 0
 
   /** 会话切换 / 文件可能变化的活动信号（extension.ts 接变更视图刷新）。 */
   onSessionActivity: ((kind: 'attach' | 'activity', sessionId: string) => void) | undefined
@@ -107,6 +109,7 @@ export class CockpitProvider {
   }
 
   private teardownBridge(): void {
+    this.subscriptionGeneration++
     this.unsubscribe?.()
     this.unsubscribe = undefined
   }
@@ -120,8 +123,10 @@ export class CockpitProvider {
       await vscode.env.clipboard.writeText(msg.text)
       return
     }
+    const generation = this.subscriptionGeneration
     try {
       const client = await this.getClient()
+      if (msg.type === 'listRewindPoints' && generation !== this.subscriptionGeneration) return
       this.client = client
       switch (msg.type) {
         case 'ready':
@@ -418,12 +423,12 @@ export class CockpitProvider {
           break
         }
         case 'listRewindPoints':
-          await this.pushRewindPoints(client, msg.sessionId)
+          await this.pushRewindPoints(client, msg.sessionId, generation)
           break
         case 'rewind': {
           try {
             await client.rewind(msg.sessionId, msg.messageIndex, msg.rollbackFiles)
-            await this.pushRewindPoints(client, msg.sessionId)
+            await this.pushRewindPoints(client, msg.sessionId, generation)
           } catch (err) {
             this.post({ type: 'error', message: (err as Error).message })
           }
@@ -451,8 +456,7 @@ export class CockpitProvider {
   }
 
   private closeActive(): void {
-    this.unsubscribe?.()
-    this.unsubscribe = undefined
+    this.teardownBridge()
     this.activeSessionId = undefined
     this.post({ type: 'sessionClosed' })
   }
@@ -460,7 +464,8 @@ export class CockpitProvider {
   /** 切换活跃会话：撤旧订阅 → since=0 全量重放（历史即事件流）。 */
   private attachSession(sessionId: string): void {
     if (!this.client) return
-    this.unsubscribe?.()
+    this.teardownBridge()
+    const generation = this.subscriptionGeneration
     this.activeSessionId = sessionId
     this.post({ type: 'sessionAttached', sessionId })
     this.onSessionActivity?.('attach', sessionId)
@@ -468,6 +473,7 @@ export class CockpitProvider {
       sessionId,
       0,
       (ev: SessionEvent) => {
+        if (generation !== this.subscriptionGeneration || this.activeSessionId !== sessionId) return
         this.post({ type: 'event', sessionId, event: ev })
         this.onSessionEvent?.(ev)
         // 工具落盘 / turn 收束才可能改文件——只在这些点发活动信号
@@ -475,17 +481,24 @@ export class CockpitProvider {
           this.onSessionActivity?.('activity', sessionId)
         }
       },
-      (live: boolean) => this.post({ type: 'streamState', sessionId, live }),
+      (live: boolean) => {
+        if (generation !== this.subscriptionGeneration || this.activeSessionId !== sessionId) return
+        this.post({ type: 'streamState', sessionId, live })
+      },
     )
     void this.pushRewindPoints(this.client, sessionId)
   }
 
-  private async pushRewindPoints(client: SidecarClient, sessionId: string): Promise<void> {
+  private async pushRewindPoints(client: SidecarClient, sessionId: string, generation = this.subscriptionGeneration): Promise<void> {
+    if (generation !== this.subscriptionGeneration || this.activeSessionId !== sessionId || this.client !== client) return
+    const request = ++this.rewindRequestGeneration
+    const current = () => generation === this.subscriptionGeneration && request === this.rewindRequestGeneration &&
+      this.activeSessionId === sessionId && this.client === client
     try {
       const { points } = await client.listRewindPoints(sessionId)
-      this.post({ type: 'rewindPoints', sessionId, points })
+      if (current()) this.post({ type: 'rewindPoints', sessionId, points })
     } catch {
-      this.post({ type: 'rewindPoints', sessionId, points: [] })
+      if (current()) this.post({ type: 'rewindPoints', sessionId, points: [] })
     }
   }
 

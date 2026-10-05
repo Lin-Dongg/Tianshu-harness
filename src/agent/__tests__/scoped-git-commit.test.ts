@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
+import { captureCommitVersion } from '../commit-version.js'
 import { commitScopedFiles } from '../scoped-git-commit.js'
 
 // 必须在系统 tmpdir + mkdtemp 唯一路径——曾用工作树内固定路径，并发会话的
@@ -31,6 +32,20 @@ describe('commitScopedFiles', () => {
 
   afterEach(() => {
     rmSync(TMP, { recursive: true, force: true })
+  })
+
+  it('rejects stale previews and mixed staged hunks without absorbing changes', () => {
+    writeFileSync(join(TMP, 'owned.txt'), 'first edit')
+    const version = captureCommitVersion(TMP, ['owned.txt'])!
+    writeFileSync(join(TMP, 'owned.txt'), 'second edit')
+    assert.equal(commitScopedFiles({ cwd: TMP, files: ['owned.txt'], message: 'stale', expectedVersion: version }).ok, false)
+    assert.equal(git(['diff', '--cached', '--name-only']).trim(), '')
+    git(['add', '--', 'owned.txt'])
+    writeFileSync(join(TMP, 'owned.txt'), 'third edit')
+    const before = git(['diff', '--cached'])
+    const result = commitScopedFiles({ cwd: TMP, files: ['owned.txt'], message: 'mixed' })
+    assert.equal(result.ok, false); assert.match(result.output, /partially staged/)
+    assert.equal(git(['diff', '--cached']), before)
   })
 
   it('commits only scoped files and leaves external dirty files untouched', () => {

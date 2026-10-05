@@ -73,8 +73,9 @@ describe('cross-platform renderer policy', () => {
     ['linux', { TERM: 'xterm-kitty' }],
     ['win32', { TERM_PROGRAM: 'vscode' }],
     ['win32', { WT_SESSION: 'test' }],
-  ] as const) it(`auto enables compatible ${platform} host ${JSON.stringify(env)}`, () => {
-    assert.equal(resolveFrontendRenderer('auto', true, false, env, platform), 'fullscreen')
+  ] as const) it(`auto preserves native scrollback on ${platform} host ${JSON.stringify(env)}`, () => {
+    assert.equal(resolveFrontendRenderer('auto', true, false, env, platform), 'classic')
+    assert.equal(resolveFrontendRenderer('fullscreen', true, false, env, platform), 'fullscreen')
   })
   for (const platform of ['win32', 'darwin', 'linux'] as const) {
     it(`${platform} keeps non-TTY, readers, unknown and remote hosts classic`, () => {

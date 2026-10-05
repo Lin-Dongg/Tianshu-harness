@@ -126,6 +126,7 @@ export function rankPaths(paths: string[], query: string, limit = 50): string[] 
 // ── Single-level directory listing (for file browser tree) ──────
 
 export interface DirEntry {
+  path?: string
   name: string
   isDirectory: boolean
 }

@@ -50,6 +50,15 @@ export interface McpPendingApproval {
   /** env 变量**键名**（已排序）。 */
   envKeys: string[]
   url?: string
+  /** 待批原因：缺省 = 连接级审批（#215）；'inventory-change' = 工具清单快照门
+   *  （rug pull 防线 ①：已连接后重拉发现清单变更，已断开并拦截待重新审批）。 */
+  reason?: 'inventory-change'
+  /** 被拦清单的整体 hash——approve 时 arm，重拉精确匹配才消费放行（防 TOCTOU）。 */
+  inventoryHash?: string
+  /** 清单变更摘要（工具名级）。 */
+  inventoryDiff?: { added: string[]; removed: string[]; changed: string[] }
+  /** 检测到变更的时间（ISO）。 */
+  changedAt?: string
 }
 
 interface ApprovalEntry {

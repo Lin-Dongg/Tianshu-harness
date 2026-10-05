@@ -36,6 +36,17 @@ async function waitForPrompt(persist: SessionPersist, expected: number): Promise
 }
 
 describe('attachSessionPersistListener — meta tokenUsage accounting', () => {
+  it('worker knowledge and runtime instructions never replace a human session title', async () => {
+    const session = new SessionContext(), persist = new SessionPersist('origin-title', tempDir)
+    persist.initMetadata({ model: 'fixture' })
+    const listener = attachSessionPersistListener({ session, persist })
+    session.addUserMessage('<worker-knowledge>private fixture</worker-knowledge>', undefined, 'worker_task')
+    await listener.drain()
+    assert.equal(persist.loadMetadata()?.title, undefined)
+    session.addUserMessage('Human objective')
+    await listener.drain()
+    assert.equal(persist.loadMetadata()?.title, 'Human objective')
+  })
   it('prompt equals cache-inclusive input_tokens, not input+read+create (2x regression)', async () => {
     // Field bug (session 6bfc4465): meta prompt was exactly 2x the real 5.67M
     // because the patch added cache_read + cache_creation on top of DeepSeek's

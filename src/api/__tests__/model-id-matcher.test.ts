@@ -28,6 +28,10 @@ describe('alias table seeding', () => {
 
   it('preset display aliases are searchable', () => {
     assert.ok(findAliasEntryExact('v4.1-flash'))
+    assert.ok(findAliasEntryExact('4.1-flash'))
+    assert.ok(findAliasEntryExact('deepseek-4.1-flash'))
+    assert.equal(findAliasEntryExact('4.1-flash')?.canonicalId, 'deepseek-flash')
+    assert.equal(findAliasEntryExact('deepseek-4.1-flash')?.canonicalId, 'deepseek-flash')
     assert.ok(findAliasEntryLower('V4.1-FLASH'))
   })
 })

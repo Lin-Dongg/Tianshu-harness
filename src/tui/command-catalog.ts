@@ -160,6 +160,7 @@ export const COMMAND_CATALOG: readonly CommandMeta[] = [
   { name: '/zen', description: '禅模式：收敛工具面做深度专注；on|off 写配置（新会话生效）· status 查当前相位', argsHint: '[on|off|status]' },
   { name: '/fast', description: '解除禅模式，恢复全量工具面（/zen 的出口）' },
   { name: '/logout', description: '登出天枢账号（清除本机 account 凭据；不影响模型 provider 的 OAuth）' },
+  { name: '/metrics', description: '查看会话缓存、上下文、计价来源、分支和推理档位' },
   { name: '/panel', description: '开关右侧面板（on / off / 无参切换）', argsHint: '[on|off]' },
   { name: '/tui', description: '查看或切换终端绘制模式；执行结束后可切换', argsHint: '[auto|classic|fullscreen]' },
   { name: '/keybindings', description: '查看标准或旧版兼容键位；切换映射', argsHint: '[standard|legacy]' },

@@ -108,11 +108,9 @@ test('有 running 后台任务 → chrome 渲染实时条；终态后消失', as
 
   app.handleJobEvent(started('a1', 'npm run dev'))
   await tick()
+  // 状态行以符号徽章承载后台任务可见性（`⚙ N`）；完整命令与面板入口在 /tasks。
   const frame1 = history(out)
-  // 2026-09-09 v3.16.1 起（滚动战役收尾）后台任务从独立 `⚙ N 后台任务` 行
-  // 并入活动带（`› 命令 · 时长` + `/tasks 管理` 尾行），footer 另有 `⚙ N` glance。
-  assert.ok(frame1.includes('/tasks'), `有 running 应渲染后台任务活动带: ${frame1}`)
-  assert.ok(frame1.includes('任务 1'), `工作区只显示运行数量，完整命令在任务面板: ${frame1}`)
+  assert.ok(frame1.includes('⚙ 1'), `有 running 应渲染后台任务徽章: ${frame1}`)
   assert.equal(app.getTasksData('all').groups.flatMap(group => group.workers).find(row => row.workerId === 'job:a1')?.activity, 'npm run dev', 'actual task details retain the command')
 
   // 终态：notifyJobTerminal 的 commitStatic 触发全量重绘——之后的输出切片

@@ -44,7 +44,7 @@ describe('provider config mutations', () => {
     updateProviderBaseUrl('deepseek', 'https://gateway.example.com/v1')
     const provider = loadConfig().provider.providers.deepseek!
     assert.equal(provider.baseUrl, 'https://gateway.example.com/v1')
-    assert.equal(provider.models[0]?.id, 'deepseek-v4-flash')
+    assert.equal(provider.models[0]?.id, 'deepseek-flash')
   })
 
   it('baseUrl 落库前规范化：剥尾斜杠与从文档复制的完整请求路径 tail', () => {
@@ -415,10 +415,10 @@ describe('provider config mutations', () => {
   })
 
   it('setModelSupportsVision can toggle vision on and off', () => {
-    setModelSupportsVision('deepseek', 'deepseek-v4-flash', true)
-    assert.equal(loadConfig().provider.providers.deepseek!.models.find(m => m.id === 'deepseek-v4-flash')!.supportsVision, true)
-    setModelSupportsVision('deepseek', 'deepseek-v4-flash', false)
-    assert.equal(loadConfig().provider.providers.deepseek!.models.find(m => m.id === 'deepseek-v4-flash')!.supportsVision, false)
+    setModelSupportsVision('deepseek', 'deepseek-v4-pro', true)
+    assert.equal(loadConfig().provider.providers.deepseek!.models.find(m => m.id === 'deepseek-v4-pro')!.supportsVision, true)
+    setModelSupportsVision('deepseek', 'deepseek-v4-pro', false)
+    assert.equal(loadConfig().provider.providers.deepseek!.models.find(m => m.id === 'deepseek-v4-pro')!.supportsVision, false)
   })
 
   it('setModelSupportsVision rejects unknown provider or model', () => {
@@ -804,13 +804,13 @@ describe('setDefaultModelConfig defaultEffort（CC 对标：/model 面板 effort
   })
 
   it('显式档位落盘并可读回', () => {
-    const snap = setDefaultModelConfig({ defaultModel: 'deepseek:deepseek-v4-flash', defaultEffort: 'high' })
+    const snap = setDefaultModelConfig({ defaultModel: 'deepseek:deepseek-flash', defaultEffort: 'high' })
     assert.equal(snap.defaultEffort, 'high')
     assert.equal(loadConfig().agent.defaultEffort, 'high')
   })
 
   it("'auto' 与 null 删字段回自动；undefined 不动", () => {
-    setDefaultModelConfig({ defaultModel: 'deepseek:deepseek-v4-flash', defaultEffort: 'max' })
+    setDefaultModelConfig({ defaultModel: 'deepseek:deepseek-flash', defaultEffort: 'max' })
     assert.equal(loadConfig().agent.defaultEffort, 'max')
     setDefaultModelConfig({ defaultEffort: 'auto' })
     assert.equal(loadConfig().agent.defaultEffort, undefined)
@@ -820,12 +820,12 @@ describe('setDefaultModelConfig defaultEffort（CC 对标：/model 面板 effort
     assert.equal(loadConfig().agent.defaultEffort, undefined)
     // undefined = 不触碰该字段
     setDefaultModelConfig({ defaultEffort: 'high' })
-    setDefaultModelConfig({ defaultModel: 'deepseek:deepseek-v4-flash' })
+    setDefaultModelConfig({ defaultModel: 'deepseek:deepseek-flash' })
     assert.equal(loadConfig().agent.defaultEffort, 'high')
   })
 
   it('非法档位抛错且不落盘', () => {
-    setDefaultModelConfig({ defaultModel: 'deepseek:deepseek-v4-flash' })
+    setDefaultModelConfig({ defaultModel: 'deepseek:deepseek-flash' })
     assert.throws(() => setDefaultModelConfig({ defaultEffort: 'xhigh' }), /off\|low\|medium\|high\|max/)
     assert.equal(loadConfig().agent.defaultEffort, undefined)
   })
@@ -864,8 +864,8 @@ describe('setDefaultModelConfig 多 key 三段式', () => {
 
   it('两段式仍校验顶层/契约并集（单 key 与未迁移路径）', () => {
     setupProvider({ providerName: 'deepseek' })
-    const snap = setDefaultModelConfig({ defaultModel: 'deepseek:deepseek-v4-flash' })
-    assert.equal(snap.defaultModel, 'deepseek:deepseek-v4-flash')
+    const snap = setDefaultModelConfig({ defaultModel: 'deepseek:deepseek-flash' })
+    assert.equal(snap.defaultModel, 'deepseek:deepseek-flash')
   })
 
   it('三段式 key 不存在或模型不在该 key 上则拒绝', () => {

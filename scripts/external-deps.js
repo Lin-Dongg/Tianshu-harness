@@ -37,6 +37,8 @@ export const RUNTIME_BUNDLED = [
   'playwright-core', // headless chromium driver（变量化动态 import——tsup 无法内联）
   'exceljs', // Office .xlsx 读写（文档附件管线）。变量动态 import + 缺失降级
   // soffice；纯 JS 体积 ~22MB 不宜内联进主 bundle，随包分发。
+  'jszip', // bounded OOXML/ODF archive reader; also shared with ExcelJS
+  'saxes', // namespace-aware Office XML parser
   'pdfjs-dist', // .pdf 文本抽取兜底引擎（pdftotext 缺失时顶上的纯 JS 路径）。
   // 动态 import legacy/build/pdf.mjs + standard_fonts 按路径加载——不能内联，随包分发。
 ]

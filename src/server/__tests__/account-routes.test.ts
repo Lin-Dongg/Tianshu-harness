@@ -36,6 +36,17 @@ import {
 const TOKEN = 'tok'
 const AUTH = { authorization: `Bearer ${TOKEN}` }
 
+test('account partition is available before website metadata completes', async () => {
+  const { home, cleanup } = makeHome()
+  try {
+    const credential = `fixture.${Buffer.from(JSON.stringify({ sub: 'current-owner' })).toString('base64url')}.fixture`
+    new TokenStore(home, 'account').save({ accessToken: credential, expiresAt: Date.now() + 3600000 })
+    const response = await routerFor(home)('GET', '/account/status', undefined, AUTH)
+    assert.equal((response.body as {userId:string}).userId,'current-owner')
+    assert.equal(JSON.stringify(response.body).includes(credential),false)
+  } finally { cleanup() }
+})
+
 const DEVICE: DeviceCreateResult = {
   deviceCode: 'dc-1',
   userCode: 'UC-1234',
@@ -95,6 +106,7 @@ test('所有账号路由都要 Bearer token——缺 token 一律 401', async ()
   try {
     const router = routerFor(home)
     for (const [method, path] of [
+      ['POST', '/account/cancel'],
       ['POST', '/account/device'],
       ['POST', '/account/poll'],
       ['GET', '/account/status'],
@@ -238,8 +250,11 @@ test('GET /account/status 已登录 → loggedIn:true + 邮箱', async () => {
     assert.equal(res.status, 200)
     const body = res.body as { loggedIn: boolean; email: string | null; userId: string | null }
     assert.equal(body.loggedIn, true)
-    assert.equal(body.email, 'qa-test@tianshuharness.com')
-    assert.equal(body.userId, 'u-1')
+    assert.equal(body.email, null, 'first response is local, network runs in background')
+    await waitFor(() => Boolean(cachedAccountProfile(new TokenStore(home, 'account').load())?.account))
+    const next = await router('GET', '/account/status', {}, AUTH)
+    assert.equal((next.body as typeof body).email, 'qa-test@tianshuharness.com')
+    assert.equal((next.body as typeof body).userId, 'u-1')
   } finally {
     cleanup()
   }
@@ -695,4 +710,248 @@ test('POST /account/poll approved：账号资料顺带落盘，且响应体不�
   } finally {
     cleanup()
   }
+})
+
+test('approved response does not wait for metadata; duplicate polls reuse the receipt', async () => {
+  const { home, cleanup } = makeHome()
+  let release!: (identity: StellarIdentity) => void, calls = 0
+  const metadata = new Promise<StellarIdentity>(resolve => { release = resolve })
+  try {
+    const router = routerFor(home, {
+      checkDeviceOnce: async () => { calls++; return { status: 'approved', accessToken: 'FAKE-NEW' } },
+      fetchStellarIdentity: () => metadata,
+      fetchAccountProfileSnapshot: async () => ({ avatarUrl: 'https://example.com/avatar.png', founding: null, fetchedAt: Date.now() }),
+    })
+    const response = await Promise.race([
+      router('POST', '/account/poll', { deviceCode: 'dc-1' }, AUTH),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('approval blocked by metadata')), 250)),
+    ])
+    assert.equal((response.body as { status: string }).status, 'approved')
+    assert.equal(new TokenStore(home, 'account').load()?.accessToken, 'FAKE-NEW')
+    await router('POST', '/account/poll', { deviceCode: 'dc-1' }, AUTH)
+    assert.equal(calls, 1, 'a lost approved response must not consume the grant twice')
+    release(IDENTITY); await waitFor(() => Boolean(new TokenStore(home, 'account').load()?.identity))
+    const saved = new TokenStore(home, 'account').load()
+    assert.equal(saved?.profile?.avatarUrl, 'https://example.com/avatar.png', 'both categories survive out-of-order writes')
+    assert.equal(saved?.identity?.stellarId, IDENTITY.stellarId)
+  } finally { release(IDENTITY); cleanup() }
+})
+test('logout or cancel while a poll is in flight prevents credential resurrection', async () => {
+  for (const path of ['/account/logout', '/account/cancel']) {
+    const { home, cleanup } = makeHome()
+    let release!: (result: DevicePollResult) => void
+    const pending = new Promise<DevicePollResult>(resolve => { release = resolve })
+    try {
+      const router = routerFor(home, { checkDeviceOnce: () => pending })
+      const poll = router('POST', '/account/poll', { deviceCode: 'dc-old' }, AUTH)
+      await Promise.resolve()
+      await router('POST', path, {}, AUTH)
+      release({ status: 'approved', accessToken: 'FAKE-OLD' })
+      assert.equal(((await poll).body as { status: string }).status, 'expired')
+      assert.equal(new TokenStore(home, 'account').load(), null)
+    } finally { cleanup() }
+  }
+})
+test('status returns immediately while offline, refreshes are deduplicated and persisted across restart', async () => {
+  const { home, cleanup } = makeHome()
+  let release!: (value: { email: string; userId: string; displayName: string }) => void, calls = 0
+  const contact = new Promise<{ email: string; userId: string; displayName: string }>(resolve => { release = resolve })
+  try {
+    new TokenStore(home, 'account').save({ accessToken: 'FAKE', expiresAt: Date.now() + 3600_000 })
+    const router = routerFor(home, { fetchAccountProfile: () => { calls++; return contact } })
+    await Promise.race([Promise.all(Array.from({ length: 4 }, () => router('GET', '/account/status', {}, AUTH))),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('status blocked by network')), 250))])
+    assert.equal(calls, 1)
+    release({ email: 'example@example.com', userId: 'fake-user', displayName: 'Stellar traveler' })
+    await waitFor(() => Boolean(cachedAccountProfile(new TokenStore(home, 'account').load())?.account))
+    const restarted = await routerFor(home)('GET', '/account/status', {}, AUTH)
+    assert.equal((restarted.body as { displayName: string }).displayName, 'Stellar traveler')
+    assert.equal((restarted.body as { email: string }).email, 'example@example.com')
+  } finally { cleanup() }
+})
+
+test('metadata finishing after identity preserves both star ID and account contact', async () => {
+  const { home, cleanup } = makeHome()
+  const profile = { avatarUrl: 'https://example.com/portrait.png', founding: null, fetchedAt: Date.now() }
+  let release!: (value: typeof profile) => void
+  const pendingProfile = new Promise<typeof profile>(resolve => { release = resolve })
+  try {
+    const router = routerFor(home, {
+      checkDeviceOnce: async () => ({ status: 'approved', accessToken: 'FAKE-CREDENTIAL' }),
+      fetchStellarIdentity: async () => IDENTITY,
+      fetchAccountProfile: async () => ({ email: 'fixture@example.com', userId: 'fake-user' }),
+      fetchAccountProfileSnapshot: () => pendingProfile,
+    })
+    await router('POST', '/account/poll', { deviceCode: 'dc-merge' }, AUTH)
+    await waitFor(() => Boolean(cachedAccountProfile(new TokenStore(home, 'account').load())?.account))
+    release(profile)
+    await waitFor(() => new TokenStore(home, 'account').load()?.profile?.avatarUrl === profile.avatarUrl)
+    const saved = new TokenStore(home, 'account').load()
+    assert.equal(saved?.identity?.stellarId, IDENTITY.stellarId)
+    assert.equal(cachedAccountProfile(saved)?.account?.email, 'fixture@example.com')
+  } finally { release(profile); cleanup() }
+})
+
+
+test('expired device credentials rotate once before every identity request and survive restart', async () => {
+  const {home,cleanup} = makeHome()
+  try {
+    const store = new TokenStore(home,'account')
+    store.save({accessToken:'fake-expired',refreshToken:'fake-refresh',expiresAt:1})
+    let rotations = 0
+    const assertFresh = (access:string) => assert.equal(access,'fake-rotated')
+    const router = routerFor(home, {
+      refreshAccountToken: async value => { rotations++; assert.equal(value,'fake-refresh'); return {status:'approved',accessToken:'fake-rotated',refreshToken:'fake-next',expiresIn:3600} },
+      fetchStellarIdentity: async access => {assertFresh(access);return IDENTITY},
+      fetchAccountProfile: async access => {assertFresh(access);return {email:null,userId:'me',displayName:'官网昵称'}},
+      fetchAccountProfileSnapshot: async access => {assertFresh(access);return {avatarUrl:null,founding:FOUNDING_SNAPSHOT,fetchedAt:Date.now(),unconfirmed:[]}},
+    })
+    await Promise.all(Array.from({length:4},()=>router('GET','/account/status',{},AUTH)))
+    await waitFor(()=>store.load()?.profile?.founding?.rank === 7)
+    assert.equal(rotations,1)
+    const result = await router('GET','/account/status',{},AUTH)
+    const body = result.body as {syncState:string;displayName:string;profileConfirmed:boolean}
+    assert.equal(body.syncState,'cached')
+    assert.equal(body.profileConfirmed,true)
+    assert.equal(body.displayName,'官网昵称')
+    assert.equal(store.load()?.refreshToken,'fake-next')
+    assert.ok(!JSON.stringify(result.body).includes('fake-rotated'))
+    const restart = await routerFor(home)('GET','/account/status',{},AUTH)
+    assert.equal((restart.body as {founding:{rank:number}}).founding.rank,7)
+  } finally {cleanup()}
+})
+test('partial identity fetch retries missing badges despite a successful contact cache', async () => {
+  const {home,cleanup} = makeHome()
+  const realNow = Date.now
+  try {
+    const store = new TokenStore(home,'account')
+    store.save({accessToken:'fake',expiresAt:Date.now()+3600000})
+    let badgeCalls=0
+    const router=routerFor(home,{
+      fetchStellarIdentity:async()=>IDENTITY,
+      fetchAccountProfile:async()=>({email:null,userId:'me',displayName:'已登录'}),
+      fetchAccountProfileSnapshot:async()=>++badgeCalls===1 ? null : {avatarUrl:null,founding:FOUNDING_SNAPSHOT,fetchedAt:Date.now(),unconfirmed:[]},
+    })
+    await router('POST','/account/identity/refresh',{},AUTH)
+    const partial=await router('GET','/account/status',{},AUTH)
+    assert.equal((partial.body as {syncState:string}).syncState,'partial')
+    assert.equal((partial.body as {profileConfirmed:boolean}).profileConfirmed,false)
+    const afterBackoff = realNow() + 31_000
+    Date.now = () => afterBackoff
+    await router('GET','/account/status',{},AUTH)
+    await new Promise(resolve => setTimeout(resolve, 30))
+    assert.equal(badgeCalls,2,'contact fetchedAt must not hide a failed badge request for 24 hours')
+    const complete=await router('GET','/account/status',{},AUTH)
+    assert.equal((complete.body as {founding:{rank:number}}).founding.rank,7)
+    assert.equal((complete.body as {syncState:string}).syncState,'cached')
+  } finally {Date.now = realNow; cleanup()}
+})
+test('logout during device renewal never writes a late rotated credential', async () => {
+  const {home,cleanup}=makeHome()
+  const revoked: string[] = []
+  let release!:(v:DevicePollResult)=>void
+  try {
+    const store=new TokenStore(home,'account')
+    store.save({accessToken:'expired',refreshToken:'fake-refresh',expiresAt:1})
+    const router=routerFor(home,{revokeAccountSession:async value=>{revoked.push(value);return true},refreshAccountToken:()=>new Promise(resolve=>{release=resolve})})
+    const pending=router('POST','/account/identity/refresh',{},AUTH)
+    await router('POST','/account/logout',{},AUTH)
+    release({status:'approved',accessToken:'late',refreshToken:'late-refresh'})
+    await pending
+    assert.equal(store.load(),null)
+    assert.deepEqual(revoked,['expired','late'])
+  } finally {cleanup()}
+})
+
+
+test('real account API wiring accepts website device grants and projects verified founding identity', async () => {
+  const {home,cleanup}=makeHome()
+  const realFetch=globalThis.fetch
+  const credential = `header.${Buffer.from(JSON.stringify({sub:'me',type:'access'})).toString('base64url')}.fake-signature`
+  try {
+    new TokenStore(home,'account').save({accessToken:'expired',refreshToken:'fake-refresh',expiresAt:1})
+    let rotations=0
+    globalThis.fetch=async input=>{
+      const url=String(input)
+      let body:unknown
+      if(url.includes('tui-auth-refresh')) {rotations++;body={accessToken:credential,refreshToken:'fake-next',expiresIn:3600}}
+      else if(url.includes('/auth/v1/user')) return new Response('{}',{status:403})
+      else if(url.includes('/profiles')) body=[{id:'me',display_name:'官网本人',username:'real-handle',avatar_url:'https://example.com/avatar.png',created_at:'2026-09-03T00:00:00Z'}]
+      else if(url.includes('/stellar_identities')) body=[{user_id:'me',stellar_id:'TS-QS-REAL42',primary_domain:'QS',title:'observer'}]
+      else if(url.includes('/user_badges')) body=[{badge_code:'FOUNDER_TIER_2'}]
+      else if(url.includes('get_my_founder_rank')) body={is_founder:true,rank:420,total:1300}
+      else throw new Error('unexpected account endpoint')
+      return new Response(JSON.stringify(body))
+    }
+    const router=createRouter(buildAccountRoutes({apiToken:TOKEN,rivetHome:home,noProxy:'*'}))
+    const refresh=await router('POST','/account/identity/refresh',{},AUTH)
+    assert.equal((refresh.body as {complete:boolean}).complete,true)
+    assert.equal(rotations,1,'default API must actually consume the renewal method')
+    const status=await router('GET','/account/status',{},AUTH)
+    const body=status.body as {displayName:string;stellarId:string;syncState:string;founding:{rank:number;tier:number}}
+    assert.equal(body.displayName,'官网本人')
+    assert.equal(body.stellarId,'TS-QS-REAL42')
+    assert.equal(body.syncState,'cached')
+    assert.equal(body.founding.tier,2)
+    assert.equal(body.founding.rank,420)
+    assert.ok(!JSON.stringify(status.body).includes(credential))
+  } finally {globalThis.fetch=realFetch;cleanup()}
+})
+test('account replacement during renewal retains the new owner and discards the late rotation', async () => {
+  const {home,cleanup}=makeHome()
+  let release!:(v:DevicePollResult)=>void
+  try {
+    const store=new TokenStore(home,'account')
+    store.save({accessToken:'expired-A',refreshToken:'fake-refresh-A',expiresAt:1})
+    const router=routerFor(home,{refreshAccountToken:()=>new Promise(resolve=>{release=resolve})})
+    const pending=router('POST','/account/identity/refresh',{},AUTH)
+    store.save({accessToken:'account-B',expiresAt:Date.now()+3600000})
+    release({status:'approved',accessToken:'late-A',refreshToken:'late-refresh-A'})
+    await pending
+    assert.equal(store.load()?.accessToken,'account-B')
+  } finally {cleanup()}
+})
+
+
+test('desktop fingerprint survives the actual sidecar device request and repeated login', async () => {
+  const { home, cleanup } = makeHome()
+  const sent: string[] = []
+  try {
+    const router = routerFor(home, { requestDeviceCode: async opts => { sent.push(opts.deviceFingerprint ?? ''); return DEVICE } })
+    assert.equal((await router('POST', '/account/device', { deviceFingerprint: 'native-device-001' }, AUTH)).status, 200)
+    assert.equal((await router('POST', '/account/device', {}, AUTH)).status, 200)
+    assert.deepEqual(sent, ['native-device-001', 'native-device-001'])
+    assert.equal((await router('POST', '/account/device', { deviceFingerprint: '../bad' }, AUTH)).status, 400)
+  } finally { cleanup() }
+})
+
+ test('cancel invalidates the remote code; logout revokes only this session and still clears offline', async () => {
+  const { home, cleanup } = makeHome()
+  const cancelled: string[] = [], revoked: string[] = []
+  try {
+    const route = routerFor(home, { cancelDeviceCode: async code => { cancelled.push(code); return true }, revokeAccountSession: async value => { revoked.push(value); throw new Error('offline') } })
+    await route('POST', '/account/device', {}, AUTH)
+    await route('POST', '/account/cancel', {}, AUTH)
+    assert.deepEqual(cancelled, [DEVICE.deviceCode])
+    new TokenStore(home, 'account').save({ accessToken: 'session-fixture', expiresAt: Date.now()+3600000 })
+    const result = await route('POST', '/account/logout', {}, AUTH)
+    assert.deepEqual(revoked, ['session-fixture'])
+    assert.equal((result.body as {remoteRevoked:boolean}).remoteRevoked, false)
+    assert.equal(new TokenStore(home, 'account').load(), null)
+  } finally { cleanup() }
+ })
+
+test('late consumed approval after cancellation revokes the returned remote session', async () => {
+ const {home,cleanup}=makeHome()
+ let release!: (value:DevicePollResult)=>void
+ const revoked:string[]=[]
+ try {
+  const route=routerFor(home,{checkDeviceOnce:()=>new Promise(resolve=>{release=resolve}),revokeAccountSession:async value=>{revoked.push(value);return true}})
+  const polling=route('POST','/account/poll',{deviceCode:'pending-fixture'},AUTH)
+  await route('POST','/account/cancel',{},AUTH)
+  release({status:'approved',accessToken:'late-session-fixture'})
+  await polling
+  assert.deepEqual(revoked,['late-session-fixture'])
+  assert.equal(new TokenStore(home,'account').load(),null)
+ } finally {cleanup()}
 })

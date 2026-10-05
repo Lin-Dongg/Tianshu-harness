@@ -47,8 +47,8 @@ export async function fetchOfficialUsage(deps: OfficialUsageDeps): Promise<Offic
       const s = result.data
       return {
         source: 'platform',
-        todayCost: s.current_day_cost / 100,
-        monthCost: s.current_month_cost / 100,
+        todayCost: s.current_day_cost === undefined ? undefined : s.current_day_cost / 100,
+        monthCost: s.current_month_cost === undefined ? undefined : s.current_month_cost / 100,
         balance: String(s.balance_info?.total_balance ?? ''),
         currency: s.balance_info?.currency ?? 'CNY',
         requests: s.current_day_requests,

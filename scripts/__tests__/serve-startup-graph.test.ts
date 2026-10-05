@@ -34,10 +34,18 @@ const FORBIDDEN_HEAVY = [
 ] as const
 
 /**
- * 切链后实测约 383（1084 → 383，见计划文档）；上限留 ~17% 余量，
- * 既拦住「又拉回半张 agent 图」，也给正常的路由/工具增长留空间。
+ * 切链后实测约 383（1084 → 383，见计划文档）。
+ *
+ * 2026-10-05 复测 452：从切链基线到 10-05 的密集开发（HEAD~300→HEAD 共 300 提交）
+ * 累积了 ~54 条 server/api 内部新增边（profile-routes、session-browser、goal-snapshot、
+ * store-lock 等），逐提交摊平约 0.2 模块/提交——属正常的路由/工具增长，不是某一次
+ * 「把半张 agent 图拉回来」。同期的 FORBIDDEN_HEAVY 8 个重模块不可达守卫仍为绿，
+ * 未出现 agent 内核整体回流。故上调上限至 480（452 + ~6% 余量）。
+ *
+ * 再次触顶时的处置顺序：先确认 FORBIDDEN_HEAVY 仍全绿且新增边不是通往 agent/tui
+ * 的大块子树（用 why(parent) 看父链），再决定调上限或把该边改动态 `await import()`。
  */
-const REACHABLE_LIMIT = 450
+const REACHABLE_LIMIT = 480
 
 /**
  * 启动图允许静态出现的 bare 包（tsup 会按入口可达性把它们打进 chunk）。

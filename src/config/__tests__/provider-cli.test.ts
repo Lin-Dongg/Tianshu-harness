@@ -74,6 +74,15 @@ describe('toModelDescriptors', () => {
     assert.equal(models[0]?.supportsVideo, true, '视频声明必须随描述符回填（展示用）')
   })
 
+  // D3（服务端段）：预设里有 supportsImageGen 的生图模型（agnes-image-2.5-flash）
+  // 经「种子别名表 → matchModelIds → toModelDescriptors」这条链时，标记不能在中途
+  // 被白名单丢掉——丢了它，探测发现的生图模型保存后不再是生图模型。
+  it('carries supportsImageGen from the alias table (D3)', () => {
+    const { models } = toModelDescriptors(matchModelIds(['agnes-image-2.5-flash']))
+    assert.equal(models[0]?.id, 'agnes-image-2.5-flash')
+    assert.equal(models[0]?.supportsImageGen, true, '生图标记必须随描述符落地')
+  })
+
   it('emits bare skeletons + TODO notes for unknown ids', () => {
     const { models, notes } = toModelDescriptors(matchModelIds(['brand-new-model-9000']))
     assert.deepEqual(models, [{ id: 'brand-new-model-9000' }])
@@ -228,8 +237,11 @@ describe('rivet provider CLI', () => {
 
   it('rejects an invalid --protocol value', async () => {
     const { io, stderr } = captureIO()
+    // 'gemini' used to stand in for "unknown protocol" here; it is a real
+    // protocol now, so this fixture needs a value that is genuinely not in
+    // PROVIDER_PROTOCOL_VALUES.
     await assert.rejects(
-      runProviderCLI(['add', 'bad', '--base-url', 'https://x.example.com/v1', '--protocol', 'gemini'], io),
+      runProviderCLI(['add', 'bad', '--base-url', 'https://x.example.com/v1', '--protocol', 'not-a-real-protocol'], io),
       (error: unknown) => error instanceof ExitCalled && error.code === 1,
     )
     assert.ok(stderr.some(line => line.includes('Invalid --protocol')))

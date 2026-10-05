@@ -164,6 +164,9 @@ export interface RetryInfo {
   classified: ClassifiedError
   /** Delay in ms before the next attempt. */
   nextDelayMs: number
+  /** 本次重试链的有效上限（override/显式配置/分类器默认三者裁决后的 effectiveMax）。
+   *  通知载荷 additive——让可见性文案能说「N/M」的 M；不参与重试决策本身。 */
+  maxAttempts: number
 }
 
 /**
@@ -294,6 +297,7 @@ export async function withStructuredRetry<T>(
         attempt: attempt + 1,
         classified,
         nextDelayMs,
+        maxAttempts: effectiveMax,
       })
 
       // Budget guard（核验补漏）: the budget is only checked at the top of each

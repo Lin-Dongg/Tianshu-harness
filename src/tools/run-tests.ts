@@ -1,3 +1,5 @@
+import { applyBatchCounts, formatTestCounts } from './test-output-counts.js'
+import { DisplayOutputBuffer } from './display-output-buffer.js'
 import { readFile, stat, glob } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { join, delimiter, win32 as winPath } from 'node:path'
@@ -130,13 +132,16 @@ async function hasPythonProjectMarker(cwd: string): Promise<boolean> {
   const markerChecks = await Promise.all(markers.map(marker => pathExists(join(cwd, marker))))
   if (markerChecks.some(Boolean)) return true
 
-  const testsPath = join(cwd, 'tests')
+  // tests/ 目录本身不是 Python 证据——dotnet 的 tests/ 里只有 *.csproj，旧判据凭
+  // isDirectory() 就判 Python → pytest 直 spawn → ENOENT（verifier 无 bash 可旁路）。
+  // 收紧为「tests/ 须真含 .py」；glob 出错保守 false：漏判落点是 blocked 引导，误判落点是静默 ENOENT。
   try {
-    const s = await stat(testsPath)
-    return s.isDirectory()
+    if (!(await stat(join(cwd, 'tests'))).isDirectory()) return false
+    for await (const _ of glob('tests/**/*.py', { cwd })) return true
   } catch {
     return false
   }
+  return false
 }
 
 async function pythonHasTests(cwd: string): Promise<boolean> {
@@ -189,7 +194,7 @@ async function detectTestCommand(cwd: string): Promise<{ base: string; runner: s
 
   if (testScript.includes('vitest')) return { base: 'npx vitest run', runner: 'vitest' }
   if (testScript.includes('jest')) return { base: 'npx jest', runner: 'jest' }
-  if (testScript.includes('tsx --test') || testScript.includes('node:test') || testScript.includes('run-node-tests')) {
+  if (testScript.includes('node --test') || testScript.includes('tsx --test') || testScript.includes('node:test') || testScript.includes('run-node-tests')) {
     return { base: testScript, runner: 'node-test' }
   }
 
@@ -401,6 +406,7 @@ interface ParsedResult {
   skipped: number
   duration: string
   failures: Array<{ name: string; error: string }>
+  countsReliable?: boolean
 }
 
 function asNum(s: string | undefined, fallback = 0): number {
@@ -437,20 +443,7 @@ export function parseOutput(raw: string, runner: string): ParsedResult {
   }
 
   if (runner === 'node-test') {
-    const totalMatch = clean.match(/[ℹ#]\s+tests\s+(\d+)/)
-    const failMatch = clean.match(/[ℹ#]\s+fail\s+(\d+)/)
-    const skipMatch = clean.match(/[ℹ#]\s+skip\s+(\d+)/)
-    const passMatch = clean.match(/[ℹ#]\s+pass\s+(\d+)/)
     const durMatch = clean.match(/[ℹ#]\s+duration_ms\s+([\d.]+)/)
-    const total = asNum(totalMatch?.[1])
-    const fails = asNum(failMatch?.[1])
-    const skips = asNum(skipMatch?.[1])
-    const passes = asNum(passMatch?.[1])
-    if (total > 0) {
-      result.passed = passes > 0 ? passes : total - fails - skips
-      result.failed = fails
-      result.skipped = skips
-    }
     if (durMatch) result.duration = durMatch[1] ?? ''
   }
 
@@ -514,6 +507,7 @@ export function parseOutput(raw: string, runner: string): ParsedResult {
     failLines.push({ name: (m[1] ?? '').trim(), error: (m[2] ?? '').trim() })
   }
   result.failures = failLines
+  applyBatchCounts(clean, result)
 
   return result
 }
@@ -521,7 +515,7 @@ export function parseOutput(raw: string, runner: string): ParsedResult {
 function formatOutput(result: ParsedResult): string {
   const lines: string[] = []
   lines.push(`退出码：${result.exitCode}`)
-  lines.push(`${result.passed} 通过，${result.failed} 失败，${result.skipped} 跳过`)
+  lines.push(formatTestCounts(result))
 
   if (result.failures.length > 0) {
     lines.push('失败项：')
@@ -555,6 +549,7 @@ function buildBlockedVerification(
 ): VerificationMetadata {
   return {
     command: command.display,
+    kind: 'test',
     status: 'blocked',
     scope: command.scope,
     exitCode: -1,
@@ -597,7 +592,8 @@ function buildExecutionEnv(cwd: string): NodeJS.ProcessEnv {
   const repoBin = join(process.cwd(), 'node_modules', '.bin')
   // Base off the resolved env so test runners that shell out to toolchain
   // commands (mvn/gradle/java) find them under a GUI-launched minimal PATH.
-  const base = getResolvedEnv(cwd)
+  const base = { ...getResolvedEnv(cwd) }
+  delete base.NODE_TEST_CONTEXT
   // PATH may be spelled `Path` on Windows — look it up case-insensitively.
   const pathKey = Object.keys(base).find(k => k.toLowerCase() === 'path') ?? 'PATH'
   const currentPath = base[pathKey] ?? ''
@@ -674,7 +670,7 @@ export const RUN_TESTS_TOOL: Tool = {
           const isolated = await runTestCommandIn(retryPlan.path, testCommand, params, filter, timeout)
           tagVerification(isolated, 'isolated', retryPlan.snapshotRef)
           if (!isolated.isError) {
-            const note = `\n\n[C3 归因重试] 测试在实时工作区 FAILED，但在归属变更的隔离快照中 PASSED。失败来自工作区污染（并行会话的 stash/reset 或外部编辑），不是你的代码。不要为这次失败去“修”代码——与并行会话协调，或等待工作区稳定后再重新验证。`
+            const note = `\n\n[C3 归因重试] 测试在实时工作区 FAILED，但在归属变更的隔离快照中 PASSED。两个环境结果不一致；保留失败记录并检查失败位置或隔离对照，不能仅据此认定由其他会话引入。`
             const result: ToolResult = {
               ...isolated,
               content: `[实时工作区] FAILED\n${typeof inPlace.content === 'string' ? inPlace.content.slice(0, 1500) : ''}\n\n[隔离快照] PASSED\n${isolated.content}${note}`,
@@ -685,7 +681,7 @@ export const RUN_TESTS_TOOL: Tool = {
           }
           // Failed in isolation too → genuinely broken code; report the
           // in-place result with the attribution confirmed.
-          inPlace.content += `\n\n[C3 归因重试] 在隔离快照中也 FAILED——失败在你的归属变更中，不是工作区污染。`
+          inPlace.content += `\n\n[C3 归因重试] 在隔离快照中也 FAILED——两个环境均失败；尚不能区分归属缺陷与共同基线问题。`
           if (isolated.verification) inPlace.extraVerifications = [isolated.verification]
         }
       }
@@ -701,9 +697,12 @@ export const RUN_TESTS_TOOL: Tool = {
 
     const phaseB = await runTestCommandIn(params.cwd, testCommand, params, filter, timeout)
     tagVerification(phaseB, 'integration', plan.snapshotRef)
+    if (phaseB.verification) phaseB.verification.isolatedPassed = !phaseA.isError && phaseA.verification?.status === 'passed'
 
     const phaseBNote = phaseB.isError
-      ? `\n\n[阶段 B · 当前 HEAD 集成] FAILED — 归属变更在隔离环境已通过；这是并发变更冲突。合并前请 rebase/协调。交付不会因此被阻断。`
+      ? phaseB.verification?.isolatedPassed
+        ? `\n\n[阶段 B · 当前 HEAD 集成] FAILED — 归属变更在隔离环境已通过；这是并发变更冲突。合并前请 rebase/协调。交付不会因此被阻断。`
+        : `\n\n[阶段 B · 当前 HEAD 集成] FAILED — 隔离验证未通过，不能归因为并发冲突；请诊断阶段 A 的失败。`
       : `\n\n[阶段 B · 当前 HEAD 集成] 已通过。`
     const result: ToolResult = {
       ...phaseA,
@@ -812,6 +811,7 @@ export function runTestCommandIn(
 
       let stdout = ''
       let stderr = ''
+      const displayOutput = new DisplayOutputBuffer()
 
       const stdoutDecoder = deps.createDecoder()
       const stderrDecoder = deps.createDecoder()
@@ -825,6 +825,7 @@ export function runTestCommandIn(
         if (settled) return
         const text = stdoutDecoder.write(data)
         stdout += text
+        displayOutput.append(text)
         uiOutput.push(text)
         if (stdout.length > 100_000) {
           stdout = stdout.slice(-80_000)
@@ -835,6 +836,7 @@ export function runTestCommandIn(
         if (settled) return
         const text = stderrDecoder.write(data)
         stderr += text
+        displayOutput.append(text)
         uiOutput.push(text)
         if (stderr.length > 100_000) {
           stderr = stderr.slice(-80_000)
@@ -849,6 +851,8 @@ export function runTestCommandIn(
         const stderrTail = stderrDecoder.end()
         const finalStdout = stdout + stdoutTail
         const finalStderr = stderr + stderrTail
+        displayOutput.append(stdoutTail)
+        displayOutput.append(stderrTail)
         uiOutput.push(stdoutTail)
         uiOutput.push(stderrTail)
         uiOutput.flush()
@@ -859,6 +863,10 @@ export function runTestCommandIn(
         resolve({
           content: `测试在 ${timeout}ms 后超时`,
           uiContent: buildUiOutput(raw, meta),
+          displayOutput: displayOutput.text(),
+          displayOutputTruncated: displayOutput.truncated,
+          command: testCommand.display,
+          exitCode: meta.exitCode,
           rawPath,
           isError: true,
           errorKind: 'timeout',
@@ -881,7 +889,7 @@ export function runTestCommandIn(
         deps.setTimeout(() => deps.kill(child, 'SIGKILL'), 3000)
         uiOutput.flush()
         uiOutput.dispose()
-        resolve({ content: '测试已被用户中止。', uiContent: '⏹ 已中止', isError: false })
+        resolve({ content: '测试已被用户中止。', uiContent: '⏹ 已中止', displayOutput: displayOutput.text(), displayOutputTruncated: true, command: testCommand.display, isError: false })
       }
       if (signal) {
         if (signal.aborted) onAbort()
@@ -898,6 +906,8 @@ export function runTestCommandIn(
         const stderrTail = stderrDecoder.end()
         const finalStdout = stdout + stdoutTail
         const finalStderr = stderr + stderrTail
+        displayOutput.append(stdoutTail)
+        displayOutput.append(stderrTail)
         uiOutput.push(stdoutTail)
         uiOutput.push(stderrTail)
         uiOutput.flush()
@@ -933,12 +943,14 @@ export function runTestCommandIn(
         const invocationGuidance = '测试运行器启动失败或崩溃。请检查测试命令是否正确，必要时用 bash 手动运行以诊断环境问题。'
         const verification: VerificationMetadata = {
           command: testCommand.display,
+          kind: 'test',
           status: exitCode === 0 ? 'passed' : invocationFailed ? 'blocked' : 'failed',
           scope: testCommand.scope,
           exitCode,
           passed: parsed.passed,
           failed: parsed.failed,
           skipped: parsed.skipped,
+          countsReliable: parsed.countsReliable,
           durationMs,
           timestamp: startTime,
           ...(invocationFailed
@@ -986,6 +998,10 @@ export function runTestCommandIn(
               : `✓ ${parsed.passed} 通过${parsed.skipped ? `，${parsed.skipped} 跳过` : ''}${parsed.duration ? `（${parsed.duration}）` : ''}`)
             : failureContent,
           uiContent: buildUiOutput(raw, meta),
+          displayOutput: displayOutput.text(),
+          displayOutputTruncated: displayOutput.truncated,
+          command: testCommand.display,
+          exitCode: typeof code === 'number' ? code : undefined,
           rawPath,
           verification,
           isError: exitCode !== 0,

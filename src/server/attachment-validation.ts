@@ -1,8 +1,8 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { MAX_DOCUMENTS, MAX_DOCUMENT_BYTES } from './attachment-limits.js'
-import { contextFileKind, contextDataUrlBytes, decodeContextText, MAX_TEXT_ATTACHMENT_BYTES } from './file-context-policy.js'
+import { isAbsolute, join } from 'node:path'
+import { MAX_DOCUMENTS, MAX_DOCUMENT_BYTES, MAX_ARCHIVES, MAX_ARCHIVE_DATAURL_BYTES } from './attachment-limits.js'
+import { contextFileKind, contextDataUrlBytes, decodeContextText, isSupportedArchiveName, MAX_TEXT_ATTACHMENT_BYTES } from './file-context-policy.js'
 import { extractDocumentText, EXTRACTION_CAVEAT, isExtractableDocument } from '../tools/doc-extract.js'
 import { isSafeFileName } from '../utils/safe-path.js'
 
@@ -88,4 +88,70 @@ export async function extractDocumentsToText(
     if (tmpBase) rmSync(tmpBase, { recursive: true, force: true })
   }
   return parts.length > 0 ? parts.join('\n\n---\n\n') : null
+}
+
+/** 压缩包附件的入站形态：path（Tauri 原生拖拽，不读字节过 body）与
+ *  dataUrl（浏览器拖/粘，≤MAX_ARCHIVE_DATAURL_BYTES）恰居其一。 */
+export interface SessionArchivePayload {
+  name: string
+  path?: string
+  dataUrl?: string
+}
+
+/** Validate an archives payload: array of { name, path?, dataUrl? } for
+ *  zip/tar 系压缩包。服务端**不解压不抽取**——原样落盘 + 句柄文本进 prompt
+ *  （dsh 句柄式范式）。这里只做线缆形态/白名单/大小校验；path 形态的
+ *  存在性/类型/大小在持久化时核（manager.persistArchives，失败即 400）。
+ *  Shared by POST /sessions、POST /sessions/:id/prompt、POST /sessions/:id/queue。 */
+export function validateArchivesPayload(value: unknown): { archives?: SessionArchivePayload[]; error?: string } {
+  if (value === undefined) return {}
+  if (!Array.isArray(value) || value.length === 0) {
+    return { error: '"archives" must be a non-empty array' }
+  }
+  if (value.length > MAX_ARCHIVES) {
+    return { error: `Max ${MAX_ARCHIVES} archives allowed` }
+  }
+  for (const item of value) {
+    if (typeof item !== 'object' || item === null || typeof (item as { name?: unknown }).name !== 'string') {
+      return { error: 'Each archive must be { name: string, path?: string, dataUrl?: string }' }
+    }
+    const { name, path, dataUrl } = item as { name: string; path?: unknown; dataUrl?: unknown }
+    const hasPath = typeof path === 'string' && path.length > 0
+    const hasDataUrl = typeof dataUrl === 'string' && dataUrl.length > 0
+    if (hasPath === hasDataUrl) {
+      return { error: 'Each archive must carry exactly one of "path" or "dataUrl"' }
+    }
+    if (!isSafeFileName(name) || !isSupportedArchiveName(name)) {
+      return { error: 'Each archive must be a supported archive type (.zip/.tar/.tgz/.tar.gz/.tar.bz2/.tar.xz)' }
+    }
+    if (hasPath) {
+      if (!isAbsolute(path as string)) return { error: `${name}: archive path must be absolute` }
+      continue
+    }
+    if (!/^data:[^;,]+;base64,/.test(dataUrl as string)) {
+      return { error: `${name}: archive dataUrl must be a base64 data URL` }
+    }
+    if (decodedBase64Bytes(dataUrl as string) > MAX_ARCHIVE_DATAURL_BYTES) {
+      return { error: `Each archive must be <= ${Math.round(MAX_ARCHIVE_DATAURL_BYTES / 1024 / 1024)}MB (dataUrl form)` }
+    }
+  }
+  return { archives: value as SessionArchivePayload[] }
+}
+
+function humanBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`
+}
+
+/** 压缩包句柄文本（~90 token，与文件大小无关）——user message 里压缩包的
+ *  唯一投影，与 [document:] 同位前置。解压是模型的工具行为（unzip/tar 自取），
+ *  服务端永不解压；savedPath 随会话附件目录持久化，resume/重放不失效。 */
+export function buildArchiveHandleText(ref: { name: string; bytes: number; sha256short: string; savedPath: string }): string {
+  return `[archive: ${ref.name} (${humanBytes(ref.bytes)}, sha256:${ref.sha256short})]\n` +
+    `Saved verbatim at: ${ref.savedPath}\n` +
+    `Do not inline its contents. Inspect on demand: \`unzip -l ${ref.savedPath}\` to list; ` +
+    `extract into a writable workspace dir (\`unzip ${ref.savedPath} -d <dir>\`) before reading. ` +
+    `Pass this path in delegation prompts when workers need it.`
 }

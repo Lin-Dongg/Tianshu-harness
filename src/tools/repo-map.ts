@@ -1,4 +1,4 @@
-import { readdir, stat } from 'node:fs/promises'
+import { readdir, stat, lstat } from 'node:fs/promises'
 import { join, basename, resolve } from 'path'
 import { relativePosix } from '../path-format.js'
 import { classifyPath } from '../context/attention-filter.js'
@@ -56,12 +56,13 @@ interface TreeNode {
   sizeBytes?: number
 }
 
-async function buildTree(dir: string, depth: number, fileCount: { n: number; total: number }, maxFiles: number, maxDepth: number, projectRoot: string, includeSilent: boolean): Promise<TreeNode[]> {
+async function buildTree(dir: string, depth: number, fileCount: { n: number; total: number; boundaries: number; inaccessible: number }, maxFiles: number, maxDepth: number, projectRoot: string, includeSilent: boolean): Promise<TreeNode[]> {
   if (depth > maxDepth) return []
   let names: string[]
   try {
     names = await readdir(dir)
   } catch {
+    fileCount.inaccessible++
     return []
   }
 
@@ -74,7 +75,7 @@ async function buildTree(dir: string, depth: number, fileCount: { n: number; tot
     if (!includeSilent && verdict.silent) continue
     let s: Awaited<ReturnType<typeof stat>>
     try {
-      s = await stat(fullPath)
+      s = await lstat(fullPath)
     } catch {
       continue
     }
@@ -95,6 +96,11 @@ async function buildTree(dir: string, depth: number, fileCount: { n: number; tot
   const nodes: TreeNode[] = []
   for (const entry of entries) {
     if (entry.isDir) {
+      if (depth >= maxDepth) {
+        fileCount.boundaries++
+        nodes.push({ name: entry.name, isDir: true, annotation: '深度边界：内容未扫描' })
+        continue
+      }
       const children = await buildTree(join(dir, entry.name), depth + 1, fileCount, maxFiles, maxDepth, projectRoot, includeSilent)
       if (children.length > 0) {
         const annotation = entry.name === '__tests__' ? '测试' : undefined
@@ -165,7 +171,8 @@ export const REPO_MAP_TOOL: Tool = {
 
   async execute(params: ToolCallParams) {
     const maxFiles = (params.input.max_files as number) || DEFAULT_MAX_FILES
-    const maxDepth = (params.input.depth as number | undefined) ?? DEFAULT_DEPTH
+    const requestedDepth = Number(params.input.depth ?? DEFAULT_DEPTH)
+    const maxDepth = Number.isFinite(requestedDepth) ? Math.max(0, Math.min(20, Math.floor(requestedDepth))) : DEFAULT_DEPTH
     const subPath = params.input.path as string | undefined
 
     let root = params.cwd
@@ -196,7 +203,7 @@ export const REPO_MAP_TOOL: Tool = {
     }
 
     const includeSilent = Boolean(subPath && classifyPath(relativePosix(params.cwd, root)).silent)
-    const fileCount = { n: 0, total: 0 }
+    const fileCount = { n: 0, total: 0, boundaries: 0, inaccessible: 0 }
     const tree = await buildTree(root, 0, fileCount, maxFiles, maxDepth, params.cwd, includeSilent)
 
     // Header: show relative path when focused on subdirectory
@@ -222,7 +229,7 @@ export const REPO_MAP_TOOL: Tool = {
     const truncated = omitted > 0
       ? `\n...（已截断：省略 ${omitted} 个文件；可用 repo_map({path: "..."}) 或 glob/grep 做定向查看）`
       : ''
-    const summary = `树中 ${fileCount.n} 个文件，${dirCount} 个目录`
+    const summary = `树中 ${fileCount.n} 个文件，${dirCount} 个目录；depth=${maxDepth}；扫描到 ${fileCount.total} 个文件，深度边界 ${fileCount.boundaries} 个，无法读取 ${fileCount.inaccessible} 个目录。边界以下文件数未知；这是文件系统概览，不代表索引覆盖。`
 
     return {
       content: `${header}\n${lines.join('\n')}${truncated}\n${summary}`,

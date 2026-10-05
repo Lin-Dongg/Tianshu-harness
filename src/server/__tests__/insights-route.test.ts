@@ -1,3 +1,6 @@
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createRouter } from '../index.js'
@@ -47,11 +50,12 @@ const config: Config = {
   },
 } as unknown as Config
 
-function setup() {
+function setup(now?: () => number) {
   const agents: FakeAgent[] = []
   const manager = new RuntimeSessionManager({
     createAgent: () => { const a = new FakeAgent(); agents.push(a); return a },
     defaultCwd: '/tmp/work',
+    now,
   })
   const router = createRouter(buildSessionRoutes(manager, TOKEN, undefined, config))
   return { manager, agents, router }
@@ -121,7 +125,28 @@ test('GET /sessions/:id/insights aggregates delegation usage and cost', async ()
   assert.equal(body.totals.cacheReadTokens, 600_000 + 800_000)
   assert.equal(body.totals.cacheWriteTokens, 80_000 + 100_000)
   assert.equal(body.totals.totalTokens, 1_100_000 + 1_500_000)
-  assert.equal(body.cacheHitRate, 89)
+  // 命中率分母是 cache-inclusive input（内核 getCacheHitRate 口径）——
+  // 1.4M / 1.8M ≈ 78%，不是 read/(read+write) 的 89%。
+  assert.equal(body.cacheHitRate, 78)
+})
+
+test('insights 命中率分母是 cache-inclusive input —— cacheCreation 缺报时不退化成 100%', async () => {
+  // 2026-10-03：/insights 的 cacheHitRate 曾用 read/(read+write)，在 provider
+  // 不上报 cache_creation（Codex/Responses 硬编码 0）时 read/(read+0) 恒等于 100%。
+  // 分母改为 cache-inclusive input（与内核 getCacheHitRate、cache 面板 hitRate 同口径）。
+  const { agents, router } = setup()
+  const created = await router('POST', '/sessions', { prompt: 'go' }, AUTH)
+  const id = (created.body as { id: string }).id
+  const agent = agents[0]
+  assert.ok(agent?.callbacks)
+
+  // 命中 300k、未命中 700k，但 provider 不报 cache_creation（=0）
+  agent.callbacks!.onTurnComplete!({ input_tokens: 1_000_000, output_tokens: 10_000, cache_read_input_tokens: 300_000 }, 1, true)
+
+  const res = await router('GET', `/sessions/${id}/insights`, {}, AUTH)
+  assert.equal(res.status, 200)
+  const body = res.body as { cacheHitRate: number | null }
+  assert.equal(body.cacheHitRate, 30, 'read/(read+write) 会退化成 100%')
 })
 
 test('GET /sessions/:id/insights returns 404 for unknown session', async () => {
@@ -179,4 +204,42 @@ test('insights: 累计快照口径 — 不求和（同一 worker 重复上报也
   // 合计 = 主会话末值 + worker 末值
   assert.equal(body.totals.inputTokens, 400_000 + 90_000)
   assert.equal(body.totals.cacheReadTokens, 350_000 + 80_000)
+})
+
+
+test('insights costs cumulative deltas at event time, then prefers the exact request ledger', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'insights-pricing-'))
+  const previous = process.env.RIVET_SESSION_DIR
+  let now = Date.parse('2026-09-28T01:00:00Z')
+  try {
+    process.env.RIVET_SESSION_DIR = root
+    const { agents, router } = setup(() => now)
+    const created = await router('POST', '/sessions', { prompt: 'go', model: 'deepseek-v4-pro' }, AUTH)
+    const id = (created.body as { id: string }).id
+    const cb = agents[0]!.callbacks!
+    const usage = (n: number) => ({ input_tokens: n * 1e6, output_tokens: n * .5e6, cache_read_input_tokens: n * .8e6, cache_creation_input_tokens: n * .2e6, reasoning_tokens: n * .4e6 })
+    cb.onTurnComplete!(usage(1), 1, false)
+    cb.onDelegationActivity!({ workOrderId: 'fixture', parentToolId: 'tool', profile: 'scout', status: 'running', model: 'deepseek-v4-pro', provider: 'deepseek', usage: usage(1) })
+    now = Date.parse('2026-09-28T04:00:00Z')
+    cb.onTurnComplete!(usage(2), 2, true)
+    cb.onDelegationActivity!({ workOrderId: 'fixture', parentToolId: 'tool', profile: 'scout', status: 'completed', usage: usage(2) })
+    cb.onDelegationActivity!({ workOrderId: 'fixture', parentToolId: 'tool', profile: 'scout', status: 'completed', usage: usage(2) })
+    const read = async () => (await router('GET', `/sessions/${id}/insights`, {}, AUTH)).body as { mainSession: { cost: number }; workers: Array<{ cost: number }>; totals: { cost: number } }
+    let body = await read()
+    // peak=.24+1.8+13.5=15.54; idle=7.77. Reasoning is a subset of output.
+    assert.ok(Math.abs(body.mainSession.cost - 23.31) < 1e-9)
+    assert.ok(Math.abs(body.workers[0]!.cost - 23.31) < 1e-9)
+    assert.ok(Math.abs(body.totals.cost - 46.62) < 1e-9)
+    mkdirSync(join(root, id), { recursive: true })
+    writeFileSync(join(root, id, 'cache-log.jsonl'), [
+      { t: Date.parse('2026-10-01T01:00:00Z'), model: 'deepseek-flash', provider: 'deepseek', input: 1e6, output: .5e6, cacheRead: .8e6, cacheCreate: .2e6 },
+      { event: 'side_path', t: Date.parse('2026-09-28T01:00:00Z'), model: 'deepseek-flash', provider: 'deepseek', input: 1e6, output: 0, cacheRead: 0, cacheCreate: 0 },
+    ].map(row => JSON.stringify(row)).join('\n'))
+    body = await read()
+    assert.ok(Math.abs(body.mainSession.cost - 4.216) < 1e-9, 'actual request model/time overrides session model and completion time')
+  } finally {
+    if (previous === undefined) delete process.env.RIVET_SESSION_DIR
+    else process.env.RIVET_SESSION_DIR = previous
+    rmSync(root, { recursive: true, force: true })
+  }
 })

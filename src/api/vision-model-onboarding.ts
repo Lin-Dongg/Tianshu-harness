@@ -127,9 +127,15 @@ function endpointHostname(baseUrl: string): string {
   }
 }
 
+/** Agnes 官方端点域名集合。apihub.agnes-ai.com 是现役文档口径的 Base URL 主机；
+ *  api.agnes.ai 是 2026-07 前后迁移前的旧域名（现已 DNS 不解析）。两个都认——
+ *  把旧判断留在原地（对存量配置零差异），新域名让 extras 在现役端点上真正生效
+ *  （迁移后它一直没命中，等于静默失效）。 */
+const AGNES_OFFICIAL_HOSTS = new Set(['api.agnes.ai', 'apihub.agnes-ai.com'])
+
 export function vendorVisionRequestExtras(baseUrl: string, modelId: string): Record<string, unknown> {
   const hostname = endpointHostname(baseUrl)
-  if (hostname === 'api.agnes.ai' && /^agnes-\d+\.\d+-(?:flash|pro)$/i.test(modelId)) {
+  if (AGNES_OFFICIAL_HOSTS.has(hostname) && /^agnes-\d+\.\d+-(?:flash|pro)$/i.test(modelId)) {
     return { chat_template_kwargs: { enable_thinking: true, budget_tokens: 2048 } }
   }
   if (hostname === 'open.bigmodel.cn' && GLM_VISION_THINKING_MODELS.has(modelId)) {

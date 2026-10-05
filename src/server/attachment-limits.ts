@@ -23,3 +23,13 @@ export const MAX_DOCUMENT_BYTES = 8 * 1024 * 1024
  *  （image-compress.ts MAX_OUTPUT_BYTES）、read_file 工具统一 10MB；
  *  DeepSeek 官方 base64 内联上限 32MiB，10MB 在安全区内。 */
 export const MAX_IMAGE_BYTES = 10 * 1024 * 1024
+
+/** 单轮压缩包附件个数上限（句柄式：原样落盘 + ~90 token 句柄进 prompt，不解压）。 */
+export const MAX_ARCHIVES = 2
+
+/** 单个压缩包 path 形态（Tauri 原生拖拽，不经过 body）的字节上限。 */
+export const MAX_ARCHIVE_BYTES = 200 * 1024 * 1024
+
+/** 单个压缩包 dataUrl 形态解码后的字节上限——base64 膨胀后 ~41MB，
+ *  与 4 图共享 64MB 的 MAX_BODY_BYTES（src/server/index.ts）仍有裕量。 */
+export const MAX_ARCHIVE_DATAURL_BYTES = 30 * 1024 * 1024

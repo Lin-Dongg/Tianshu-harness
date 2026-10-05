@@ -66,7 +66,7 @@ export class FrontendWorkflow {
     if (name === '/tui') {
       if (args === 'auto' || args === 'classic' || args === 'fullscreen') this.save({ ...this.preferences, renderer: args })
       else if (!args && this.host.mode) this.host.mode()
-      else this.host.detail('终端显示', `当前：${this.host.rendererStatus?.() ?? '由宿主选择'} · 偏好：${this.preferences.renderer}\n/tui auto · Windows、macOS、Linux 的兼容本地终端自动全屏；远程与未知宿主使用经典\n/tui fullscreen · 在兼容终端手动开启全屏\n/tui classic · 经典输出与宿主复制\n读屏、非交互输出与 dumb 终端保持经典。\n仅空闲、没有待审批/问答/编辑器时可切换；会话与草稿保留。`)
+      else this.host.detail('终端显示', `当前：${this.host.rendererStatus?.() ?? '由宿主选择'} · 偏好：${this.preferences.renderer}\n/tui auto · Windows、macOS、Linux 默认原生回滚与底部局部重绘\n/tui fullscreen · 在兼容终端手动开启全屏\n/tui classic · 经典输出与宿主复制\n读屏、非交互输出与 dumb 终端保持经典。\n仅空闲、没有待审批/问答/编辑器时可切换；会话与草稿保留。`)
       return
     }
     if (args === 'standard' || args === 'legacy') this.save({ ...this.preferences, keymap: args, bindings: {} })

@@ -1056,9 +1056,9 @@ Write only the fields you want to override; defaults are deep-merged. Full schem
 - **Security vulnerabilities** → [Report privately](https://github.com/huiliyi37/Tianshu-harness/security/advisories/new) (do not open a public issue)
 - **Contributing** → See [CONTRIBUTING.md](CONTRIBUTING.md)
 - **Support guide** → See SUPPORT.md
-- **WeChat group** → 「天枢 harness 交流群」 — scan the QR code below to join (QR codes expire every 7 days; leave a note in Discussions once expired):
+- **WeChat group** → 「天枢 harness 交流群5群」 — scan the QR code below to join (QR codes expire every 7 days; leave a note in Discussions once expired):
 
-<img src="docs/brand/assets/wechat-group-qr.png" width="280" alt="Tianshu Harness WeChat group QR code">
+<img src="docs/brand/assets/wechat-group-qr.png" width="280" alt="Tianshu Harness WeChat group 5 QR code">
 
 > Note: a maintainer needs to enable Discussions in `Settings → General → Discussions` first.
 

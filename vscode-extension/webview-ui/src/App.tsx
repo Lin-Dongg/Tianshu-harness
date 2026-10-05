@@ -156,6 +156,7 @@ export function App() {
           break
         case 'sessionCreated':
           setSessions((prev) => [msg.session, ...prev])
+          activeIdRef.current = msg.session.id
           setActiveId(msg.session.id)
           send({ type: 'listPickers', sessionId: msg.session.id })
           {
@@ -168,9 +169,11 @@ export function App() {
           }
           break
         case 'sessionAttached':
+          activeIdRef.current = msg.sessionId
           setActiveId(msg.sessionId)
           dispatch({ type: 'reset' })
           everLiveRef.current = false
+          setLive(false)
           setCockpit(null)
           setHistoryBusy(false)
           setRewindPoints([])
@@ -182,6 +185,7 @@ export function App() {
           send({ type: 'listRewindPoints', sessionId: msg.sessionId })
           break
         case 'event':
+          if (msg.sessionId !== activeIdRef.current) break
           dispatch({ type: 'event', ev: msg.event })
           // turn 收束即刷新统计（占用/命中率/成本随 turn 变化）
           if (msg.event.type === 'turn_complete') send({ type: 'getCockpit', sessionId: msg.sessionId })
@@ -202,6 +206,7 @@ export function App() {
           setRestoreDraft({ text: msg.text, n: restoreNRef.current, mode: 'append' })
           break
         case 'streamState':
+          if (msg.sessionId !== activeIdRef.current) break
           if (msg.live) everLiveRef.current = true
           setLive(msg.live)
           break
@@ -215,6 +220,7 @@ export function App() {
           }
           break
         case 'pickers':
+          if (msg.sessionId !== activeIdRef.current) break
           setModels(msg.models)
           setDomains(msg.domains)
           break
@@ -229,9 +235,11 @@ export function App() {
           setProviderConfig(msg.config)
           break
         case 'plan':
+          if (msg.sessionId !== activeIdRef.current) break
           setPlans((prev) => ({ ...prev, [msg.plan.slug]: msg.plan }))
           break
         case 'planDecisionResult':
+          if (msg.sessionId !== activeIdRef.current) break
           if (msg.ok) {
             setPlanDecisions((prev) => ({ ...prev, [msg.slug]: msg.decision }))
           } else {
@@ -239,10 +247,13 @@ export function App() {
           }
           break
         case 'cockpit':
+          if (msg.sessionId !== activeIdRef.current) break
           setCockpit(msg.snapshot)
           break
         case 'sessionClosed':
+          activeIdRef.current = undefined
           setActiveId(undefined)
+          setLive(false)
           dispatch({ type: 'reset' })
           setCockpit(null)
           setRewindPoints([])
@@ -287,8 +298,8 @@ export function App() {
           setDraftDomain((prev) => (prev && prev !== 'auto' ? prev : msg.domains.find((d) => d.current)?.key || 'auto'))
           break
         case 'earlierEvents':
-          setHistoryBusy(false)
           if (msg.sessionId !== activeIdRef.current) break
+          setHistoryBusy(false)
           if (msg.error) {
             setErrorBanner(msg.error)
             break
@@ -489,6 +500,7 @@ export function App() {
           if (curM) setDraftModel(curM.id)
           if (curD) setDraftDomain(curD.key)
           setPanel('none')
+          activeIdRef.current = undefined
           setActiveId(undefined)
           dispatch({ type: 'reset' })
           setCockpit(null)

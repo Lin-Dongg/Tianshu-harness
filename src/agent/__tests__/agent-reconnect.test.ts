@@ -154,4 +154,41 @@ describe('AgentLoop agent-layer bounded reconnect (2D)', () => {
     assert.equal(streamMock.mock.calls.length, 3, '首次 + 2 次重连 = 3 次调用')
     assert.ok(errored, '重连耗尽后应透传 onError')
   })
+
+  it('onModelRetry 载荷带分类信息：category / message / nextDelayMs（重试可见性）', async () => {
+    // 此前载荷只有 {attempt, maxAttempts}——429/503 退避期间 UI 只能说「重试中」，
+    // 读起来像卡住。分类器结果（shouldReconnect 判定同源）必须透传（2026-10-05）。
+    const session = new SessionContext()
+    const registry = new ToolRegistry()
+    registry.register(READ_FILE_TOOL)
+    const client = makeFlakyClient(1) // 第 1 次抛 503（→ overloaded），第 2 次成功
+
+    const agent = new AgentLoop({
+      client, promptEngine: makeEngine(), toolRegistry: registry,
+      maxTurns: 1, contextWindow: 1_000_000,
+      compact: { enabled: false, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash' },
+      agentReconnect: { enabled: true, maxAttempts: 2, backoffMs: 1 },
+    }, session, TEST_CWD)
+
+    const retries: Array<{ attempt: number; maxAttempts: number; category?: string; message?: string; nextDelayMs?: number }> = []
+    await agent.run('hi', {
+      onTextDelta: () => {},
+      onThinkingDelta: () => {},
+      onToolUse: () => {},
+      onToolResult: () => {},
+      onTurnComplete: () => {},
+      onError: (e) => { throw e },
+      onAbort: () => {},
+      onApprovalRequired: async () => false,
+      onModelRetry: (info) => { retries.push(info) },
+    })
+
+    assert.equal(retries.length, 1, '一次失败 → 一次重试通知')
+    const r = retries[0]!
+    assert.equal(r.attempt, 1)
+    assert.equal(r.maxAttempts, 2)
+    assert.equal(r.category, 'overloaded', '503 应分类为 overloaded 并透传')
+    assert.ok(typeof r.message === 'string' && r.message.includes('503'), '原始错误消息应透传')
+    assert.equal(r.nextDelayMs, 1, '等待时长 = agentReconnect.backoffMs')
+  })
 })

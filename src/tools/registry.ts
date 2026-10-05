@@ -16,13 +16,66 @@ const FOREIGN_ALIASES: Record<string, string> = {
   agent: 'delegate_task',
 }
 
+// ── 同名覆盖检测（rug pull 防线 ④）────────────────────────────────────────
+// 背景：register 为 Map.set 后到者赢，被覆盖方无任何信号（安全报告《MCP 工具
+// 描述 rug pull》§2.3 —— 攻击者可注册同名工具静默替换）。已知的预期重注册
+// 来源（按前缀静默，不告警）：
+//   - mcp__：MCP 重连/重拉/热更新对同一 serverId 的工具面重建（manager 侧有意
+//     静默替换）。跨 server 的 sanitize 撞名（'a_b' vs 'a__b'）在名字层面与
+//     同源重拉不可区分，属已知残余；根治在命名层（mcpToolName 的有损映射）。
+//   - lsp_：serve-agent.attachLspTools 每次 assembleAgentLoop 重挂（switchModel
+//     安全性的设计约束，"重复 register 无害"，serve-agent.ts:180）。
+// 其余同名覆盖此前静默——本检测把"后到者赢"变为至少可观察：默认通道
+// console.error 一条（进程级一次/名字），**不改变覆盖行为本身**。
+const KNOWN_REFRESH_PREFIXES = ['mcp__', 'lsp_'] as const
+
+/** 已知刷新（预期幂等重注册）或意外覆盖。 */
+export function classifyToolOverwrite(name: string): 'known-refresh' | 'unexpected' {
+  return KNOWN_REFRESH_PREFIXES.some((p) => name.startsWith(p)) ? 'known-refresh' : 'unexpected'
+}
+
+/** 默认告警输出口（测试经 __setOverwriteSink 替换）。 */
+let overwriteSink: ((msg: string) => void) | null = null
+
+/** @internal 测试缝：替换默认告警 sink；null 恢复 console.error。 */
+export function __setOverwriteSink(sink: ((msg: string) => void) | null): void {
+  overwriteSink = sink
+}
+
+const reportedOverwrites = new Set<string>()
+
+/** @internal 测试缝：重置进程级去重台账。 */
+export function __resetOverwriteLog(): void {
+  reportedOverwrites.clear()
+}
+
+function reportOverwriteOnce(name: string): void {
+  if (reportedOverwrites.has(name)) return
+  reportedOverwrites.add(name)
+  const line = `[rivet] 工具注册覆盖：「${name}」被新实例替换（非 mcp__/lsp_ 的预期刷新）。`
+    + '若这不是插件热重载等已知路径，请检查同名注册来源——注册表为 Map.set 后到者赢。'
+  if (overwriteSink) overwriteSink(line)
+  else console.error(line)
+}
+
 export class ToolRegistry {
   private tools = new Map<string, Tool>()
+  /** 同名覆盖上报口（见文件头「同名覆盖检测」）。注入 = 每次意外覆盖都回调；
+   *  缺省 = reportOverwriteOnce（进程级一次/名字 + console.error）。 */
+  private readonly onToolOverwrite?: (name: string) => void
   /** 异步晚到注册（MCP/插件/LSP）未完成计数 + 等待者。见 awaitExtraRegistrations。 */
   private extraRegistrationPending = 0
   private extraRegistrationWaiters: Array<() => void> = []
 
+  constructor(opts: { onToolOverwrite?: (name: string) => void } = {}) {
+    this.onToolOverwrite = opts.onToolOverwrite
+  }
+
   register(tool: Tool): void {
+    const existing = this.tools.get(tool.definition.name)
+    if (existing && existing !== tool && classifyToolOverwrite(tool.definition.name) === 'unexpected') {
+      (this.onToolOverwrite ?? reportOverwriteOnce)(tool.definition.name)
+    }
     this.tools.set(tool.definition.name, tool)
   }
 

@@ -9,6 +9,7 @@
  * 缓存纪律：kickoff 是用户边界的 append 消息，纯追加不碰前缀；本模块不注入任何 prompt 块。
  */
 
+import { planRevision } from './plan-revision.js'
 import { readPlan, approvePlan, type PlanDocument } from './plan-store.js'
 import { validatePlanContentForApproval } from '../tools/plan.js'
 import { extractRequiredSkills } from '../agent/skill-gate.js'
@@ -44,7 +45,7 @@ export interface PlanApprovalSuccess {
 export interface PlanApprovalFailure {
   ok: false
   /** not-found: 计划不存在；invalid-content: 空计划/占位符校验拒绝。 */
-  code: 'not-found' | 'invalid-content'
+  code: 'not-found' | 'invalid-content' | 'document-changed'
   reason: string
   /** invalid-content 时携带标题便于提示。 */
   title?: string
@@ -60,12 +61,17 @@ export async function approvePlanWithGuards(
   cwd: string,
   slug: string,
   resolvedApproach?: string,
+  expectedRevision?: string,
+  canCommit?: () => boolean,
 ): Promise<PlanApprovalResult> {
   // Empty/invalid-plan hard-fail at the approval boundary (kimi-code borrow):
   // never mark a stale draft or gutted file APPROVED + kick off execution.
   const existing = await readPlan(cwd, slug)
   if (!existing) {
     return { ok: false, code: 'not-found', reason: `Plan not found: "${slug}".` }
+  }
+  if (expectedRevision && (existing.status !== 'submitted' || planRevision(existing.content) !== expectedRevision)) {
+    return { ok: false, code: 'document-changed', reason: '计划内容或状态已变化，请重新确认。' }
   }
   const check = validatePlanContentForApproval(existing.content)
   if (!check.ok) {
@@ -86,9 +92,9 @@ export async function approvePlanWithGuards(
     // Best-effort — the guard itself must never break approval.
   }
 
-  const approved = await approvePlan(cwd, slug)
+  const approved = await approvePlan(cwd, slug, expectedRevision, canCommit)
   if (!approved) {
-    return { ok: false, code: 'not-found', reason: `Plan not found: "${slug}".` }
+    return { ok: false, code: expectedRevision ? 'document-changed' : 'not-found', reason: '计划不存在或内容、状态已变化，请重新确认。' }
   }
 
   // 技能契约：提取计划点名的 skill，过滤到本运行时可加载的（点名了但注册表

@@ -69,5 +69,5 @@ test('start() first frame is a clean append (no stale moveToTop after pre-start 
   // 首帧应完整含输入框三要素（顶边框/输入行/底边框的可辨识片段）。
   assert.ok(startOutput.includes('❯'), 'start() 首帧应含输入行提示符 ❯')
   assert.ok(startOutput.includes('╭') || startOutput.includes('─'), 'start() 首帧应含顶边框')
-  assert.equal(startOutput.replace(/\x1b\[[\d;]*m/g, '').split('\n').filter(row => /^[─━┄-]{3,}\s*$/.test(row)).length, 2, 'start has one complete open composer with two writing rules')
+  assert.equal(startOutput.replace(/\x1b\[[\d;]*m/g, '').split('\n').filter(row => /^(?:[─━┄-]{3,}|[─━┄-] .+ [─━┄-]{2,})\s*$/.test(row)).length, 2, 'start has one complete open composer with two writing rules')
 })

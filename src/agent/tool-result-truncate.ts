@@ -1,5 +1,11 @@
 import { estimateOaiMessageTokens } from '../compact/micro.js'
 
+/** Error output must stay bounded even without durable storage or a turn budget. */
+export function boundToolFailure(content: string): string {
+  if (content.length <= 32_000) return content
+  return `${content.slice(0, 20_000)}\n\n[Error output shortened; omitted material is recoverable only if an artifact reference is present.]\n\n${content.slice(-10_000)}`
+}
+
 export function truncateToolResult(content: string, maxTokens: number): string {
   if (!content) return content
   const tokens = estimateOaiMessageTokens({ role: 'user', content })

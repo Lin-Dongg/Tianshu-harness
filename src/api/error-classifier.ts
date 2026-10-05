@@ -7,6 +7,7 @@
 
 import { ReasoningRepetitionError } from './reasoning-repetition.js'
 import { RequestInvariantError } from './request-invariant.js'
+import { isLocalWorkerPolicyError } from './continuation-prefix.js'
 import { detectTlsInterception } from '../platform/tls-interception.js'
 
 // ---------------------------------------------------------------------------
@@ -580,7 +581,7 @@ export function classifyApiError(error: unknown): ClassifiedError {
   // 且必须**穿透**故障转移（FallbackStreamClient 只接管五类上游错误）——
   // 让它落进任何可重试/可接管类别，一次前缀损坏就会变成「悄悄换个 provider
   // 重发」，比不检查更糟。maxRetries=0 + 独占 category 把两件事都钉死。
-  if (error instanceof RequestInvariantError) {
+  if (error instanceof RequestInvariantError || isLocalWorkerPolicyError(error)) {
     return {
       retryable: false,
       retryDelayMs: 0,
@@ -687,6 +688,32 @@ export function classifyApiError(error: unknown): ClassifiedError {
 
   // 2. Fall back to name / message pattern classification
   return classifyByPattern(error)
+}
+
+/**
+ * 错误类别的中文短标签——重试/错误可见性文案（retry 相位、桌面重试块）共用
+ * 同一族措辞，与 errorRecoveryGuidance 的分流口径一致。未知类别给通用兜底，
+ * 不返回空串（消费方直接拼进句子，空串会留下「（）」）。
+ */
+export function errorCategoryLabel(category: string | undefined): string {
+  switch (category) {
+    case 'rate_limit': return '限流（429）'
+    case 'overloaded': return '服务端过载'
+    case 'server_error': return '服务端错误'
+    case 'timeout': return '网络超时'
+    case 'auth_error': return '鉴权失败'
+    case 'client_error': return '请求被拒'
+    case 'context_overflow': return '上下文超限'
+    case 'request_body_too_large': return '请求体超限'
+    case 'image_strip': return '图片负载超限'
+    case 'stream_parse': return '流解析失败'
+    case 'malformed_response': return '上游响应畸形'
+    case 'reasoning_echo': return '思考内容需回传'
+    case 'reasoning_repetition': return '推理复读'
+    case 'request_invariant': return '请求前缀被改动'
+    case 'tls_intercept': return 'TLS 拦截'
+    default: return '未知错误'
+  }
 }
 
 /**

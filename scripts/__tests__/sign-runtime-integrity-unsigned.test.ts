@@ -7,11 +7,14 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 
-const src = readFileSync(new URL('../../desktop/scripts/sign-runtime-integrity.js', import.meta.url), 'utf8')
+const sourceUrl = new URL('../../desktop/scripts/sign-runtime-integrity.js', import.meta.url)
 
-test('无私钥 + RIVET_ALLOW_UNSIGNED_RUNTIME=1：warn 之后直接 exit 0，不调 gen-integrity-manifest', () => {
+test('无私钥 + RIVET_ALLOW_UNSIGNED_RUNTIME=1：warn 之后直接 exit 0，不调 gen-integrity-manifest', {
+  skip: !existsSync(sourceUrl) && 'CLI 仓库不包含桌面签名脚本',
+}, () => {
+  const src = readFileSync(sourceUrl, 'utf8')
   const warnIdx = src.indexOf('RIVET_ALLOW_UNSIGNED_RUNTIME=1：本次构建')
   assert.ok(warnIdx > 0, '应有未签名警告块')
   const execIdx = src.indexOf('gen-integrity-manifest.ts', warnIdx)

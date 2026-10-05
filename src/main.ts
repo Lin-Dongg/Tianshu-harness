@@ -11,6 +11,7 @@
 
 // Windows EPERM scandir noise filter — must register before any dependency
 // that might trigger fs operations against system-protected directories.
+import { attachDecisionSession } from './tui/decision-session.js'
 import { installEpermFilter } from './platform/eperm-filter.js'
 import { setTargetConventions, applyConfiguredGitBashPath } from './platform.js'
 import { assertStagedRuntimeIntact } from './platform/staged-runtime-guard.js'
@@ -24,8 +25,8 @@ installEpermFilter()
 // start when it cannot. No-op outside a staged layout (tsx dev runs).
 assertStagedRuntimeIntact(dirname(fileURLToPath(import.meta.url)))
 
-import { bootstrapInteractiveSession, createShutdownHandler, switchAgentRuntime, restorePlanModeFromMeta, getOrCreateSessionId, wasSessionResumed } from './bootstrap.js'
-import type { BootstrapContext } from './bootstrap.js'
+import { bootstrapInteractiveSession, createShutdownHandler, switchAgentRuntime, restorePlanModeFromMeta, getOrCreateSessionId, wasSessionResumed, initializeMcp } from './bootstrap.js'
+import type { BootstrapContext, RuntimeRefs } from './bootstrap.js'
 import { resolveCapabilities } from './api/provider.js'
 import { createExitFuse } from './platform/exit-fuse.js'
 
@@ -92,8 +93,7 @@ import { configureSpinnerVerbs, setReducedMotion } from './tui/format/spinner-st
 import { StatusLineRunner } from './tui/statusline.js'
 import { buildVerboseTranscript } from './tui/transcript-verbose.js'
 import { resolveAppPromptInput, registerTuiSlashCommands, approvePlanAndKickoff } from './tui/slash-commands.js'
-import { listPlansSync, readPlanSync, rejectPlan, stripPlanChrome } from './plan/plan-store.js'
-import { formatPlanReviewDate } from './tui/format/plan-review.js'
+import { listPlansSync, readPlanSync, stripPlanChrome } from './plan/plan-store.js'
 import { resolveAutoApproveMs, shouldArm } from './tui/plan-auto-approve.js'
 import type { PlanPickerEntry } from './tui/format/overlay.js'
 import { isCurrentModelSelection } from './tui/model-picker-selection.js'
@@ -340,7 +340,10 @@ async function main() {
       process.exit(2)
     }
 
-    const cfg = loadConfig()
+    // 传 cwd：无头此前从不读项目层配置（.rivet-config.json 不参与合并），是
+    // 「无头不加载 MCP」的更深层根因——即使装配了 initializeMcp，servers 也恒为空。
+    // 项目信任门语义不变：未授信项目的 mcp/hooks 等敏感键在 loadConfig 内剥离。
+    const cfg = loadConfig({ cwd: process.cwd() })
     setTargetConventions(cfg.editor.platform, cfg.editor.eol)
     applyConfiguredGitBashPath(cfg.env.gitBashPath)
     const { buildSearchBackends } = await import('./tools/web-search.js')
@@ -460,6 +463,16 @@ async function main() {
     const builtinNames = new Set(createDefaultToolRegistry([], registryOptions).getAllNames())
     const pluginTools = pluginRegistry.getAll().filter(t => !builtinNames.has(t.definition.name))
 
+    // MCP（无头补齐）：交互路径经 bootstrapInteractiveSession → initializeMcp，
+    // 无头此前从不装配——配置了 MCP 服务器的自动化场景会静默失去全部 mcp__ 工具
+    // （无警告、无报错）。这里先连接后注册（await）：工具在 createAgent 之前就绪，
+    // 不需要交互路径的晚到注册闸门。未配置 MCP 时 initializeMcp 直接早退（零成本）；
+    // 坏服务器的最坏等待由 mcp.timeoutMs 界定，与交互路径同一上限。
+    const mcpStageRegistry = createDefaultToolRegistry([], registryOptions)
+    const mcpRefs = { mcpManager: null } as RuntimeRefs
+    await initializeMcp(cfg, mcpStageRegistry, mcpRefs)
+    const mcpTools = mcpStageRegistry.getAll()
+
     const result = await runHeadless({
       prompt: effectivePrompt,
       json: parsed.json,
@@ -472,6 +485,10 @@ async function main() {
 
         // Register plugin tools (loaded during startup, already conflict-checked)
         for (const tool of pluginTools) {
+          toolRegistry.register(tool)
+        }
+        // Register MCP tools (connected before runHeadless; empty when no MCP configured)
+        for (const tool of mcpTools) {
           toolRegistry.register(tool)
         }
         for (const name of pluginResult.suppressTools) {
@@ -661,6 +678,10 @@ async function main() {
     const exitCode = parsed.goal
       ? (goalTrackerRef.current?.isGoalAchieved() ? 0 : 1)
       : result.exitCode
+    // 无头一次性进程：stdio MCP 子进程会挂住事件循环——退出前显式拆掉
+    // （交互路径的等价收尾挂在 shutdown handler 上，无头分支不走那条路）。
+    try { mcpRefs.mcpManager?.killChildrenSync?.() } catch { /* best-effort */ }
+    try { await mcpRefs.mcpManager?.shutdown?.() } catch { /* best-effort */ }
     process.exit(exitCode)
   }
 
@@ -876,28 +897,22 @@ async function main() {
     contextWindow: ctx!.agent.config.contextWindow,
     recordUsage: (usage, model) => ctx?.agent.recordSidePathUsage('side-question', usage, model),
   }, { question, onDelta }))
-  // Plan submit 成功后自动弹出审批面板（替代手动 /plan-approve）。
-  ctx!.agent.onPlanApprovalRequested = (info) => {
-    // 工具执行期间直接推 overlay 可能与 turn 收尾渲染冲突，defer 到下一事件循环。
-    // 预览摘要在开面板时一次性读取（避免渲染路径每帧读盘；修订重提同 slug 也能取到新内容）。
-    setImmediate(() => tuiApp.openPlanApprovalPanel(info, planReviewViewFor(info.slug)))
-    // Goal 模式倒计时自动批准（2026-07-24，与 sidecar 同语义同 env）：
-    // goal 激活 + 窗口开启才武装；非 goal 会话保持纯手动审批。
+  const attachDecisions = () => attachDecisionSession(tuiApp, () => ctx!.agent, slug => {
     const delayMs = resolveAutoApproveMs()
-    if (shouldArm(ctx!.refs.goalTrackerRef.current?.isActive() === true, delayMs)) {
-      tuiApp.armPlanAutoApprove(info.slug, delayMs)
-    }
-  }
+    if (shouldArm(ctx!.refs.goalTrackerRef.current?.isActive() === true, delayMs)) tuiApp.armPlanAutoApprove(slug, delayMs)
+  })
+  ctx!.onAgentRuntimeChanged = attachDecisions
+  attachDecisions()
   // 倒计时触发守卫：idle（非运行中）+ goal 仍激活 + 计划仍 submitted。
   tuiApp.planAutoApproveGuardsProvider = () => ({
-    idle: !tuiApp.isAgentBusy,
+    idle: !tuiApp.isAgentBusy && !tuiApp.pendingAskFlow,
     goalActive: ctx!.refs.goalTrackerRef.current?.isActive() === true,
     planStillSubmitted: listPlansSync(ctx!.agent.cwd).find(p => p.slug === tuiApp.planAutoApproveSlug)?.status === 'submitted',
   })
   // 倒计时到期 → 自动批准并执行（默认方案：Recommended 否则首个，与面板 approve 同逻辑）。
   tuiApp.onPlanAutoApproveFire = (slug) => {
     const plan = listPlansSync(ctx!.agent.cwd).find(p => p.slug === slug)
-    const option = plan?.options?.find(o => o.label.includes('Recommended')) ?? plan?.options?.[0]
+    const option = plan?.options?.find(o => o.recommended === true || (o.recommended === undefined && o.label.includes('Recommended'))) ?? plan?.options?.[0]
     tuiApp.commitStatic(`⏳ Goal 模式：倒计时结束，自动批准计划「${plan?.title ?? slug}」并执行`)
     void approvePlanAndKickoff(
       {
@@ -909,10 +924,6 @@ async function main() {
       slug,
       option?.label,
     )
-  }
-  // ask_user_question 含单选选项时自动弹出选择面板（替代手动输入编号）。
-  ctx!.agent.onAskUserQuestionRequested = (info) => {
-    setImmediate(() => tuiApp.openAskUserQuestionPanel(info))
   }
   const initialDomain = resolveInitialDomainName({
     agentDomainName: ctx!.agent.getSessionDomain()?.name,
@@ -1055,20 +1066,6 @@ async function main() {
       return { content: stripPlanChrome(doc.content).join('\n'), title: `计划预览: 「${doc.title}」· ${doc.slug}`, footerHints }
     } catch {
       return { content: `无法读取计划文件（${preview.draftPath ?? preview.slug}）。文件可能已被移动或删除。`, title: '计划预览', footerHints }
-    }
-  }
-  // 钉底审阅卡：剥 chrome 后的全文 + 本地提交日期。读不到计划则只画标题。
-  const planReviewViewFor = (slug: string): { body?: string; date?: string } => {
-    try {
-      const doc = listPlansSync(ctx!.agent.cwd).find(p => p.slug === slug)
-      if (!doc) return {}
-      const body = stripPlanChrome(doc.content).join('\n')
-      return {
-        ...(body.trim() ? { body } : {}),
-        date: formatPlanReviewDate(doc.createdAt),
-      }
-    } catch {
-      return {}
     }
   }
   // /disconnect 两段式面板的闭包状态：列表页选定目标后进入确认页。
@@ -1330,55 +1327,6 @@ async function main() {
           choices: toRetargetChoiceEntries(buildRetargetEntries(cfg.provider.providers, cfg.provider.default)),
           selectedIndex: 0,
         }
-      }
-      if (tuiApp.choicePanelKind === 'plan-approval') {
-        const info = tuiApp.pendingPlanApproval
-        const title = info?.title ?? '待审批计划'
-        // 标题区附计划正文预览（开面板时提取，剥掉 frontmatter/留痕行的前 6 行）。
-        const excerpt = tuiApp.planApprovalExcerpt
-        // Goal 倒计时行：每次渲染重算剩余秒（armed 时 1s tick 驱动重绘）。
-        const countdown = tuiApp.planAutoApproveRemainSec
-        const countdownLine = countdown !== undefined
-          ? `\n⏳ Goal 模式：${countdown}s 后自动批准（批准/驳回即取消；Esc 收起不取消）`
-          : ''
-        const fullTitle = excerpt
-          ? `计划审批 / Plan Approval\n「${title}」${countdownLine}\n──\n${excerpt}`
-          : `计划审批 / Plan Approval\n「${title}」${countdownLine}`
-        const entries = []
-        const options = info?.options ?? []
-        if (options.length > 1) {
-          // 多方案计划：每个方案一个「批准并执行」条目，Recommended 带 ★ 并预定位光标。
-          for (const [i, o] of options.entries()) {
-            const recommended = /recommended/i.test(o.label)
-            const cleanLabel = o.label.replace(/\s*[(（]?\s*recommended\s*[)）]?/i, '').trim()
-            entries.push({
-              id: `approve:${i}`,
-              label: `批准并执行 — ${cleanLabel}`,
-              description: o.description || `以方案「${cleanLabel}」执行计划`,
-              recommended,
-            })
-          }
-        } else {
-          entries.push({ id: 'approve', label: '批准并执行', description: `执行计划「${title}」`, recommended: true })
-        }
-        entries.push(
-          { id: 'reject', label: '驳回修订', description: '标记为 REJECTED，agent 可继续修改' },
-          { id: 'reject-exit', label: '驳回并退出计划模式', description: '驳回计划并退出 plan mode' },
-          { id: '__reject_comment__', label: '驳回并填写反馈…', description: '输入反馈后驳回，agent 可继续修订' },
-        )
-        const recommendedIndex = Math.max(0, entries.findIndex(e => e.recommended))
-        return {
-          title: fullTitle,
-          choices: entries,
-          selectedIndex: recommendedIndex,
-          inputSubMode: tuiApp.getChoicePanelInputState(),
-          footerHints: [['↑↓', '选择'], ['Enter', '确认'], ['v', '预览全文'], ['Esc', '取消']],
-        }
-      }
-      if (tuiApp.choicePanelKind === 'ask-user-question') {
-        // ask 面板走 app.ts 的 Tab 化专用渲染器（buildAskPanelData），
-        // 不经过通用 choicePanelData 管线——这里是不可达的兜底。
-        return { title: '', choices: [], selectedIndex: 0 }
       }
       const current = ctx?.agent.getReasoningEffort() ?? ctx?.agent.config.reasoningEffort ?? 'high'
       const isAuto = ctx?.agent.config.autoReasoning && !ctx?.agent.userReasoningOverride
@@ -1651,60 +1599,6 @@ async function main() {
       }
       return
     }
-    if (tuiApp.choicePanelKind === 'plan-approval') {
-      // 计划审批面板回调：approve / approve:<idx> / reject / reject-exit。
-      const info = tuiApp.pendingPlanApproval
-      const rejectComment = tuiApp.choicePanelInputBuffer.trim()
-      // 任何审批决策 = 用户参与——取消倒计时自动批准
-      tuiApp.cancelPlanAutoApprove()
-      tuiApp.clearPlanReviewState()
-      if (!info) return
-      const deps = {
-        cwd: ctx!.agent.cwd,
-        agent: ctx!.agent,
-        submitToAgent: (prompt: string) => { tuiApp.submitText(prompt) },
-        notify: (content: string, isError?: boolean) => tuiApp.commitStatic(content, { isError }),
-      }
-      if (id === 'approve') {
-        const option = info.options?.find(o => o.label.includes('Recommended')) ?? info.options?.[0]
-        void approvePlanAndKickoff(deps, info.slug, option?.label)
-      } else if (id.startsWith('approve:')) {
-        // 多方案计划：面板内选定的方案（索引编码在条目 id 里）。
-        const idx = Number(id.slice('approve:'.length))
-        const option = Number.isInteger(idx) ? info.options?.[idx] : undefined
-        void approvePlanAndKickoff(deps, info.slug, option?.label)
-      } else if (id === 'reject') {
-        void rejectPlan(ctx!.agent.cwd, info.slug).then(doc => {
-          deps.notify(doc ? `计划「${info.title}」已驳回，可继续修订。` : '计划不存在或已被删除。')
-        })
-      } else if (id === 'reject-exit') {
-        void rejectPlan(ctx!.agent.cwd, info.slug).then(doc => {
-          ctx!.agent.exitPlanMode()
-          deps.notify(doc ? `计划「${info.title}」已驳回，已退出 plan mode。` : '已退出 plan mode。')
-        })
-      } else if (id === '__reject_comment__') {
-        void rejectPlan(ctx!.agent.cwd, info.slug).then(doc => {
-          if (!doc) {
-            deps.notify('计划不存在或已被删除。')
-            return
-          }
-          deps.notify(`计划「${info.title}」已驳回${rejectComment ? '（含反馈）' : ''}，可继续修订。`)
-          if (rejectComment) {
-            deps.submitToAgent(
-              `User rejected the plan. Feedback:\n\n${rejectComment}\n\nRevise the plan in \`.rivet/plans/${info.slug}.md\`, then call plan action=submit again.`,
-            )
-          }
-        })
-      }
-      return
-    }
-    if (tuiApp.choicePanelKind === 'ask-user-question') {
-      // Handled inside TuiApp.resolveAskChoice / advanceAskFlow (multi-question).
-      // Legacy single-shot path should not double-submit via this callback.
-      const done = tuiApp.resolveAskChoice(id)
-      if (!done) return
-      return
-    }
     // Effort 选择面板回车回调。
     ctx!.agent.setReasoningEffort(id as import('./agent/auto-reasoning.js').ReasoningEffort | 'auto')
     const label = id === 'auto' ? 'Auto（按任务复杂度自动选档）' : id
@@ -1928,13 +1822,13 @@ async function main() {
   // ── Wire agent → TuiApp ──────────────────────────────────────
   // 消息队列已收编进 TuiApp：streaming 时 Enter 由 TuiApp 入队（steerBuffer），
   // onSteerDrain 由 TuiApp callbacks 真实 drain，此处无需外层 override。
-  app.onSubmit((text, images) => {
+  app.onSubmit((text, images, options) => {
     const trimmed = text.trim()
     if (!trimmed) return
 
     // 将 slash 命令解析为 agent prompt（对齐 Ink resolveAppPromptInput）。
     // /review → "deliver_task(...)"；未知 slash → null → 显示错误提示。
-    const resolved = resolveAppPromptInput(trimmed, process.cwd(), app!.getCommandPredicate())
+    const resolved = options?.literalText ? { prompt: trimmed } : resolveAppPromptInput(trimmed, process.cwd(), app!.getCommandPredicate())
     if (resolved === null) {
       // Backstop: a registered slash command (e.g. /plan-approve) may slip past
       // normal dispatch. Give the registry one more chance before reporting
@@ -1991,7 +1885,7 @@ async function main() {
     const tapped = sinks.length > 0
       ? tapAgentCallbacks(base, (event) => { for (const s of sinks) s(event) })
       : null
-    ctx!.agent.run(resolved.prompt, tapped ?? base, images)
+    ctx!.agent.run(resolved.prompt, tapped ?? base, images, options ?? (resolved.prompt !== trimmed ? { origin: 'runtime_command' } : { origin: 'human' }))
       .then((outcome) => {
         // re-entry guard 命中：本次没发起任何轮次，而 TUI 已把自己置成 busy。
         // 不复位的话那个 busy 再没人清，后续消息会全进 steer 队列等一个不存在的

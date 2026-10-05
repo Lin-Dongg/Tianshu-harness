@@ -124,7 +124,7 @@ export function listTrustedProjectEntries(): { path: string; trustedAt: string }
  *  边界重建，避免刷屏。 */
 const noticed = new Set<string>()
 export function notifyUntrustedOnce(
-  kind: 'hooks' | 'config' | 'project-instructions',
+  kind: 'hooks' | 'config' | 'project-instructions' | 'project-state',
   projectDir: string,
   strippedKeys?: string[],
 ): void {
@@ -139,7 +139,9 @@ export function notifyUntrustedOnce(
     ? `检测到项目 hooks（${join(projectDir, '.rivet', 'hooks.json')}），项目未授信，已跳过执行`
     : kind === 'project-instructions'
       ? `检测到项目指令（${join(projectDir, 'AGENTS.md')} / ${join(projectDir, '.rivet.md')}），项目未授信，已跳过注入——未进入模型上下文`
-      : `检测到项目配置（${join(projectDir, '.rivet-config.json')}），项目未授信，其中安全敏感键（${keyList}）已忽略`
+      : kind === 'project-state'
+        ? `检测到项目状态文件（${join(projectDir, '.rivet', 'knowledge', 'memory.jsonl')} / ${join(projectDir, '.rivet', 'knowledge', 'manifest.md')}），项目未授信，已跳过注入——未进入模型上下文`
+        : `检测到项目配置（${join(projectDir, '.rivet-config.json')}），项目未授信，其中安全敏感键（${keyList}）已忽略`
   console.error(`[rivet] ${what}——${how}。信任决策存于 ${trustStorePath()}，绝不写回仓库。`)
 }
 
@@ -161,6 +163,26 @@ export function hasProjectInstructionFiles(cwd: string): boolean {
 export function projectInstructionsAllowed(cwd: string): boolean {
   if (isProjectTrusted(cwd)) return true
   if (hasProjectInstructionFiles(cwd)) notifyUntrustedOnce('project-instructions', cwd)
+  return false
+}
+
+/** 目录内是否存在项目状态注入文件（.rivet/knowledge 的记忆与索引）——供未受信时的跳过提示判定。 */
+export function hasProjectStateInjectionFiles(cwd: string): boolean {
+  const knowledgeDir = join(cwd, '.rivet', 'knowledge')
+  return existsSync(join(knowledgeDir, 'memory.jsonl')) || existsSync(join(knowledgeDir, 'manifest.md'))
+}
+
+/**
+ * 项目状态（.rivet/knowledge/memory.jsonl 项目记忆、manifest.md 知识索引）是否允许
+ * 进入模型上下文 —— #218 信任门的 .rivet 状态面扩展（2026-10-03 安全报告，链 A/B）。
+ *
+ * 这两个文件物理上位于仓库内、可随仓库分发，却以权威化框架（<project-memory> 的
+ * user_constraint / manifest 路由索引）常驻冻结前缀——与 AGENTS.md 同属「随仓库
+ * 分发的指令」注入面。未受信目录一律不读不注入，与 projectInstructionsAllowed 同契约。
+ */
+export function projectStateAllowed(cwd: string): boolean {
+  if (isProjectTrusted(cwd)) return true
+  if (hasProjectStateInjectionFiles(cwd)) notifyUntrustedOnce('project-state', cwd)
   return false
 }
 

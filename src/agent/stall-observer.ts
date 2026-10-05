@@ -42,6 +42,48 @@ export interface StallActivity {
 const activityByKey = new Map<string, StallActivity>()
 const MAX_ACTIVITY_KEYS = 1000
 
+/** 一次真实打点的时序记录（loop-lag 卡顿归因用）。 */
+export interface RecentActivity {
+  /** 打点时刻（epoch ms）。 */
+  ts: number
+  /** 会话维度 key。 */
+  key: string
+  /** 活动来源，如 'tool:write_file:start' / 'event:tool_result'。 */
+  source: string
+}
+
+/** 最近活动环形缓冲容量。 */
+const RECENT_ACTIVITY_CAPACITY = 64
+const recentActivities: RecentActivity[] = []
+
+/**
+ * 写入环形缓冲。**只记守卫通过的真实打点**——被守卫拒绝的调用（空闲会话的
+ * 迟到 hook、过期 generation、无上下文）不代表任何进展，混进来会把「卡顿前
+ * 在跑什么」归因到一段并未推进的活动上。缓冲只是观测面，不做背压——超过
+ * 容量就从最老的开始丢（64 条足以覆盖卡顿前 1 秒的活动密度）。
+ */
+function recordRecentActivity(key: string, source: string, ts: number): void {
+  recentActivities.push({ ts, key, source })
+  if (recentActivities.length > RECENT_ACTIVITY_CAPACITY) {
+    recentActivities.splice(0, recentActivities.length - RECENT_ACTIVITY_CAPACITY)
+  }
+}
+
+/**
+ * 读取最近活动——loop-lag 卡顿归因：卡顿的**开始时刻**之后事件循环已停摆，
+ * 用「现在」当右界只会取到空集，所以右界可传。
+ *
+ * @param lookbackMs 回顾窗口 ms（相对 anchor 往前取多久）。
+ * @param anchorMs   窗口右界（绝对 epoch ms，缺省 `Date.now()`）。卡顿归因传
+ *   「卡顿开始时刻」，返回 `[anchor - lookbackMs, anchor]` 内的打点，即
+ *   「卡顿开始前 lookbackMs 内碰过的活动」。
+ */
+export function getRecentActivities(lookbackMs: number, anchorMs?: number): RecentActivity[] {
+  const anchor = anchorMs ?? Date.now()
+  const since = anchor - Math.max(0, lookbackMs)
+  return recentActivities.filter((a) => a.ts >= since && a.ts <= anchor)
+}
+
 /** 记录一次回合级活动。key：会话维度（server 用 sessionId，CLI 用会话 id）；
  *  source 示例：'event:tool_result' / 'tool:write_file:start'。首次打点时懒
  *  安装默认观察器（60s tick / 150s 阈值——高于 120s 工具超时，避免慢工具
@@ -52,7 +94,9 @@ export function touchActivity(key: string, source: string): void {
   const current = activityByKey.get(key)
   const context = runContext.getStore()
   if (!current || current.idle || context?.key !== key || context.generation !== current.generation) return
-  activityByKey.set(key, { ...current, ts: Date.now(), source })
+  const ts = Date.now()
+  activityByKey.set(key, { ...current, ts, source })
+  recordRecentActivity(key, source, ts)
 }
 
 export function setActivityPhase(key: string, phase: StallActivity['phase'], deadlineAt?: number): void {
@@ -118,11 +162,12 @@ export function listStallActivities(): Array<{ key: string; activity: StallActiv
     .sort((a, b) => b.activity.ts - a.activity.ts)
 }
 
-/** 测试用：清空活动表与已安装观察器，保证用例间隔离。 */
+/** 测试用：清空活动表、归因缓冲与已安装观察器，保证用例间隔离。 */
 export function _resetStallObserverForTest(): void {
   installed?.dispose()
   installed = null
   activityByKey.clear()
+  recentActivities.length = 0
 }
 
 export interface StallObserverOptions {

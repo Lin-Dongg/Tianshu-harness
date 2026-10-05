@@ -43,6 +43,7 @@ export async function runGateCompletion(
     messages: [{ role: 'user' as const, content: prompt }],
     max_tokens: 2048,
     stream: true,
+    diagnostics: { purpose: 'essence_gate' as const },
   }
   const chunks: string[] = []
   let streamError: Error | undefined

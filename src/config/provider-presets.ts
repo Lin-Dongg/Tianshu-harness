@@ -1,8 +1,10 @@
+import { DEEPSEEK_PEAK_PRICING } from '../utils/deepseek-pricing.js'
 import type { ModelConfig, ProviderConfig } from './schema.js'
 import { isLoopbackBaseUrl } from './local-endpoint.js'
 import { VOLC_PRESETS } from './provider-presets-volc.js'
+import { AGNES_PRESETS } from './provider-presets-agnes.js'
 
-export type ProviderPresetKey = 'deepseek' | 'glm' | 'kimi' | 'opencode-go' | 'opencode-go-anthropic' | 'mimo' | 'mimo-api' | 'minimax' | 'codex' | 'openai' | 'grok' | 'siliconflow' | 'stepfun' | 'longcat' | 'ccswitch' | 'zhipu-vision' | 'dashscope' | 'volc' | 'volc-plan' | 'volc-plan-anthropic' | 'openrouter' | 'relay' | 'ollama'
+export type ProviderPresetKey = 'deepseek' | 'glm' | 'kimi' | 'opencode-go' | 'opencode-go-anthropic' | 'mimo' | 'mimo-api' | 'minimax' | 'codex' | 'openai' | 'grok' | 'siliconflow' | 'stepfun' | 'agnes' | 'longcat' | 'ccswitch' | 'zhipu-vision' | 'dashscope' | 'volc' | 'volc-plan' | 'volc-plan-anthropic' | 'openrouter' | 'relay' | 'ollama' | 'gemini'
 
 /** 一种计费模式对应一个官方 Base URL（如百炼的按量计费 / token plan）。 */
 export interface ProviderBillingMode {
@@ -34,12 +36,13 @@ export const PROVIDER_PRESETS: Record<ProviderPresetKey, ProviderPreset> = {
   deepseek: {
     key: 'deepseek',
     label: 'DeepSeek',
-    description: '官方 DeepSeek：1M 上下文，多档可选——默认快速档，深度推理可切旗舰档',
-    // 2026-09-13：官方改口径——v4-pro 不再下架、继续提供服务（用户转达官方声明）。
-    // ea8d9c92c 的退役据此撤销：条目恢复，deepseek-flash 保持 strong（多模态/视觉
-    // 是真能力，两个 strong 档并存合理——路由按 tier 取池，成本差由席位自己的预算约束）。
-    // defaultModelId 维持 deepseek-v4-flash 不变（默认档走低价）。
-    defaultModelId: 'deepseek-v4-flash',
+    description: '官方 DeepSeek：1M 上下文。默认 DeepSeek 4.1 Flash（deepseek-flash），深度推理可切 Pro',
+    // 2026-10-04：官方定价表只列 deepseek-flash（版本 DeepSeek-V4.1-Flash，有视觉）
+    // 与 deepseek-v4-pro。deepseek-v4-flash 已下线，旧名仍可调用但由 V4.1 Flash 承接。
+    // 默认档与首模型改为实际模型名 deepseek-flash。别名 4.1-flash / deepseek-4.1-flash
+    // / v4.1-flash 见 model-aliases。deepseek-flash 保持 strong（视觉是真能力，与
+    // v4-pro 两个 strong 档并存；定价仍是 Flash 档）。
+    defaultModelId: 'deepseek-flash',
     keyUrl: 'https://platform.deepseek.com/api_keys',
     provider: {
       name: 'deepseek',
@@ -62,17 +65,21 @@ export const PROVIDER_PRESETS: Record<ProviderPresetKey, ProviderPreset> = {
       maxTokens: 256_000,
       models: [
         {
-          id: 'deepseek-v4-flash',
-          description: '快速档：能力对标旗舰，成本更低',
+          // 官方模型名 deepseek-flash，版本 DeepSeek-V4.1-Flash。名字里的 flash
+          // 只标定价档位、不代表能力——路由读的是 tier 字段，勿据模型名把它降档。
+          id: 'deepseek-flash',
+          description: 'DeepSeek 4.1 Flash：1M 上下文 + 原生多模态（图像输入）',
           contextWindow: 1_000_000,
           maxTokens: 256_000,
-          reasoningEffort: 'medium',
-          tier: 'cheap',
-          pricing: { input: 1, output: 2, cacheRead: 0.02, cacheWrite: 1 },
+          // 2026-10-05 产品决定：medium → high。4.1 Flash 在 max 档过度推理，
+          // high 已足够支撑 agent 任务的执行与落地（桌面新会话同档默认 high）。
+          reasoningEffort: 'high',
+          tier: 'strong',
+          supportsVision: true,
+          pricing: { ...DEEPSEEK_PEAK_PRICING.flash },
         },
         {
-          // 官方 2026-09-13 改口径：继续提供服务，不下线。恢复 ea8d9c92c 前的条目形态
-          // （顺序也复原——v4-flash 保持首位，defaultModelId 的「默认档排首位」不变量不破）。
+          // 官方 2026-09-13 改口径：继续提供服务，不下线。
           id: 'deepseek-v4-pro',
           description: '旗舰推理档，1M 上下文',
           contextWindow: 1_000_000,
@@ -81,22 +88,7 @@ export const PROVIDER_PRESETS: Record<ProviderPresetKey, ProviderPreset> = {
           // effort routing; users who need max can set it in config / Settings.
           reasoningEffort: 'high',
           tier: 'strong',
-          pricing: { input: 3, output: 6, cacheRead: 0.025, cacheWrite: 3 },
-        },
-        {
-          // 2026-09-10 接入（V4.1 Flash 线，用户指定 id）：1M 上下文 + 原生多模态，
-          // 定价与 v4-flash 同档。图片按尺寸换算 token 计入计费。
-          // 2026-09-11 起承接 strong 档；v4-pro 恢复后两个 strong 档并存（见上）。
-          // 名字里的 "flash" 只标定价档位、不代表能力——路由读的是 tier 字段，
-          // 勿据模型名把它降档。
-          id: 'deepseek-flash',
-          description: '旗舰档：V4.1 线，1M 上下文 + 原生多模态（图像输入）',
-          contextWindow: 1_000_000,
-          maxTokens: 256_000,
-          reasoningEffort: 'medium',
-          tier: 'strong',
-          supportsVision: true,
-          pricing: { input: 1, output: 2, cacheRead: 0.02, cacheWrite: 1 },
+          pricing: { ...DEEPSEEK_PEAK_PRICING.pro },
         },
       ],
       unsupported: [],
@@ -1007,6 +999,7 @@ export const PROVIDER_PRESETS: Record<ProviderPresetKey, ProviderPreset> = {
     },
   },
   ...VOLC_PRESETS,
+  ...AGNES_PRESETS,
   // 阶跃星辰 StepFun —— 官方开放平台，OpenAI 兼容端点（/v1/chat/completions）。
   // 2026-09-23 接入，规格与定价取自官方文档 platform.stepfun.com（模型页 + 定价页）。
   // 推理强度走 reasoning_effort（low/medium/high 三档，无 max）——档位映射声明在
@@ -1084,6 +1077,65 @@ export const PROVIDER_PRESETS: Record<ProviderPresetKey, ProviderPreset> = {
           maxTokens: 8_192,
           reasoningEffort: 'medium',
           tier: 'cheap',
+        },
+      ],
+      unsupported: [],
+    },
+  },
+  // Google Gemini —— 官方**原生**协议，不是 OpenAI 兼容端点。
+  // 端点形态差异是硬性的：模型 id 走 URL 路径（…/v1beta/models/<id>:generateContent）、
+  // 鉴权走 x-goog-api-key、消息体是 contents[].parts[]、系统提示是顶层
+  // systemInstruction、采样参数在 generationConfig、思考在 thinkingConfig。
+  // 兼容层（/v1beta/openai/）能跑单轮对话，但会让 Gemini 3 要求回传的
+  // thought_signature 丢失，多轮工具调用直接 400——所以这里必须走原生。
+  // 对照表与实现见 src/api/gemini-client.ts。
+  gemini: {
+    key: 'gemini',
+    label: 'Google Gemini',
+    description: 'Google 官方 Gemini API：原生协议直连（1M 上下文，原生多模态与思考）',
+    defaultModelId: 'gemini-3.8-flash',
+    keyUrl: 'https://aistudio.google.com/apikey',
+    provider: {
+      name: 'gemini',
+      apiKeyEnv: 'GEMINI_API_KEY',
+      baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+      protocol: 'gemini',
+      capabilities: {
+        cacheControl: false,
+        stripParams: [],
+        toolJsonBug: false,
+        prefixCache: 'none',
+        prefixCompletion: false,
+      },
+      thinking: 'enabled',
+      maxTokens: 65_536,
+      models: [
+        {
+          id: 'gemini-3.8-flash',
+          description: '快速档：1M 上下文，原生多模态（文本/图像），支持思考',
+          contextWindow: 1_048_576,
+          maxTokens: 65_536,
+          reasoningEffort: 'medium',
+          supportsVision: true,
+          tier: 'cheap',
+        },
+        {
+          id: 'gemini-3.5-flash',
+          description: '均衡档：1M 上下文，原生多模态',
+          contextWindow: 1_048_576,
+          maxTokens: 65_536,
+          reasoningEffort: 'medium',
+          supportsVision: true,
+          tier: 'cheap',
+        },
+        {
+          id: 'gemini-3.1-pro-preview',
+          description: '旗舰档：深度推理',
+          contextWindow: 1_048_576,
+          maxTokens: 65_536,
+          reasoningEffort: 'high',
+          supportsVision: true,
+          tier: 'strong',
         },
       ],
       unsupported: [],

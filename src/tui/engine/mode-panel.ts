@@ -7,7 +7,7 @@ import { panelHeader, numberedChoice } from '../format/panel-layout.js'
 import { wrapReadingText } from '../format/reading-layout.js'
 
 const modes: Array<{ id: FrontendPreferences['renderer']; label: string; text: string }> = [
-  { id: 'auto', label: '自动 · 依据终端能力', text: 'Windows、macOS、Linux 的兼容本地终端自动全屏；远程、未知宿主、读屏与 dumb 终端使用经典。当前实际模式可能与偏好不同。' },
+  { id: 'auto', label: '自动 · 原生回滚', text: 'Windows、macOS、Linux 默认使用终端原生回滚，底部局部重绘任务状态与输入。全屏需手动选择；读屏、非交互输出与 dumb 终端保持经典。' },
   { id: 'classic', label: '经典 · 使用终端滚动与复制', text: '正文进入宿主滚动历史；下方保留当前任务、审批和输入。使用宿主的文本选择与复制。' },
   { id: 'fullscreen', label: '全屏 · 固定输入与历史阅读', text: '使用备用屏；输入固定在底部。阅读历史、搜索、选择与复制沿用当前前端键位。退出后恢复宿主终端。' },
 ]

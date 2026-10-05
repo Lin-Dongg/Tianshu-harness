@@ -89,7 +89,7 @@ test('same-size middle rewrite with restored mtime cannot reuse a stale artifact
   } finally { f.cleanup() }
 })
 
-test('disorder, fractional and negative seqs keep the heap scan contract; all delegation survives capacity zero', async () => {
+test('disorder, fractional and negative seqs keep the heap scan contract; zero capacity retains no activity payload', async () => {
   const f = fixture()
   try {
     for (const seq of [-1, 1.5, 1]) {
@@ -97,7 +97,7 @@ test('disorder, fractional and negative seqs keep the heap scan contract; all de
       const result = await readEventsTailIndexed(f.file, 0)
       assert.equal(result.metrics.mode, 'scan')
       assert.deepEqual(result.tail, parseEventsTailRaw(readFileSync(f.file, 'utf8'), 0))
-      assert.equal(result.tail.events.length, 3)
+      assert.equal(result.tail.events.length, 0)
     }
   } finally { f.cleanup() }
 })
@@ -249,4 +249,23 @@ test('block boundary disorder and count overflow are rejected even with a valid 
     delete block.artifacts[0].id; block.artifacts[0].length = 1
     assert.throws(() => validateBlock(block, blockReference(block)), /artifact ID/, 'artifact shape cannot be mistaken for a delegation reference')
   } finally { f.cleanup() }
+})
+
+
+test('scan, indexed reload and appended suffix enforce bytes while preserving old worker state', async () => {
+  const f=fixture(1300)
+  try {
+    const rows=Array.from({length:1300},(_,i)=>JSON.stringify({seq:i+1,ts:i,type:i===0?'delegation':'text_delta',data:i===0?{workerId:'w',attemptId:'a',status:'running',objective:'old task'}:{text:'汉字🌌'.repeat(80)}}))
+    writeFileSync(f.file,rows.join('\n')+'\n')
+    for(let n=0;n<3;n++) {
+      const {tail}=await readEventsTailIndexed(f.file,5000,{maxEventBytes:1800})
+      assert.ok(tail.events.reduce((sum,e)=>sum+Buffer.byteLength(JSON.stringify(e)),0)<=1800)
+      if(n<2) assert.equal(tail.delegationState?.events[0]?.data.objective,'old task')
+      if(n===0) clearEventsSummaryCache(f.file)
+      if(n===1) appendFileSync(f.file,JSON.stringify({seq:1301,ts:1301,type:'delegation',data:{workerId:'w',attemptId:'a',status:'failed',text:'🌌'.repeat(500)}})+'\n')
+    }
+    const {tail}=await readEventsTailIndexed(f.file,5000,{maxEventBytes:1800})
+    assert.deepEqual(tail.events,[], 'oversized final row establishes an empty replay window')
+    assert.deepEqual(tail.delegationState?.events,[])
+  } finally {f.cleanup()}
 })

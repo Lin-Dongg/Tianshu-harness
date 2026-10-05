@@ -105,6 +105,11 @@ export interface CompactCircuitBreakerState {
 // ─── Compact Event ────────────────────────────────────────────
 
 export interface CompactEvent {
+  rewriteTransactionId?: string
+  beforeDigest?: string
+  afterDigest?: string
+  status?: 'committed' | 'rejected'
+  artifactId?: string
   turn: number
   tier: CompactTier
   reason: string
@@ -155,6 +160,7 @@ export interface SessionMemoryState {
 }
 
 export interface SessionMetadata {
+  workspaceRoots?: string[]
   sessionId: string
   /** ISO timestamp when the session was first created */
   createdAt: number

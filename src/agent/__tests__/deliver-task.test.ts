@@ -60,7 +60,7 @@ function makeContext(opts: {
   })
   const ledger = createTaskLedger({ taskId: opts.taskId })
   for (const f of opts.ownedFiles) ledger.record({ type: 'file_write', path: f })
-  for (const v of (opts.verifications ?? [])) ledger.record({ type: 'verification', command: v.command, status: v.status, meta: v.meta })
+  for (const v of (opts.verifications ?? [])) ledger.record({ type: 'verification', command: v.command, status: v.status, meta: { targetFiles: opts.ownedFiles, ...v.meta } })
   const ownership = createOwnershipLedger({ baseline, taskLedger: ledger })
   ownership.autoOwnFromLedger()
   const attribution = createVerificationAttribution({ ownership })
@@ -187,7 +187,7 @@ describe('deliver-task — semantic task delivery tool', () => {
     }
   })
 
-  it('W1: force=true overrides module_unverified block (逃生口)', async () => {
+  it('W1: force=true cannot waive missing module verification', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'w1-force-'))
     try {
       mkdirSync(join(dir, 'src', '__tests__'), { recursive: true })
@@ -206,9 +206,9 @@ describe('deliver-task — semantic task delivery tool', () => {
       })
 
       const result = await tool.execute({ ...params, cwd: dir, input: { commit: true, force: true, message: 'fix: test' } })
-      assert.equal(result.isError ?? false, false)
-      assert.equal(committed, true)
-      assert.ok(result.content.includes('module_unverified overridden'))
+      assert.equal(result.isError, true)
+      assert.equal(committed, false)
+      assert.ok(result.content.includes('does not waive missing verification'))
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
@@ -1600,7 +1600,7 @@ Do not declare a streamed response duplicate in the middle of the stream.
       const result = await tool.execute(params)
 
       assert.match(result.content, /Delivery Gate: GREEN/)
-      assert.match(result.content, /预存量失败：1 条/)
+      assert.match(result.content, /已取代失败：1 条/)
       assert.doesNotMatch(result.content, /Cannot commit/)
     })
 
@@ -3175,5 +3175,89 @@ describe('deliver-task stage markers', () => {
       if (prevDebug !== undefined) process.env.RIVET_DEBUG = prevDebug
     }
     assert.equal(warns.some(w => w.includes('[deliver-task]')), false)
+  })
+})
+
+describe('delivery recovery real tool path', () => {
+  it('does not use unrelated superseded failures to waive an active owned blocker', async () => {
+    let commits = 0
+    const {tool, params} = makeContext({ taskId: 'force-regression', ownedFiles: ['src/a.ts'], dirtyFiles: ['src/a.ts'],
+      verifications: [
+        {command: 'fixed-check', status: 'failed', meta: {scope: 'targeted'}},
+        {command: 'fixed-check', status: 'passed', meta: {scope: 'targeted'}},
+        {command: 'active-check', status: 'failed', meta: {scope: 'targeted'}},
+      ], commitOwnedFiles: () => { commits++; return {ok:true,output:'unexpected'} } })
+    const result = await tool.execute({...params,input:{commit:true,force:true,message:'fix: regression'}})
+    assert.equal(result.isError,true); assert.equal(commits,0)
+    assert.doesNotMatch(result.content,/RED overridden|RED after adoption|改动前已存在/)
+  })
+})
+
+it('no adoption reuses the original decision and clean historical owned files stay out of commits', async () => {
+  let committed: string[] = []
+  const { tool, params, gate } = makeContext({ taskId: 'no-adoption-regression', ownedFiles: ['docs/a.md', 'docs/clean.md'], dirtyFiles: ['docs/a.md'],
+    verifications: [{ command: 'check', status: 'passed', meta: { scope: 'full' } }],
+    commitOwnedFiles: (_cwd, files) => { committed = files; return { ok: true, output: 'created' } }, isAutoReviewOff: true })
+  const getReport = gate.getReport.bind(gate)
+  let reports = 0; gate.getReport = (...args) => { reports++; return getReport(...args) }
+  const result = await tool.execute({ ...params, input: { commit: true, message: 'docs: selected' } })
+  assert.notEqual(result.isError, true); assert.equal(reports, 1)
+  assert.deepEqual(committed, ['docs/a.md'])
+})
+
+it('unknown and blocked checks cannot authorize a code commit even with force', async () => {
+  let commits = 0
+  const { tool, params } = makeContext({ taskId: 'unknown-proof', ownedFiles: ['src/a.ts'], dirtyFiles: ['src/a.ts'],
+    verifications: [{ command: 'npm test | tail -1', status: 'blocked', meta: { scope: 'unknown' } }],
+    commitOwnedFiles: () => { commits++; return { ok: true, output: 'unexpected' } } })
+  const result = await tool.execute({ ...params, input: { commit: true, force: true, message: 'code' } })
+  assert.equal(result.isError, true); assert.equal(commits, 0)
+  assert.match(result.content, /no applicable successful verification/)
+})
+
+describe('issue #356 — 门禁拒绝必须带结构化 errorKind（防文本正则误判为 timeout）', () => {
+  it('git index.lock 拒绝：errorKind=delivery_gate，且不进入 commit 执行器', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'issue356-lock-'))
+    try {
+      mkdirSync(join(dir, '.git'), { recursive: true })
+      writeFileSync(join(dir, '.git', 'index.lock'), '')
+      let commitCalls = 0
+      const { tool, params } = makeContext({
+        taskId: 'issue356-lock',
+        ownedFiles: ['src/a.ts'],
+        dirtyFiles: ['src/a.ts'],
+        // verify 命令刻意含 timeout 字样：返回文本必经 deliver-task.ts:537 回显该命令
+        verifications: [{ command: 'timeout 300 dotnet build', status: 'passed' }],
+        commitOwnedFiles: () => { commitCalls++; return { ok: true, output: 'unexpected' } },
+        disableReviewDeps: true,
+      })
+
+      const result = await tool.execute({ ...params, cwd: dir, input: { commit: true, message: 'fix: scoped delivery' } })
+
+      assert.equal(result.isError, true)
+      assert.ok(result.content.includes('Git index is locked'), '返回文本应含锁提示')
+      assert.ok(result.content.includes('timeout 300 dotnet build'), '污染前提：verify 命令回显确实在返回文本里')
+      assert.equal(result.errorKind, 'delivery_gate', 'issue #356：锁拒绝不得缺 errorKind（否则文本正则按 timeout 重试）')
+      assert.equal(commitCalls, 0, '锁检查先于任何 git 操作——执行器不得被调用')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('scoped commit 失败：errorKind=delivery_gate（重试会重新进入 commit）', async () => {
+    const { tool, params } = makeContext({
+      taskId: 'issue356-commit-fail',
+      ownedFiles: ['src/a.ts'],
+      dirtyFiles: ['src/a.ts'],
+      verifications: [{ command: 'timeout 300 dotnet build', status: 'passed' }],
+      commitOwnedFiles: () => ({ ok: false, output: 'fatal: unable to write new index file' }),
+      disableReviewDeps: true,
+    })
+
+    const result = await tool.execute({ ...params, input: { commit: true, message: 'fix: scoped delivery' } })
+
+    assert.equal(result.isError, true)
+    assert.ok(result.content.includes('Scoped commit failed'))
+    assert.equal(result.errorKind, 'delivery_gate', 'issue #356：commit 失败不得缺 errorKind（否则重试会重复进入 commit）')
   })
 })

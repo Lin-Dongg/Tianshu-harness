@@ -1,6 +1,7 @@
 import type { WorkerResult } from './work-order.js'
 import type { WorkerTranscript } from './worker-session.js'
 import { VERIFY_BASH_RE } from './hooks/self-verify-hook.js'
+import { RUN_TESTS_EXIT_CODE_RE, RUN_TESTS_FAILED_RE } from '../tools/run-tests.js'
 
 /** 能在批末口径（transcript=undefined）下保住 evidenceStatus=verified 的 profile。 
  *  batch-short-circuit.ts 的 DP 义务守卫复用同一事实源，避免硬编码漂移。 */
@@ -15,6 +16,23 @@ const WRITE_PROFILES_ADVISORY = ['patcher']
 /** 交付文本里的"宣称模式"——命中即认为 worker 在报告验证结论。 */
 const CLAIM_RE = /全绿|已修复|(?:typecheck|类型检查)\s*(?:干净|clean|passed)|\b\d+\s*\/\s*\d+\s*(?:通过|passed|pass|全绿)|\btests?\s+(?:pass(?:ed|ing)?|green)\b|所有测试通过/i
 
+/** run_tests 工具结果/错误的失败特征——复用 run-tests.ts 的共享正则（改文案
+ *  必须与消费方同步，禁止两边各自手抄）。
+ *
+ *  为什么需要它：spawn 失败（如 Windows 无 pytest → `spawn pytest ENOENT`）的
+ *  err.message 会进 transcript.errors，但文本不含 'run_tests' 字样，旧判据漏判
+ *  → blocked 工单被误补 verification.status='passed'，台账自相矛盾。
+ *  只收「明确失败」特征，模糊地带保守不计：失败计数须 > 0（formatOutput 恒带
+ *  「N 失败」，0 是成功形态），退出码须非 0。 */
+function isFailedRunTestsEvidence(text: string): boolean {
+  if (/\bENOENT\b/.test(text)) return true
+  const failed = text.match(RUN_TESTS_FAILED_RE)
+  if (failed && Number(failed[1]) > 0) return true
+  const exit = text.match(RUN_TESTS_EXIT_CODE_RE)
+  if (exit && Number(exit[1]) !== 0) return true
+  return false
+}
+
 /** transcript 取证：是否有真实且未失败的验证执行痕迹（run_tests 或验证形状的 bash）。 */
 function provenVerification(transcript: WorkerTranscript): { proven: true } | { proven: false; reason: 'missing' | 'errored' } {
   const ranTests = transcript.toolUses.includes('run_tests')
@@ -26,10 +44,15 @@ function provenVerification(transcript: WorkerTranscript): { proven: true } | { 
   const failedVerifyBash = (transcript.failedBashCommands ?? []).filter(cmd => VERIFY_BASH_RE.test(cmd))
   const verifyBashSucceeded = verifyBashRuns.length > failedVerifyBash.length
 
-  // run_tests 报错检查（沿用 adversarial_verifier 的纵深检查：匹配错误串而非
-  // 按索引对位，容忍乱序）。
-  const testsErrored = ranTests && transcript.errors.some(e =>
-    e.includes('run_tests') || e.includes('Test run failed'),
+  // run_tests 报错检查（纵深：既匹配错误串，也匹配失败特征；后者覆盖 spawn
+  // ENOENT / 失败计数 / 非零退出码——这些文本里不含 'run_tests' 字样，旧判据
+  // 漏判会把 blocked 工单补成 passed。toolResults 当前固件只存工具名，失败
+  // 结果文本进 errors；仍一并扫描以兼容存结果内容的形态）。
+  // toolResults 里的工具名（'run_tests'）不匹配失败特征，故不会误判成功运行。
+  const failureTexts = [...transcript.errors, ...transcript.toolResults]
+  const testsErrored = ranTests && (
+    transcript.errors.some(e => e.includes('run_tests') || e.includes('Test run failed'))
+    || failureTexts.some(isFailedRunTestsEvidence)
   )
   const testsSucceeded = ranTests && !testsErrored
 
@@ -79,11 +102,11 @@ export function reconcileCapturedWorkerFacts(result: WorkerResult, transcript: W
         scope: 'targeted',
       },
     }
-  } else if (!proof.proven && proof.reason === 'errored' && next.verification?.status === 'passed') {
+  } else if (!proof.proven && next.verification?.status === 'passed') {
     next = {
       ...next,
-      verification: { ...next.verification, status: 'failed' },
-      risks: addRisk(next.risks, '系统捕获到验证执行失败（run_tests/验证形状 bash errored），自报 passed 不可信'),
+      verification: { ...next.verification, status: proof.reason === 'errored' ? 'failed' : 'blocked' },
+      risks: addRisk(next.risks, proof.reason === 'errored' ? '系统捕获到验证执行失败（run_tests/验证形状 bash errored），自报 passed 不可信' : '未捕获验证执行，自报 verification passed 不可信'),
     }
   }
 
@@ -112,7 +135,21 @@ export function verifyWorkerEvidence(result: WorkerResult, profile?: string, tra
   // 系统捕获优先（2026-08-01）：有 transcript 先以工具调用痕迹交叉校验自报的
   // changedFiles/verification，再走下游门禁。幂等——worker-session 成功路径已
   // 校过一次的结果在此重校不变；批量二次过闸不带 transcript 时自然跳过。
-  if (transcript) result = reconcileCapturedWorkerFacts(result, transcript)
+  if (transcript) {
+    result = reconcileCapturedWorkerFacts(result, transcript)
+    if (!provenVerification(transcript).proven && CLAIM_RE.test(result.summary)) {
+      const limitation = '【未经执行验证的原始宣称】'
+      result = {
+        ...result,
+        summary: result.summary.startsWith(limitation) ? result.summary : `${limitation}${result.summary}`,
+        risks: addRisk(addRisk(result.risks, '交付文本包含验证宣称（全绿/已修复/N过N）但 transcript 无验证工具执行痕迹 — 宣称未经复现'), '摘要中的验证宣称仅为原始观察，未经实际执行验证；需独立派发有验证工具和预算的任务补证'),
+      }
+    }
+  }
+
+  if (result.changedFiles.length > 0 && result.verification?.status === 'failed') {
+    return { ...result, status: 'failed', evidenceStatus: 'failed', risks: addRisk(result.risks, `worker verification failed: ${result.verification.command}`) }
+  }
 
   // 复现即证明（全星域泛化，2026-07-07）：任何 profile 宣称 verified，只要有
   // transcript 就取证——没有真实 run_tests/验证形状 bash 的执行痕迹 → 降级。
@@ -137,7 +174,7 @@ export function verifyWorkerEvidence(result: WorkerResult, profile?: string, tra
           : `${label} reported verified without running run_tests or verify-shaped bash — 宣称未经复现`
         return {
           ...result,
-          evidenceStatus: 'unverified',
+          evidenceStatus: proof.reason === 'errored' ? 'failed' : 'unverified',
           risks: addRisk(result.risks, risk),
         }
       }

@@ -111,6 +111,7 @@ test('引用计数：首个订阅启动推流，后续复用，全退订才停',
   assert.equal(s.streaming, true)
 
   unsubB()
+  await new Promise(resolve => setImmediate(resolve))
   assert.equal(driver.stopCount, 1)
   assert.equal(s.streaming, false)
 
@@ -126,6 +127,7 @@ test('退订幂等：重复调用不会多停一次推流', async () => {
   unsub()
   unsub()
   unsub()
+  await new Promise(resolve => setImmediate(resolve))
   assert.equal(driver.stopCount, 1)
 
   await closeSession('k3')
@@ -141,7 +143,7 @@ test('帧分发给全部订阅者；单个订阅者抛错不影响其余', async
   await s.subscribeFrames((f) => { got.push(f.seq) })
 
   driver.lastSink?.({ data: 'X', width: 10, height: 10, seq: 7 })
-  assert.deepEqual(got, [7], '坏的订阅者不应吞掉其他订阅者的帧')
+  assert.deepEqual(got, [1], '坏的订阅者不应吞掉其他订阅者的帧')
 
   await closeSession('k4')
 })
@@ -212,9 +214,10 @@ test('W2.1 会话重建：帧订阅跨会话迁移，面板无需重连，退订
   assert.deepEqual(got, [1], '接管时要补一帧（静态页不会自己产帧）')
 
   second.lastSink?.({ data: 'Y', width: 1, height: 1, seq: 8 })
-  assert.deepEqual(got, [1, 8], '面板继续收到新会话的帧，无需重连')
+  assert.deepEqual(got, [1, 2], '面板继续收到新会话的帧，无需重连')
 
   unsub()
+  await new Promise(resolve => setImmediate(resolve))
   assert.equal(second.stopCount, 1, '退订必须停在新 driver 上（旧实现会漏停，浏览器永远编码）')
   assert.equal(s2.streaming, false)
 

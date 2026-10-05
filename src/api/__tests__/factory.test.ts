@@ -6,6 +6,7 @@ import { resolveCapabilities } from '../provider.js'
 import { OpenAIClient } from '../openai-client.js'
 import { AnthropicClient } from '../anthropic-client.js'
 import { ResponsesClient } from '../responses-client.js'
+import { GeminiClient } from '../gemini-client.js'
 import { ApiKeyAuth } from '../../auth/api-key.js'
 import { cloneProviderPreset } from '../../config/provider-presets.js'
 import type { ProviderConfig } from '../../config/schema.js'
@@ -300,6 +301,26 @@ describe('createProviderClient', () => {
       model: 'claude-opus-4-7',
     })
     assert.ok(client instanceof AnthropicClient)
+  })
+
+  it('creates GeminiClient for a custom provider declaring protocol gemini (issue #339)', () => {
+    const geminiProvider: ProviderConfig = {
+      name: 'my-gemini-relay',
+      baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+      protocol: 'gemini',
+      capabilities: {},
+      thinking: 'enabled',
+      maxTokens: 65536,
+      models: [{ id: 'gemini-3.8-flash', contextWindow: 1048576, maxTokens: 65536 }],
+      unsupported: [],
+    }
+    const caps = resolveCapabilities('my-gemini-relay')
+    const client = createProviderClient(geminiProvider, caps, {
+      ...runtimeParams,
+      model: 'gemini-3.8-flash',
+    })
+
+    assert.ok(client instanceof GeminiClient)
   })
 
   it('schema parses a provider named "anthropic" to protocol anthropic (end-to-end dispatch)', () => {

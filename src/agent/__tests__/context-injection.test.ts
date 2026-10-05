@@ -49,6 +49,17 @@ function makeController(input: {
 }
 
 describe('ContextInjectionController', () => {
+  it('runtime commands cannot become human constraint claims', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rivet-origin-claims-'))
+    const claimStore = new ContextClaimStore(dir, 'session-1')
+    try {
+      const controller = makeController({ claimStore })
+      controller.recordUserInputClaims('Always run tests before delivery; never change the API.', 'runtime_command')
+      assert.equal(claimStore.listClaims().length, 0)
+      controller.recordUserInputClaims('Always run tests before delivery; never change the API.', 'human')
+      assert.ok(claimStore.listClaims().length > 0)
+    } finally { await claimStore.flushWrites(); rmSync(dir, { recursive: true, force: true }) }
+  })
   it('refreshes ledger with user anchors', () => {
     const session = new SessionContext()
     session.addUserMessage('hello')

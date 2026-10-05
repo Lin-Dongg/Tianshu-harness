@@ -30,6 +30,8 @@ export interface UserImageDispatchConfig {
   /** 写回首图描述缓存；缺省 no-op（单测不必造 registry）。 */
   cacheDescription?: (imageId: string, cacheKey: string, description: string) => void
   signal?: AbortSignal
+  recordUsage?: (usage: Partial<import('../api/types.js').Usage>) => void
+  visionModel?: string
 }
 
 export interface UserImageDispatchResult {
@@ -68,8 +70,9 @@ export async function dispatchUserImages(
   // 让主控知道「有图但没读到」而不是静默吞图或整轮 failed。原因落 debugLog。
   // 缓存键必须按**原始** userInput 归类（与 describeImages 内部的模式判定同源）——
   // userInput 下面会被 prepend 改写，故先算好键再改写。
-  const descriptionKey = visionCacheKey(undefined, config.visionModelPrompt, userInput)
+  const descriptionKey = `${config.visionModel ?? 'unknown'}:${visionCacheKey(undefined, config.visionModelPrompt, userInput)}`
   let nextInput = userInput
+  let complete = false
   try {
     const description = await describeImages(config.visionClient, images, {
       prompt: config.visionModelPrompt,
@@ -78,12 +81,14 @@ export async function dispatchUserImages(
       accompanyingText: userInput,
       maxTokens: config.visionModelMaxTokens,
       signal: config.signal,
+      model: config.visionModel, recordUsage: config.recordUsage,
+      onOutcome: outcome => { complete = outcome.complete },
     })
     if (description) {
       nextInput = `[图片描述]\n${description}\n\n${userInput}`
       // 首描述写入首图缓存，供 ask_image 同角度追问命中零调用。
       const firstId = config.registeredIds?.[0]
-      if (firstId) config.cacheDescription?.(firstId, descriptionKey, description)
+      if (firstId && complete && images.length === 1) config.cacheDescription?.(firstId, descriptionKey, description)
     } else {
       nextInput = `[图片桥接提示] 用户发送了 ${images.length} 张图片，但识图模型返回空描述——`
         + `请告知用户重发或检查识图模型配置。\n\n${userInput}`

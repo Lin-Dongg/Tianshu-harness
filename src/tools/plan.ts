@@ -6,6 +6,7 @@
  * (≤25) and eliminates the "which plan tool do I use?" micro-decision.
  */
 
+import { recommendationError } from './ask-user-question.js'
 import type { Tool, ToolCallParams, ToolResult } from './types.js'
 import { writePlan, slugify, stripPlanStatusMarkers, insertPlanStatusMarker, insertPlanModelMarker, isDraftSlug, type PlanOption } from '../plan/plan-store.js'
 import { checkPlanFactAnchors, formatAnchorDrifts, extractPlanAnchors } from '../plan/plan-fact-anchors.js'
@@ -119,7 +120,11 @@ function parseSubmitOptions(raw: unknown): PlanOption[] | undefined {
     const description = (item as { description?: unknown }).description
     if (typeof label !== 'string' || label.trim().length === 0) continue
     if (typeof description !== 'string') continue
-    options.push({ label: label.trim(), description: description.trim() })
+    const detail = item as Record<string, unknown>
+    options.push({ label: label.trim(), description: description.trim(),
+      recommended: detail.recommended === true,
+      ...(typeof detail.recommendation_reason === 'string' ? { recommendationReason: detail.recommendation_reason.trim() } : {}),
+    })
   }
   if (options.length === 0) return undefined
   if (options.length > 3) {
@@ -132,6 +137,8 @@ function parseSubmitOptions(raw: unknown): PlanOption[] | undefined {
     if (RESERVED_OPTION_LABELS.has(key)) throw new Error('Option labels must not use reserved approval labels')
     labels.add(key)
   }
+  const error = recommendationError(options, options.length)
+  if (error) throw new Error(error)
   return options
 }
 
@@ -261,8 +268,10 @@ export const PLAN_TOOL: Tool = {
           items: {
             type: 'object',
             properties: {
-              label: { type: 'string', description: '方案短名（推荐项追加 "(Recommended)"）' },
+              label: { type: 'string', description: '方案短名，无需在标签里附加推荐标记' },
               description: { type: 'string', description: '取舍简要说明' },
+              recommended: { type: 'boolean', description: '多个方案中恰好一个为 true' },
+              recommendation_reason: { type: 'string', description: '推荐理由：为何最符合用户目标及主要取舍' },
             },
             required: ['label', 'description'],
           },
@@ -592,7 +601,7 @@ async function planSubmitExecute(params: ToolCallParams): Promise<ToolResult> {
       ? `\n已记录选项（${submitOptions.length}）。用户可在审批时选择：${submitOptions.map(o => `\`${o.label}\``).join(', ')}`
       : ''
     // Notify the TUI so it can prompt the user with an arrow-key approval panel.
-    params.onPlanSubmitted?.({ slug, title: title.trim(), options: submitOptions })
+    params.onPlanSubmitted?.({ requestId: params.toolUseId, slug, title: title.trim(), options: submitOptions })
     return {
       content: [
         `✅ 计划已提交：**${title.trim()}**`,

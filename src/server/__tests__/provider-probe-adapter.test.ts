@@ -19,6 +19,14 @@ describe('probeForTestKey', () => {
     global.fetch = originalFetch
   })
 
+  it('actual endpoint probe exposes inferred IDs while preserving callable IDs', async () => {
+    global.fetch = mock.fn(async () => fetchResponse(200, { data: [{ id: 'deepseek-v4-flash-0731' }, { id: 'custom-unknown-model' }] })) as typeof fetch
+    const result = await probeForTestKey({ baseUrl: 'https://api.example.com/v1' })
+    assert.deepEqual(result.inferredIds, ['deepseek-v4-flash-0731'])
+    assert.equal(result.descriptors?.[0]?.id, 'deepseek-v4-flash-0731')
+    assert.equal(result.descriptors?.[1]?.contextWindow, undefined)
+  })
+
   it('returns ok with models and alias-backfilled descriptors on a successful /models', async () => {
     global.fetch = mock.fn(async (url: string | URL | Request, init?: RequestInit) => {
       const u = String(url)

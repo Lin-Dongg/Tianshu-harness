@@ -55,6 +55,19 @@ export type SessionStatus = 'idle' | 'running' | 'completed' | 'failed' | 'abort
  * S — autonomy level. Canonical wire definition; the agent runtime re-exports
  * it from src/agent/loop-types.ts.
  */
+export interface ApprovalRequest {
+  requestId: string
+  toolName: string
+  input: Record<string, unknown>
+  pathGrant?: { dir: string; mode: 'read' | 'write' }
+}
+
+/** Current, live interventions; lastSeq fences older approval replay. */
+export interface ApprovalSnapshot {
+  approvals: ApprovalRequest[]
+  lastSeq: number
+}
+
 export type ApprovalMode = 'auto-accept' | 'auto-safe' | 'manual' | 'dangerously-skip-permissions'
 
 /**
@@ -81,6 +94,9 @@ export type AskModeState = 'off' | 'asking'
 //    （getEstimatedTokens = getRealOccupancy，与会话记录 enrichment 同源）。
 //    记录侧只在下拉/push 时现算，长 run 中途环形图百分比最多落后 30s；带上
 //    它之后桌面端百分比与缓存计数同频。旧客户端忽略该字段。
+//  · `stopReason: 'max_tokens'`（2026-10-05）——本轮流式因输出 token 上限被截断
+//    （finish_reason 'length' 归一而来）时携带；桌面/TUI 据此渲染「发『继续』可续」
+//    提醒（dsh 式，截断内容保留在历史里，不自动续写）。正常 end_turn 不携带。
 export type SessionEventType =
   | 'context_budget'
   | 'user'
@@ -99,12 +115,16 @@ export type SessionEventType =
   | 'checkpoint'
   | 'approval_required'
   | 'approval_resolved'
+  | 'approval_snapshot'
   // E4 — client tool delegation (apply_edit / terminal_exec). data: ToolDelegateEventData.
   | 'tool_delegate'
   | 'intent_note'
   | 'delegation'
   | 'artifact'
   | 'status'
+  // data: { error, scope?, kind?, guidance? }。guidance（2026-10-05 additive）=
+  // errorRecoveryGuidance 的「下一步」中文指引——此前只有 TUI 渲染，桌面 error 块
+  // 只有类别标签 + 原文；AbortError（用户动作）不携带。
   | 'error'
   | 'decision_shift'
   | 'rewind'
@@ -140,6 +160,7 @@ export type SessionEventType =
   | 'model_switched'
   | 'domain_changed'
   | 'domain_resolved'
+  | 'domain_usage'
   | 'domain_drift'
   | 'skills_changed'
   // I4 — user-defined .rivet/hooks.json script results.
@@ -161,8 +182,10 @@ export type SessionEventType =
   | 'resume_offer'
   | 'recovery_status'
   // 阶段 2 恢复 — 模型请求中断后本轮重试（按尝试替换）。data: { attempt,
-  // maxAttempts, replaceAttempt: true }。桌面端据此丢弃失败尝试的未完成 partial
-  // （否则与重试输出重复），只留一条「未完成/重试」标记；旧版 UI 忽略即可。
+  // maxAttempts, replaceAttempt: true, category?, message?, nextDelayMs? }。
+  // 桌面端据此丢弃失败尝试的未完成 partial（否则与重试输出重复），只留一条
+  // 「未完成/重试」标记；category/nextDelayMs（2026-10-05 additive）让重试块
+  // 说清「为什么断、等多久」；旧版 UI 忽略即可。
   | 'retry'
   // /handoff 归档完成 — 交接 run 收尾时项目内 .rivet/HANDOFF.md 已拷贝归档到
   // 会话目录 <id>.handoff.md（loadPrevHandoff 注入管线认的位置）。
@@ -187,6 +210,7 @@ export type SessionEventType =
   // started 事件、sidecar 重启后注册表更是全空——前端据此 upsert 并摘除
   // 本地仍 running 但服务端已消失的任务（重启悬挂对账）。
   | 'job_snapshot'
+  | 'delegation_snapshot'
 
 export interface SessionEvent {
   runId?: string
@@ -257,6 +281,7 @@ export interface GoalRolloverView {
 }
 
 export interface SessionRecord {
+  workspaceRoots?: string[]
   goalRollover?: GoalRolloverView
   goalInputs?: { imageIds: string[]; documents: Array<{ id: string; name: string; bytes: number; mime: string }> }
   contextBudget?: ContextBudgetSnapshot
@@ -363,6 +388,8 @@ export interface SessionRecord {
   worktreeBranch?: string
   /** Worktree path on disk (for cleanup on archive/close). */
   worktreePath?: string
+  /** Checkout from which this session's isolated worktree was created. */
+  worktreeOriginCwd?: string
   /** HEAD commit at session creation — diff baseline for the Changes tab (worktree sessions). */
   baselineHead?: string
   /** Worktree branch head at the last successful merge-back. Squash merges
@@ -400,4 +427,18 @@ export interface PlanDraft {
   path: string
   title: string | null
   content: string
+}
+
+export interface DomainUsageResponse {
+  days: 7 | 30
+  totalRuns: number
+  domains: Array<{ key: string; count: number; lastUsedAt: number }>
+  coverage: { partial: boolean; missingRuns: number; unreadableSessions: number; firstRecordedAt: number | null }
+}
+export interface FeaturedRepository { url: string; title: string; description: string }
+export interface ProfileOverview {
+  profileKey: string
+  login: { totalMs: number; trackedSince: number | null }
+  tokens: { total: number; peak: number; activeDays: number; scannedFiles: number } | null
+  repositories: FeaturedRepository[]
 }

@@ -269,82 +269,122 @@ export async function startServer(
   }
 
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
-    const reqHeaders = normalizeHeaders(req)
+    // P0-5 路由异常兜底：此前回调体是裸 async——任一 handler 抛错（现场：
+    // POST /project-templates/apply 对已被删除的目录抛 ENOENT）都会变成无人
+    // catch 的 rejected promise，Node 默认 --unhandled-rejections=throw 直接
+    // 终结整个 sidecar（两次真实崩溃）。这里只兜「单次请求」：未发响应头 →
+    // 500 JSON；已开始流式输出（SSE 等）→ 状态行已出、无法再改 500，直接断开
+    // 该连接。**不**设 process 级 unhandledRejection 网——路由之外的异常仍应
+    // 暴露（吞掉会把真实缺陷变成静默）。
+    try {
+      const reqHeaders = normalizeHeaders(req)
 
-    if (!isHostAllowed(req.headers.host, boundPort)) {
-      res.writeHead(403, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ error: 'Forbidden: Host not allowed' }))
-      return
-    }
-
-    const origin = corsOrigin(reqHeaders)
-    if (req.method === 'OPTIONS') {
-      res.writeHead(204, {
-        ...(origin ? { 'Access-Control-Allow-Origin': origin } : {}),
-        'Access-Control-Allow-Methods': 'GET, POST, DELETE, PUT, PATCH, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-      })
-      res.end()
-      return
-    }
-
-    // P2 Mobile Remote：/mobile 静态挂载在 auth 门前（health 特判旁）。已配
-    // mobileDir → GET/HEAD 免 Bearer 服务前端资产；未配 → 任何 /mobile* 请求
-    // 404（不暴露「未配置」之外的任何信息）。Host 校验在其上已执行——LAN/allowlist
-    // 语义统一适用。API 与 SSE 路径不含 /mobile 前缀，不受此分支影响。
-    const rawUrl = req.url ?? '/'
-    const qIdx = rawUrl.indexOf('?')
-    const cleanUrl = qIdx >= 0 ? rawUrl.slice(0, qIdx) : rawUrl
-    const isMobilePath = cleanUrl === '/mobile' || cleanUrl.startsWith('/mobile/')
-    if (isMobilePath) {
-      if (!mobileRoot) {
-        res.writeHead(404, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'Not found' }))
+      if (!isHostAllowed(req.headers.host, boundPort)) {
+        res.writeHead(403, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Forbidden: Host not allowed' }))
         return
       }
-      if (req.method === 'GET' || req.method === 'HEAD') {
-        // 无尾斜杠的 /mobile → 302 到 /mobile/（保留 query）：mobile.html 的资源
-        // 引用是相对路径（./assets/…），无斜杠 URL 下浏览器把相对路径解析到站点根
-        // （/assets/* 落 API 管线 → 401 白屏）。规范化后相对解析留在 /mobile/ 前缀内。
-        // 审查 2026-09-12 修复；与 alpha 上游行为有意偏差（上游直接 200 返回 HTML）。
-        if (cleanUrl === '/mobile') {
-          const search = qIdx >= 0 ? rawUrl.slice(qIdx) : ''
-          res.writeHead(302, { Location: `/mobile/${search}`, 'Cache-Control': 'no-store' })
-          res.end()
+
+      const origin = corsOrigin(reqHeaders)
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204, {
+          ...(origin ? { 'Access-Control-Allow-Origin': origin } : {}),
+          'Access-Control-Allow-Methods': 'GET, POST, DELETE, PUT, PATCH, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+        })
+        res.end()
+        return
+      }
+
+      // P2 Mobile Remote：/mobile 静态挂载在 auth 门前（health 特判旁）。已配
+      // mobileDir → GET/HEAD 免 Bearer 服务前端资产；未配 → 任何 /mobile* 请求
+      // 404（不暴露「未配置」之外的任何信息）。Host 校验在其上已执行——LAN/allowlist
+      // 语义统一适用。API 与 SSE 路径不含 /mobile 前缀，不受此分支影响。
+      const rawUrl = req.url ?? '/'
+      const qIdx = rawUrl.indexOf('?')
+      const cleanUrl = qIdx >= 0 ? rawUrl.slice(0, qIdx) : rawUrl
+      const isMobilePath = cleanUrl === '/mobile' || cleanUrl.startsWith('/mobile/')
+      if (isMobilePath) {
+        if (!mobileRoot) {
+          res.writeHead(404, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'Not found' }))
           return
         }
-        serveMobileTarget(mobileRoot, cleanUrl, res, origin, mobileRootReal)
+        if (req.method === 'GET' || req.method === 'HEAD') {
+          // 无尾斜杠的 /mobile → 302 到 /mobile/（保留 query）：mobile.html 的资源
+          // 引用是相对路径（./assets/…），无斜杠 URL 下浏览器把相对路径解析到站点根
+          // （/assets/* 落 API 管线 → 401 白屏）。规范化后相对解析留在 /mobile/ 前缀内。
+          // 审查 2026-09-12 修复；与 alpha 上游行为有意偏差（上游直接 200 返回 HTML）。
+          if (cleanUrl === '/mobile') {
+            const search = qIdx >= 0 ? rawUrl.slice(qIdx) : ''
+            res.writeHead(302, { Location: `/mobile/${search}`, 'Cache-Control': 'no-store' })
+            res.end()
+            return
+          }
+          serveMobileTarget(mobileRoot, cleanUrl, res, origin, mobileRootReal)
+          return
+        }
+      }
+
+      // Health endpoint is intentionally not auth-gated — the desktop shell and
+      // Rust monitor probe it from cold-start / token-rotation windows where the
+      // Bearer token may not be available yet. No user data is exposed.
+      // Use startsWith so /health?foo=bar also bypasses auth.
+      const isHealth = req.url?.startsWith('/health') ?? false
+      if (!isHealth && !isAuthorizedRequest({ headers: reqHeaders }, apiToken)) {
+        res.writeHead(401, { 'Content-Type': 'application/json', ...(origin ? { 'Access-Control-Allow-Origin': origin } : {}) })
+        res.end(JSON.stringify({ error: 'Unauthorized' }))
         return
       }
-    }
 
-    // Health endpoint is intentionally not auth-gated — the desktop shell and
-    // Rust monitor probe it from cold-start / token-rotation windows where the
-    // Bearer token may not be available yet. No user data is exposed.
-    // Use startsWith so /health?foo=bar also bypasses auth.
-    const isHealth = req.url?.startsWith('/health') ?? false
-    if (!isHealth && !isAuthorizedRequest({ headers: reqHeaders }, apiToken)) {
-      res.writeHead(401, { 'Content-Type': 'application/json', ...(origin ? { 'Access-Control-Allow-Origin': origin } : {}) })
-      res.end(JSON.stringify({ error: 'Unauthorized' }))
-      return
-    }
+      const body = await readBody(req)
+      if (body === BODY_TOO_LARGE) {
+        res.writeHead(413, { 'Content-Type': 'application/json', ...(origin ? { 'Access-Control-Allow-Origin': origin } : {}) })
+        res.end(JSON.stringify({ error: 'Request body too large' }))
+        return
+      }
 
-    const body = await readBody(req)
-    if (body === BODY_TOO_LARGE) {
-      res.writeHead(413, { 'Content-Type': 'application/json', ...(origin ? { 'Access-Control-Allow-Origin': origin } : {}) })
-      res.end(JSON.stringify({ error: 'Request body too large' }))
-      return
+      const result = await router(req.method ?? 'GET', req.url ?? '/', body, reqHeaders, res)
+      if (result.handled) return
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        ...(origin ? { 'Access-Control-Allow-Origin': origin } : {}),
+        ...result.headers,
+      }
+      // 2026-10-04 收编 PR #350：序列化提前到 writeHead 之前——cyclic body 等
+      // stringify 失败时 headersSent 仍为 false，走 500 JSON 而非断连。
+      const responseBody = result.body ? JSON.stringify(result.body) : ''
+      res.writeHead(result.status, headers)
+      res.end(responseBody)
+    } catch (error) {
+      serverLogger.error('[server] request handler error', {
+        method: req.method,
+        url: req.url,
+        ...errorContext(error),
+      })
+      if (res.headersSent) {
+        // 流式响应（SSE）已开始：状态行已发出，500 无法替换——断开该连接，
+        // 让客户端立刻看到中断而非永远挂在半条流上。
+        res.destroy()
+        return
+      }
+      let origin: string | undefined
+      try { origin = corsOrigin(normalizeHeaders(req)) } catch { origin = undefined }
+      // 2026-10-04 收编 PR #350：malformed URL encoding（decodeURIComponent 等
+      // 抛 URIError）是客户端错误——返回 400 而非 500（现场：provider-key 路由
+      // 的路径参数解码）。dev 的 P0-5 兜底只覆盖了 500/destroy/cors 面。
+      const malformedUrl = error instanceof URIError
+      try {
+        res.writeHead(malformedUrl ? 400 : 500, {
+          'Content-Type': 'application/json',
+          ...(origin ? { 'Access-Control-Allow-Origin': origin } : {}),
+        })
+        res.end(JSON.stringify({ error: malformedUrl ? 'Malformed URL encoding' : 'Internal server error' }))
+      } catch {
+        // 客户端已断开/套接字已失效——写响应失败本身不再逃逸。
+        res.destroy()
+      }
     }
-
-    const result = await router(req.method ?? 'GET', req.url ?? '/', body, reqHeaders, res)
-    if (result.handled) return
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      ...(origin ? { 'Access-Control-Allow-Origin': origin } : {}),
-      ...result.headers,
-    }
-    res.writeHead(result.status, headers)
-    res.end(result.body ? JSON.stringify(result.body) : '')
   })
 
   let boundPort = port

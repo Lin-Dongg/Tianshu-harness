@@ -1,10 +1,11 @@
+import {setBrowserOwner} from '../../tools/browser-debug/control.js'
 /**
  * /browser/sessions | /browser/live/:key | /browser/input — 实时视图路由层。
  *
  * 会话用注入桩替换（真浏览器另由 browser-debug 的集成冒烟覆盖）；这里只断言
  * 路由形状、鉴权、建连补帧与输入回传的分支。SSE 用最小 ServerResponse 桩抓字节。
  */
-import { describe, it } from 'node:test'
+import { describe, it, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import type { ServerResponse } from 'node:http'
 import { createRouter } from '../index.js'
@@ -147,6 +148,12 @@ describe('GET /browser/live/:sessionKey', () => {
 })
 
 describe('POST /browser/input', () => {
+  beforeEach(()=>setBrowserOwner('sess-1','user'))
+  it('blocks input until user takes control',async()=>{
+    setBrowserOwner('sess-1','agent')
+    const router=createRouter(buildBrowserRoutes(TOKEN,depsWith({'sess-1':fakeSession()})))
+    assert.equal((await router('POST','/browser/input',{sessionKey:'sess-1',event:{type:'mouseMoved'}},AUTH)).status,409)
+  })
   it('404 for an unknown session', async () => {
     const router = createRouter(buildBrowserRoutes(TOKEN, depsWith({})))
     const res = await router('POST', '/browser/input', { sessionKey: 'nope', event: { type: 'mouseMoved' } }, AUTH)
@@ -202,4 +209,15 @@ describe('POST /browser/input', () => {
     const res = await router('POST', '/browser/input', { sessionKey: 'sess-1', event: { type: 'mouseMoved' } }, {})
     assert.equal(res.status, 401)
   })
+})
+
+it('connection closing during subscription startup releases the late subscription', async () => {
+  let started!: () => void, complete!: (unsubscribe: () => void) => void, stopped = 0
+  const starting = new Promise<void>(resolve => { started = resolve })
+  const session = fakeSession({ subscribeFrames: async () => { started(); return new Promise(resolve => { complete = resolve }) } })
+  const router = createRouter(buildBrowserRoutes(TOKEN, depsWith({ 'sess-1': session })))
+  const response = fakeRes()
+  const pending = router('GET', '/browser/live/sess-1', {}, AUTH, response.res)
+  await starting; response.close(); complete(() => { stopped++ }); await pending
+  assert.equal(stopped, 1)
 })

@@ -50,6 +50,46 @@ export function basenamePortable(p: string): string {
   return idx >= 0 ? normalized.slice(idx + 1) : normalized
 }
 
+const WINDOWS_DEVICE_NAME = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/iu
+
+function isWindowsDeviceName(name: string): boolean {
+  const dot = name.indexOf('.')
+  const stem = (dot < 0 ? name : name.slice(0, dot)).replace(/[. ]+$/u, '')
+  return WINDOWS_DEVICE_NAME.test(stem)
+}
+
+/** 按 UTF-8 字节数截断（不劈开多字节字符）。 */
+function utf8Prefix(value: string, maxBytes: number): string {
+  let bytes = 0
+  let prefix = ''
+  for (const character of value) {
+    const characterBytes = Buffer.byteLength(character, 'utf8')
+    if (bytes + characterBytes > maxBytes) break
+    prefix += character
+    bytes += characterBytes
+  }
+  return prefix
+}
+
+/**
+ * 压缩包附件的事件/UI 展示名清洗（dsh fileLeafName 同款五条）：剥两种路径
+ * 分隔符取叶名、去控制字符、Windows 非法字符 `<>:"|?*` 置 `_`、设备名
+ * （con/prn/nul/aux/com1-9/lpt1-9）加下划线前缀、UTF-8 感知截 255 字节。
+ * 仅用于展示——落盘名恒为 docId，天然免疫路径注入。
+ */
+export function sanitizeArchiveDisplayName(value: string): string {
+  const leaf = value.slice(Math.max(value.lastIndexOf('/'), value.lastIndexOf('\\')) + 1)
+  let clean = leaf
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u001f\u007f]/g, '')
+    .replace(/[<>:"|?*]/g, '_')
+    .trim()
+    .replace(/[. ]+$/u, '')
+  if (isWindowsDeviceName(clean)) clean = `_${clean}`
+  clean = utf8Prefix(clean, 255).replace(/[. ]+$/u, '')
+  return clean === '' || clean === '.' || clean === '..' ? 'file' : clean
+}
+
 /**
  * orderId → 文件系统安全键：拼进文件名前的唯一映射（写/读/列三处共用）。
  *

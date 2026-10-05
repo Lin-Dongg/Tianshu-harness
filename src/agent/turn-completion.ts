@@ -9,7 +9,7 @@ import { processTurnEnd } from './turn-end.js'
 
 export interface TurnCompletionCallbacks {
   onTextDelta: (text: string) => void
-  onTurnComplete: (usage: Partial<Usage>, turnNumber: number, isFinal?: boolean, evidenceSummary?: EvidenceSummary, continuationReason?: string) => void
+  onTurnComplete: (usage: Partial<Usage>, turnNumber: number, isFinal?: boolean, evidenceSummary?: EvidenceSummary, continuationReason?: string, stopReason?: string) => void
 }
 
 export interface TurnCompletionDeps {
@@ -46,6 +46,9 @@ export interface CompleteTurnInput {
   callbacks: TurnCompletionCallbacks
   /** 自动续轮原因，透传给 onTurnComplete（wire 事件上的可选字段）。 */
   continuationReason?: string
+  /** 本轮流式停止原因——目前只在 'max_tokens'（输出被 token 上限截断）时由
+   *  turn-orchestrator 附上，透传给 onTurnComplete（additive wire 字段）。 */
+  stopReason?: string
 }
 
 export class TurnCompletionController {
@@ -79,6 +82,7 @@ export class TurnCompletionController {
       input.isFinal,
       evidenceSummary,
       input.continuationReason,
+      input.stopReason,
     )
   }
 

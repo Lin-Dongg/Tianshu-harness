@@ -78,10 +78,17 @@ cpuPool.dispose()
     const out = await runner(script, { RIVET_CPU_POOL: '1', RIVET_CPU_POOL_IDLE_MS: '100' })
     const { request, tail, workerResolved, modes } = JSON.parse(out)
     assert.equal(workerResolved, true, 'real worker must resolve; fallback alone cannot satisfy this check')
-    assert.deepEqual(request, { task: 'readEventsTailIndexed', args: [file, 3] })
+    // The worker call carries an options object (byte budget) as its third argument
+    // since PR #353. `request` is round-tripped through JSON.stringify below, so the
+    // undefined maxEventBytes vanishes and the options object arrives here as {}.
+    assert.deepEqual(request, { task: 'readEventsTailIndexed', args: [file, 3, {}] })
     assert.equal(tail.total, 20)
     assert.deepEqual(tail.artifactIds, ['old-art'])
-    assert.deepEqual(tail.seqs, [2, 19, 20])
+    // PR #353 revoked the delegation payload exemption: the replay window is now a
+    // pure count/byte trailing slice of the log, so the seq-2 delegation row falls
+    // outside it. Head metadata still survives — 'old-art' (seq 1) via artifactIds
+    // and delegation transitions via delegationState, not by pinning ring rows.
+    assert.deepEqual(tail.seqs, [18, 19, 20])
     assert.deepEqual(modes, ['scan', 'warm'], 'the actual worker must build then consume its verified summary')
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })

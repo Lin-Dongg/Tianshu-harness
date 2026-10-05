@@ -14,10 +14,12 @@ import {
   consumeCheckpointOnce,
   workerSessionPath,
   SESSION_HISTORY_SIZE_LIMIT,
-  type WorkerSessionRecord,
 } from '../worker-session-persist.js'
 import type { OaiMessage } from '../../api/oai-types.js'
 import type { WorkerCheckpoint } from '../worker-session.js'
+import { proveWirePrefix } from '../../api/continuation-prefix.js'
+import type { FrozenSnapshotData } from '../../prompt/frozen-snapshot.js'
+import { leaseWorkerResume } from '../worker-resume-lease.js'
 
 describe('worker-session-persist', () => {
   function makeMessages(): OaiMessage[] {
@@ -128,6 +130,28 @@ describe('worker-session-persist', () => {
 
   // ── v2 format ────────────────────────────────────────────────────────────
 
+  it('resume retains frozen anchors and the last actual wire proof', () => {
+    const home = mkdtempSync(join(tmpdir(), 'rivet-home-'))
+    const messages = makeMessages()
+    const prefixProof = proveWirePrefix({ model: 'deepseek-v4-flash', messages, tools: [] }, 'deepseek-spark', 'last-main')
+    const frozenSnapshot: FrozenSnapshotData = {
+      v: 1, frozenUserMerged: [['user-anchor', ['stable appendix']]],
+      frozenPendingMerged: [], firstUserKey: 'user-anchor', collapseWatermark: 0, collapseTokenStep: 1024,
+    }
+    saveWorkerSession('wo_proof', 'code_scout', 'resume', messages, home, undefined, { prefixProof, frozenSnapshot })
+    const loaded = loadWorkerSession('wo_proof', home)
+    assert.deepEqual(loaded?.prefixProof, prefixProof)
+    assert.deepEqual(loaded?.frozenSnapshot, frozenSnapshot)
+    assert.deepEqual(loaded?.messages, messages)
+    const oversized = [{ role: 'user' as const, content: 'x'.repeat(SESSION_HISTORY_SIZE_LIMIT + 100) }]
+    saveWorkerSession('wo_proof', 'code_scout', 'resume', oversized, home, undefined, { prefixProof, frozenSnapshot })
+    const trimmed = loadWorkerSession('wo_proof', home)
+    assert.deepEqual(trimmed?.messages, oversized)
+    assert.deepEqual(trimmed?.prefixProof, prefixProof)
+    assert.deepEqual(trimmed?.frozenSnapshot, frozenSnapshot)
+    assert.ok(trimmed?.historyRef)
+  })
+
   it('v2 checkpoint round-trips: checkpoint is preserved across save/load', () => {
     const home = mkdtempSync(join(tmpdir(), 'rivet-home-'))
     const id = 'wo_cp_roundtrip'
@@ -164,7 +188,7 @@ describe('worker-session-persist', () => {
     assert.equal(loaded!.messages.length, 5)
   })
 
-  it('oversized history keeps only the checkpoint: messages emptied + historyOmitted=size_limit', () => {
+  it('oversized history preserves the complete transcript outside the manifest', () => {
     const home = mkdtempSync(join(tmpdir(), 'rivet-home-'))
     const id = 'wo_oversized'
     // Build messages whose serialized size exceeds the session history limit.
@@ -179,11 +203,39 @@ describe('worker-session-persist', () => {
     assert.ok(loaded, 'oversized record should still load')
     assert.equal(loaded!.format, 2)
     // Never slice a tail — messages must be dropped wholesale, not truncated.
-    assert.deepEqual(loaded!.messages, [])
-    assert.equal(loaded!.historyOmitted, SESSION_HISTORY_SIZE_LIMIT)
+    assert.deepEqual(loaded!.messages, messages)
+    assert.equal(loaded!.historyOmitted, undefined)
+    assert.ok(loaded!.historyRef)
     // The checkpoint survives the size overflow.
     assert.ok(loaded!.checkpoint, 'checkpoint kept across size overflow')
     assert.equal(loaded!.checkpoint!.turnIndex, 3)
+  })
+
+  it('resume leases do not consume checkpoints on rejection or cancellation; one owner per generation', () => {
+    const home = mkdtempSync(join(tmpdir(), 'rivet-resume-lease-'))
+    saveWorkerSession('source', 'patcher', 'resume', makeMessages(), home, makeCheckpoint())
+    const record = loadWorkerSession('source', home)!
+    const first = leaseWorkerResume('source', record, home)
+    assert.throws(() => leaseWorkerResume('source', record, home), /already leased/)
+    first.release()
+    assert.deepEqual(loadWorkerSession('source', home)?.checkpoint, record.checkpoint)
+    const next = leaseWorkerResume('source', record, home)
+    next.ack(); next.release()
+    assert.equal(loadWorkerSession('source', home)?.checkpoint, undefined)
+    saveWorkerSession('source', 'patcher', 'resume', makeMessages(), home, makeCheckpoint())
+    const original = loadWorkerSession('source', home)!, replacement = leaseWorkerResume('source', original, home)
+    const path = workerSessionPath('source', home)
+    writeFileSync(path, JSON.stringify({ ...original, checkpoint: { ...original.checkpoint, turnIndex: 99 } }))
+    replacement.ack(); replacement.release()
+    assert.equal(loadWorkerSession('source', home)?.checkpoint?.turnIndex, 99, 'same timestamp never permits consuming a changed generation')
+  })
+
+  it('bad large-history archives cannot silently become empty resumable sessions', () => {
+    const home = mkdtempSync(join(tmpdir(), 'rivet-history-digest-'))
+    saveWorkerSession('large', 'code_scout', 'resume', [{ role: 'user', content: 'x'.repeat(SESSION_HISTORY_SIZE_LIMIT + 10) }], home)
+    const record = loadWorkerSession('large', home)!
+    writeFileSync(join(home, '.rivet/subagents', record.historyRef!.file), 'damaged')
+    assert.equal(loadWorkerSession('large', home), null)
   })
 
   it('corrupt-record fail-open: structurally-invalid v2 record loads as null', () => {

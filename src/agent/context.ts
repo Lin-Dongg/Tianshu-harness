@@ -6,7 +6,7 @@ import { stableStringify } from '../api/stable-json.js'
 import { sanitizeForJsonTransport } from '../utils/sanitize.js'
 import { wrapSystemReminder } from '../prompt/system-reminder.js'
 
-import { INLINE_TOOL_RESULT_MAX_CHARS } from '../compact/constants.js'
+import { trimToolResultForMemory } from './tool-result-memory.js'
 import { ToolArgPostProcessorRegistry } from './tool-arg-post-processor.js'
 import { planSubmitArgProcessor } from '../tools/plan-submit-arg-processor.js'
 import { editFileArgProcessor } from '../tools/edit-file-arg-processor.js'
@@ -268,7 +268,7 @@ export class SessionContext {
     return this.currentGoal
   }
 
-  addUserMessage(content: string, images?: string[]): void {
+  addUserMessage(content: string, images?: string[], origin: import('./input-origin.js').InputOrigin = 'human'): void {
     let msg: OaiMessage
     if (images && images.length > 0) {
       // Multimodal: construct OpenAI vision content parts (text + image_url).
@@ -280,6 +280,7 @@ export class SessionContext {
     } else {
       msg = { role: 'user', content: sanitizeForJsonTransport(content) }
     }
+    if (msg.role === 'user') msg.origin = origin
     this.state.oaiMessages.push(msg)
     const t = estimateOaiMessageTokens(msg)
     this.state.estimatedTokens += t
@@ -339,7 +340,7 @@ export class SessionContext {
       this.onMutation?.({ type: 'replace', messages: msgs.slice() })
       return
     }
-    this.addUserMessage(wrapped)
+    this.addUserMessage(wrapped, undefined, 'hook')
   }
 
   /** W3/W1：每轮开始时重置 discipline SR 计数器（由 AgentLoop 调用）。
@@ -381,7 +382,7 @@ export class SessionContext {
       this.onMutation?.({ type: 'replace', messages: msgs.slice() })
       return true
     }
-    this.addUserMessage(wrapped)
+    this.addUserMessage(wrapped, undefined, 'hook')
     return true
   }
 
@@ -807,34 +808,4 @@ export class SessionContext {
   getCompactEvents(): CompactEvent[] {
     return [...this.state.compactEvents]
   }
-}
-
-// ─── Memory-safety helpers ───────────────────────────────────────
-
-/** Artifact marker pattern: "[artifact:ID]" at end of content. */
-const ARTIFACT_MARKER_REGEX = /\[artifact:([A-Za-z0-9_-]+)\]\s*$/
-
-/**
- * Trim tool result content that exceeds {@link INLINE_TOOL_RESULT_MAX_CHARS}.
- * Preserves the artifact marker so the model can still recover full content
- * via read_section. Full content remains on disk — this only bounds JS heap usage.
- */
-function trimToolResultForMemory(content: string): string {
-  if (content.length <= INLINE_TOOL_RESULT_MAX_CHARS) return content
-
-  const artifactMatch = content.match(ARTIFACT_MARKER_REGEX)
-  const marker = artifactMatch ? artifactMatch[0] : ''
-  const markerLen = marker.length
-
-  // Reserve space for the marker + the memory-trimmed tag
-  const tagOverhead = `<memory-trimmed original_chars="${content.length}" />\n`.length
-  const keepChars = Math.max(0, INLINE_TOOL_RESULT_MAX_CHARS - markerLen - tagOverhead)
-  const truncated = content.slice(0, keepChars)
-
-  const memoryTag = `<memory-trimmed original_chars="${content.length}" kept_chars="${keepChars}" />`
-
-  if (artifactMatch) {
-    return truncated + '\n' + memoryTag + '\n' + marker
-  }
-  return truncated + '\n' + memoryTag
 }

@@ -15,6 +15,7 @@ import { latexToBlock } from '../pi/latex-block.js'
 import { renderMathInText, latexToUnicode } from '../pi/latex-to-unicode.js'
 import { proseColumns, wrapReadingText } from './reading-layout.js'
 import { renderTable } from './table.js'
+import { displayWidth, ambiguousWideEnabled } from '../width.js'
 
 // ── Types ──────────────────────────────────────────────────────
 
@@ -39,6 +40,8 @@ export interface Block {
   items?: string[]
   /** 列表块：标记为 `1. ` 的有序列表。parse 阶段会剥掉标记，不记下来就再也分不出。 */
   ordered?: boolean
+  /** 每项原始缩进与标记，保留混合/嵌套列表及起始编号。 */
+  itemPrefixes?: string[]
 }
 
 // ── Keyword sets (unchanged from markdown-render.tsx) ──────────
@@ -277,12 +280,15 @@ export function parseBlocks(text: string): Block[] {
 
     if (/^(\s*[-*]\s|\s*\d+\.\s)/.test(line)) {
       const items: string[] = []
+      const itemPrefixes: string[] = []
       let ordered = false
       while (i < lines.length && /^(\s*[-*]\s|\s*\d+\.\s)/.test(lines[i]!)) {
         if (/^\s*\d+\.\s/.test(lines[i]!)) ordered = true
+        const prefix = lines[i]!.match(/^\s*[-*]\s|\s*\d+\.\s/)![0].replace(/\t/g, '    ')
+        itemPrefixes.push(prefix)
         items.push(lines[i]!.replace(/^\s*[-*]\s|\s*\d+\.\s/, '')); i++
       }
-      blocks.push({ type: 'list', content: items.join('\n'), items, ordered }); continue
+      blocks.push({ type: 'list', content: items.join('\n'), items, ordered, itemPrefixes }); continue
     }
 
     if (line.includes('|') && i + 1 < lines.length && /^\|?[\s-:|]+\|?$/.test(lines[i + 1]!)) {
@@ -296,7 +302,7 @@ export function parseBlocks(text: string): Block[] {
     if (line.trim() === '') { i++; continue }
 
     const paraLines: string[] = []
-    while (i < lines.length && lines[i]!.trim() !== '' && !lines[i]!.startsWith('#') && !lines[i]!.startsWith('```') && !lines[i]!.startsWith('> ') && !/^(\s*[-*]\s)/.test(lines[i]!)) {
+    while (i < lines.length && lines[i]!.trim() !== '' && !lines[i]!.startsWith('#') && !lines[i]!.startsWith('```') && !lines[i]!.startsWith('> ') && !/^(\s*[-*]\s|\s*\d+\.\s)/.test(lines[i]!)) {
       paraLines.push(lines[i]!); i++
     }
     if (paraLines.length > 0) {
@@ -392,7 +398,7 @@ function formatSegment(seg: Segment, theme: RivetTheme): string {
 
   // 使用 color() 包裹，除非是普通文本
   if (seg.color || seg.code || seg.bold || seg.italic || seg.underline || seg.dimmed) {
-    s = color(seg.code ? ` ${seg.text} ` : seg.text, fgHex, opts)
+    s = color(seg.text, fgHex, opts)
   }
   // markdown 链接 → OSC 8 可点击（支持的终端；其余保持下划线纯文本）
   if (seg.href) s = hyperlink(s, seg.href)
@@ -514,12 +520,14 @@ function formatBlock(block: Block, columns: number, theme: RivetTheme): string[]
       const items = block.items ?? block.content.split('\n')
       items.forEach((item, idx) => {
         const itemAnsi = formatInlineToAnsi(parseInline(item), theme)
-        // 有序列表还原序号（parse 阶段连标记一起剥掉了）。高亮口径沿用行首
-        // 数字那一套（warning + bold），与纯文本路径的 `1.` 视觉一致。
-        const bullet = block.ordered
-          ? color(`${idx + 1}.`, theme.warning, { bold: true })
-          : color('◇', theme.secondary)
-        result.push(`${bullet} ${highlightCodeLineNumber(itemAnsi, theme)}`)
+        const original = block.itemPrefixes?.[idx] ?? (block.ordered ? `${idx + 1}. ` : '- ')
+        const indent = original.match(/^\s*/)![0]
+        const marker = original.trim()
+        const bullet = /^\d+\.$/.test(marker)
+          ? color(marker, theme.warning, { bold: true }) : color('◇', theme.secondary)
+        const prefix = `${indent}${bullet} `
+        const continuation = ' '.repeat(displayWidth(prefix, { ambiguousAsWide: ambiguousWideEnabled() }))
+        result.push(...wrapReadingText(`${prefix}${highlightCodeLineNumber(itemAnsi, theme)}`, proseColumns(columns), continuation))
       })
       break
     }
@@ -552,8 +560,8 @@ function formatBlock(block: Block, columns: number, theme: RivetTheme): string[]
     }
   }
 
-  return ['paragraph', 'list', 'blockquote'].includes(block.type)
-    ? result.flatMap(line => wrapReadingText(line, proseColumns(columns, 0), block.type === 'list' ? '  ' : ''))
+  return ['paragraph', 'blockquote'].includes(block.type)
+    ? result.flatMap(line => wrapReadingText(line, proseColumns(columns, 0)))
     : result
 }
 

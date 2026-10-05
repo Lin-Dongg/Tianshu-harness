@@ -1,3 +1,6 @@
+import { withWorkspaceRoots } from '../tools/workspace-context.js'
+import { NonRepositoryError } from '../agent/repository-capability.js'
+import { validateWorkspaceRoots } from './workspace-roots.js'
 /**
  * /sessions/* routes — the desktop-facing multi-session API surface over
  * RuntimeSessionManager. Every route is Bearer-gated (fail-closed).
@@ -34,12 +37,17 @@
  *   POST   /github/prs/:number/merge                   merge a PR (confirm-gated)
  *   POST   /github/prs/:number/push-fix                push auto-fix diff to PR head (confirm-gated)
  */
+import { buildDocumentRoutes, documentVersion } from './file-document.js'
+import { buildGitWorkbenchRoutes } from './git-workbench-routes.js'
+import { buildGitPrRoutes } from './git-pr-routes.js'
+import { buildApprovalRoutes, sendApprovalSnapshot } from './approval-routes.js'
+import { buildGitReviewRoutes } from './git-review-jobs.js'
 import { normalizeRolloverConfig } from '../agent/goal-tracker.js'
 import { decodeRouteParam, type RouteHandler } from './index.js'
 import { allowedCorsOrigin } from './cors.js'
 import type { SseConnectionRegistry } from './sse-registry.js'
 import { SseStream } from './sse-stream.js'
-import type { RuntimeSessionManager } from './session-manager.js'
+import type { RuntimeSessionManager, SessionArchiveEventRef, SessionArchiveRef } from './session-manager.js'
 import { buildSessionSnapshot, isImportableSnapshot } from './session-snapshot.js'
 import type { Artifact } from '../artifact/types.js'
 import type { SessionRegistry } from '../agent/session-registry.js'
@@ -50,12 +58,16 @@ import type { Config } from '../config/schema.js'
 import type { SessionEvent, SessionRecord } from './protocol.js'
 import { compactReplayRuns, compactReplayRunsWithStats, isReplayCompactionEnabled } from './replay-compaction.js'
 import { isSessionWorkspaceMode, type SessionWorkspaceMode } from './workspace.js'
-import { computeUsageCost, findModelPricing } from '../utils/pricing.js'
+import { computeUsageCost } from '../utils/pricing.js'
+import { findUsagePricing } from '../utils/deepseek-pricing.js'
+import { sessionsDir } from '../config/paths.js'
+import { parseUsageRows } from '../cache/usage-aggregator.js'
 import { getRollbackPreview, rollbackToCheckpoint, makeOwnershipGuard } from '../agent/checkpoint.js'
 import { rankFiles, listDirEntries } from './file-list.js'
 import { cachedProjectFiles } from './file-context-routes.js'
-import { validateDocumentsPayload, extractDocumentsToText } from './attachment-validation.js'
+import { validateDocumentsPayload, extractDocumentsToText, validateArchivesPayload, buildArchiveHandleText, type SessionArchivePayload } from './attachment-validation.js'
 import {
+  MAX_ARCHIVES,
   MAX_DOCUMENTS,
   MAX_DOCUMENT_BYTES,
   MAX_IMAGES,
@@ -63,13 +75,12 @@ import {
 } from './attachment-limits.js'
 import { listPrs, getPrDetail, isGhAvailable, getPrDiff, submitPrReview, listPrChecks, getCheckRunLog, mergePr, type PrReviewInput } from './gh-cli.js'
 import { pushFixToPrBranch } from './pr-fix-push.js'
-import { resolveAppPromptInput } from '../tui/prompt-input-resolver.js'
-import { getPaletteCommands } from '../tui/command-palette.js'
+import { SlashPromptError, resolveSlashCommandPrompt, prepareSessionPrompt, isDraftSessionId, draftSkills } from './session-skills-helper.js'
 import { RECOMMENDED_MAX_SKILLS } from '../skills/skill-loader.js'
 import { validatePath } from '../tools/path-validate.js'
 import { convertOfficeToPdf, ConverterUnavailableError, OFFICE_CONVERTIBLE_EXTS } from './file-preview.js'
 import { readFileSync, statSync, writeFileSync, mkdirSync } from 'node:fs'
-import { extname, relative, join, isAbsolute } from 'node:path'
+import { extname, relative, join, isAbsolute, resolve, basename } from 'node:path'
 import type { HookEntry, HookEvent, HooksConfig } from '../hooks/user-hooks-runner.js'
 import { loadHooksConfig, VALID_EVENTS } from '../hooks/user-hooks-runner.js'
 import { buildDistillPrompt } from '../prompt/rpa-distill.js'
@@ -298,6 +309,26 @@ async function sendReplayTimeSliced(
 /** 导入快照的体积上限：快照是纯文本对话（无工具面），5MB 已远超正常分享件。 */
 const MAX_SNAPSHOT_BYTES = 5 * 1024 * 1024
 
+/** 压缩包附件三处入口（POST /sessions、/prompt、/queue）共用的「持久化 +
+ *  句柄文本」管线：原样落盘（服务端不解压），句柄文本与 docTexts 同位前置
+ *  进 prompt；eventRefs 是 user 事件的小引用形态（{id,name,bytes}——
+ *  savedPath/sha256 只进句柄文本，不进事件流）。refs 留给拒绝路径
+ *  （run busy / queue 预算超限）做 discardArchives 孤儿回收。 */
+async function persistArchivesForPrompt(
+  manager: RuntimeSessionManager,
+  sessionId: string,
+  archives: SessionArchivePayload[] | undefined,
+): Promise<{ refs: SessionArchiveRef[]; eventRefs: SessionArchiveEventRef[]; handleText: string } | { error: string } | undefined> {
+  if (!archives?.length) return undefined
+  const persisted = await manager.persistArchives(sessionId, archives)
+  if ('error' in persisted) return { error: persisted.error }
+  return {
+    refs: persisted.refs,
+    eventRefs: persisted.refs.map(({ id, name, bytes }) => ({ id, name, bytes })),
+    handleText: persisted.refs.map((ref) => buildArchiveHandleText(ref)).join('\n\n---\n\n'),
+  }
+}
+
 export function buildSessionRoutes(
   manager: RuntimeSessionManager,
   apiToken?: string,
@@ -315,13 +346,17 @@ export function buildSessionRoutes(
   }
 
   const routes: Record<string, RouteHandler> = {
+    ...buildApprovalRoutes(manager, apiToken),
+    ...buildGitWorkbenchRoutes(manager, apiToken),
+    ...buildGitPrRoutes(manager, apiToken),
+    ...buildGitReviewRoutes(manager, apiToken),
     'POST /sessions': withAuth(async (body) => {
       // DEBUG instrumentation (RIVET_DEBUG_RENDER=1): logs createSession latency
       // so we can tell session-creation bottlenecks (loadConfig, worktree setup)
       // from SSE/stream issues. See docs/dev/render-debug-playbook.md.
       const __dbg = process.env.RIVET_DEBUG_RENDER === '1'
       const __t0 = __dbg ? Date.now() : 0
-      const data = (body ?? {}) as { cwd?: string; workspaceMode?: unknown; title?: string; prompt?: string; missionId?: string; approvalMode?: unknown; isolatedWorktree?: unknown; model?: string; domain?: string; reasoningEffort?: unknown; planMode?: unknown; askMode?: unknown; planAutoApproveUi?: unknown; images?: unknown; documents?: unknown }
+      const data = (body ?? {}) as { cwd?: string; workspaceRoots?: unknown; workspaceMode?: unknown; title?: string; prompt?: string; missionId?: string; approvalMode?: unknown; isolatedWorktree?: unknown; model?: string; domain?: string; reasoningEffort?: unknown; planMode?: unknown; askMode?: unknown; planAutoApproveUi?: unknown; images?: unknown; documents?: unknown; archives?: unknown }
       // issue #147 — 非法 workspaceMode 显式 400（静默降级会让客户端以为用了默认工作区）。
       if (data.workspaceMode !== undefined && !isSessionWorkspaceMode(data.workspaceMode)) return { status: 400, body: { error: 'Invalid "workspaceMode" (explicit|default|scratch)' } }
       if (data.approvalMode !== undefined && !isApprovalMode(data.approvalMode)) {
@@ -344,26 +379,36 @@ export function buildSessionRoutes(
       if (imagesCheck.error) {
         return { status: 400, body: { error: imagesCheck.error } }
       }
-      // 新建即携带文档附件（欢迎页 pdf/office 按钮/拖拽/粘贴）——与 /prompt 同一
-      // 份校验与抽取管线：extractDocumentsToText 后前置进首轮 prompt。此前欢迎页
-      // 附件只能建会话后再发（POST /sessions 没有这条抽取管线）。
+      // 文档抽取独立于命令展开，随后前置到首轮 prompt。
       const docsCheck = validateDocumentsPayload(data.documents)
       if (docsCheck.error) {
         return { status: 400, body: { error: docsCheck.error } }
       }
-      let prompt = data.prompt
-      // issue #300 — promptText（用户实际输入）与 documents 原文随 createSession
-      // 透传：首轮 user 事件即带附件卡片元数据。
-      const promptText = docsCheck.documents?.length ? (prompt ?? '') : undefined
-      if (docsCheck.documents && docsCheck.documents.length > 0) {
-        const docTexts = await extractDocumentsToText(docsCheck.documents)
-        if (docTexts) prompt = `${docTexts}\n\n${prompt ?? ''}`
+      // 压缩包附件（句柄式，不解压）——与 /prompt /queue 同一份校验。
+      const archivesCheck = validateArchivesPayload(data.archives)
+      if (archivesCheck.error) {
+        return { status: 400, body: { error: archivesCheck.error } }
       }
-      const rec = manager.createSession({
+      let prompt = data.prompt
+      // 展开技能或附加文档时仍保留用户实际输入。
+      const promptText = docsCheck.documents?.length || archivesCheck.archives?.length || prompt?.trim().startsWith('/') ? (prompt ?? '') : undefined
+      const docTexts = docsCheck.documents?.length ? await extractDocumentsToText(docsCheck.documents) : ''
+      let workspaceRoots: string[] | undefined
+      if (data.workspaceRoots !== undefined) {
+        if (data.workspaceMode && data.workspaceMode !== 'explicit') return {status:400,body:{error:'Project folders require an explicit workspace'}}
+        try { workspaceRoots = validateWorkspaceRoots(data.workspaceRoots, data.cwd) }
+        catch (error) { return { status: 400, body: { error: (error as Error).message } } }
+        if (data.isolatedWorktree === true && workspaceRoots.length > 1) return { status: 400, body: { error: 'Isolated Worktree supports a single folder only' } }
+      }
+      let requiredTools: readonly string[] = []
+      let rec: ReturnType<RuntimeSessionManager['createSession']>
+      try { rec = manager.createSession({
+        preparePrompt: prepareSessionPrompt(data.prompt, resolved => { prompt = resolved.prompt; requiredTools = resolved.requiredTools ?? [] }),
         cwd: data.cwd,
+        workspaceRoots,
         workspaceMode: data.workspaceMode as SessionWorkspaceMode | undefined,
         title: data.title,
-        prompt,
+        prompt: undefined,
         images: imagesCheck.images,
         documents: docsCheck.documents,
         promptText,
@@ -379,7 +424,20 @@ export function buildSessionRoutes(
         // P1b：客户端自报「我有自动批准倒计时 UI」。缺省即 fail-closed，
         // 不武装定时器——宿主看不见倒计时就不该被静默自动批准。
         planAutoApproveUi: data.planAutoApproveUi === true,
-      })
+      }) } catch (error) {
+        if (error instanceof SlashPromptError) return { status: 400, body: { error: error.message } }
+        throw error
+      }
+      for (const toolName of requiredTools) await manager.enableTool(rec.id, toolName)
+      if (prompt && /@computer\b/i.test(prompt)) await manager.enableTool(rec.id, 'computer_use')
+      // 压缩包在 createSession 后才有 sessionId 可落盘——持久化失败即 400
+      // （会话已建但未启动任何 run，与抽取失败降级语义不同：没有句柄就没有注入形态）。
+      const archivePersist = await persistArchivesForPrompt(manager, rec.id, archivesCheck.archives)
+      if (archivePersist && 'error' in archivePersist) return { status: 400, body: { error: archivePersist.error } }
+      const attachmentTexts = [docTexts, archivePersist?.handleText].filter((s) => s)
+      if (attachmentTexts.length > 0) prompt = `${attachmentTexts.join('\n\n---\n\n')}\n\n${prompt ?? ''}`
+      if (prompt?.trim()) manager.run(rec.id, prompt, imagesCheck.images, false, undefined, { documents: docsCheck.documents, archiveRefs: archivePersist?.eventRefs, promptText })
+      rec = manager.getSession(rec.id) ?? rec
       if (__dbg) console.log(`[createSession] +${Date.now() - __t0}ms id=${rec.id} cwd=${data.cwd}`)
       return { status: 201, body: rec }
     }, apiToken),
@@ -561,7 +619,7 @@ export function buildSessionRoutes(
       const plan = await manager.readPlan(params!.id!, slug)
       if (plan === undefined) return { status: 404, body: { error: 'Session not found' } }
       if (!plan) return { status: 404, body: { error: 'Plan not found' } }
-      return { status: 200, body: { plan } }
+      return { status: 200, body: { plan, version: documentVersion(plan.content) } }
     }, apiToken),
 
     // Plan edit — replace a submitted plan's markdown before approval
@@ -569,11 +627,12 @@ export function buildSessionRoutes(
     'PUT /sessions/:id/plans/:slug': withAuth(async (body, params) => {
       const slug = decodeSlug(params!.slug!)
       if (!isSafeFileName(slug)) return { status: 400, body: { error: 'Invalid plan slug' } }
-      const data = (body ?? {}) as { content?: string }
+      const data = (body ?? {}) as { content?: string; version?: string }
       if (typeof data.content !== 'string') {
         return { status: 400, body: { error: 'Missing "content" string' } }
       }
-      const outcome = await manager.updatePlan(params!.id!, slug, data.content)
+      if (data.version !== undefined && typeof data.version !== 'string') return { status: 400, body: { error: 'Invalid plan version' } }
+      const outcome = await manager.updatePlan(params!.id!, slug, data.content, data.version)
       if (!outcome.ok) {
         const status =
           outcome.code === 'session-missing' || outcome.code === 'plan-not-found' ? 404
@@ -675,9 +734,12 @@ export function buildSessionRoutes(
       return { status: 200, body: { id: params!.id!, domain: data.key.trim() } }
     }, apiToken),
 
+    'GET /skills': withAuth((_body, params) => ({ status: 200, body: draftSkills(manager, typeof params?.cwd === 'string' ? params.cwd : undefined) }), apiToken),
+
     // ── PlusMenu: skills toggle ──
     // Read — every loaded skill with its per-session enablement status.
     'GET /sessions/:id/skills': withAuth((_body, params) => {
+      if (isDraftSessionId(params!.id!)) return { status: 200, body: draftSkills(manager, typeof params?.cwd === 'string' ? params.cwd : undefined) }
       const skills = manager.listSkills(params!.id!)
       if (!skills) return { status: 404, body: { error: 'Session not found' } }
       // loadErrors: skills that failed to parse from .rivet/skills at session
@@ -876,6 +938,7 @@ export function buildSessionRoutes(
     // 临时会话目录此前只增不减、没有应用内清理路径。占用判定要读存活会话，
     // 故与 /storage 同族挂在这里（体量在 scratch-cleanup.ts）。
     ...buildScratchRoutes(manager, apiToken),
+    ...buildDocumentRoutes(manager, apiToken),
 
     'GET /sessions/:id': withAuth((_body, params) => {
       const rec = manager.getSession(params!.id!)
@@ -904,7 +967,7 @@ export function buildSessionRoutes(
     }, apiToken),
 
     'POST /sessions/:id/prompt': withAuth(async (body, params) => {
-      const data = (body ?? {}) as { prompt?: string; images?: unknown; documents?: unknown; requestId?: unknown }
+      const data = (body ?? {}) as { prompt?: string; images?: unknown; documents?: unknown; archives?: unknown; requestId?: unknown }
       if (!data.prompt || typeof data.prompt !== 'string' || !data.prompt.trim()) {
         return { status: 400, body: { error: 'Missing or empty "prompt" field' } }
       }
@@ -925,6 +988,13 @@ export function buildSessionRoutes(
       }
       const documents = docsCheck.documents
 
+      // 压缩包附件（句柄式，不解压）——线缆校验在此；持久化在 prepareSession 之后
+      // （需要会话确实存在），句柄文本与 docTexts 同位前置。
+      const archivesCheck = validateArchivesPayload(data.archives)
+      if (archivesCheck.error) {
+        return { status: 400, body: { error: archivesCheck.error } }
+      }
+
       // Slash 翻译层（对齐 TUI 端 resolveAppPromptInput 行为）。
       // 桌面 PlusMenu 命令是写死人话经 onSend 发送；自由文本输入若以 "/" 起头，
       // 这里负责把 /plan /team /council /review /write-plan /plan-close 等
@@ -935,16 +1005,11 @@ export function buildSessionRoutes(
       if (trimmed.startsWith('/')) {
         const record = manager.getSession(params!.id!)
         if (record) {
-          const knownCmds = new Set(getPaletteCommands()
-            .filter(c => c.name.startsWith('/'))
-            .map(c => c.name.slice(1).split(/\s/)[0]!))
-          const resolved = resolveAppPromptInput(trimmed, record.cwd, (name) => knownCmds.has(name))
-          if (resolved === null) {
-            const first = trimmed.split(/\s+/)[0]
-            return {
-              status: 400,
-              body: { error: `Unknown slash command: "${first}". Type a normal message or use the command menu (+).` },
-            }
+          let resolved: ReturnType<typeof resolveSlashCommandPrompt>
+          try { resolved = resolveSlashCommandPrompt(trimmed, record.cwd) }
+          catch (error) {
+            if (error instanceof SlashPromptError) return { status: 400, body: { error: error.message } }
+            throw error
           }
           prompt = resolved.prompt
           // 桌面端也需挂载 workflow 声明的 EXTENDED 工具（与 TUI main.ts 对齐）。
@@ -967,13 +1032,10 @@ export function buildSessionRoutes(
       // 把非文本附件转成文本注入 prompt。
       // issue #300 — documents 原文与 promptText（用户实际输入，抽取前置前）随
       // run 透传：user 事件携带附件卡片元数据，UI 气泡显示原文而非拼接全文。
-      const promptText = documents?.length ? prompt : undefined
-      if (documents && documents.length > 0) {
-        const docTexts = await extractDocumentsToText(documents)
-        if (docTexts) {
-          prompt = `${docTexts}\n\n${prompt}`
-        }
-      }
+      const promptText = documents?.length || archivesCheck.archives?.length ? prompt : undefined
+      // 抽取块先备好不拼——与压缩包句柄文本合流后统一前置（prepareSession 之后），
+      // 保证「documents 块在前、archive 句柄块随后、用户输入最后」的次序。
+      const docTexts = documents && documents.length > 0 ? (await extractDocumentsToText(documents) ?? '') : ''
 
       // Stop → settle window（同 /rewind）：Stop 后 status 立刻变 aborted，桌面端
       // Composer 据此把下一条输入按新 prompt 发出，而 agent loop 还在收尾、
@@ -981,12 +1043,19 @@ export function buildSessionRoutes(
       // 收尾再起新轮；仍在跑的 run 立即 409（方法直接返回），steer/queue 语义不变。
       await manager.waitForRunSettled(params!.id!)
       if (!await manager.prepareSession(params!.id!)) return { status: 404, body: { error: 'Session not found' } }
+      // 压缩包持久化 + 句柄前置（会话已确认存在）。落盘幂等（docId=内容哈希），
+      // requestId 重试产出的 prompt 与首次字节一致，run-ledger 指纹去重成立。
+      const archivePersist = await persistArchivesForPrompt(manager, params!.id!, archivesCheck.archives)
+      if (archivePersist && 'error' in archivePersist) return { status: 400, body: { error: archivePersist.error } }
+      const archiveRefs = archivePersist?.eventRefs
+      const attachmentTexts = [docTexts, archivePersist?.handleText].filter((s) => s)
+      if (attachmentTexts.length > 0) prompt = `${attachmentTexts.join('\n\n---\n\n')}\n\n${prompt}`
       if (data.requestId !== undefined) {
         if (typeof data.requestId !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(data.requestId)) {
           return { status: 400, body: { error: 'Invalid requestId' } }
         }
         try {
-          const result = await manager.submitRun(params!.id!, prompt, images, data.requestId, { documents, promptText })
+          const result = await manager.submitRun(params!.id!, prompt, images, data.requestId, { documents, archiveRefs, promptText })
           if (!result.ok) return { status: result.code === 'not_found' ? 404 : 409, body: { error: result.code } }
           return { status: 200, body: { ...manager.getSession(params!.id!), receipt: 'receipt' in result ? result.receipt : undefined } }
         } catch (error) {
@@ -996,7 +1065,7 @@ export function buildSessionRoutes(
           return { status: 503, body: { error: 'Could not durably accept request; retry with the same requestId', code: 'request_persistence_failed' } }
         }
       }
-      const ok = manager.run(params!.id!, prompt, images, false, undefined, { documents, promptText })
+      const ok = manager.run(params!.id!, prompt, images, false, undefined, { documents, archiveRefs, promptText })
       // 区分两种拒绝：session 缺失（404，前端可提示重新打开）与执行中（409 busy，
       // 前端显示"正在执行中"而非错误 toast——用户连续发消息时这是正常排队语义）。
       if (!ok) {
@@ -1038,7 +1107,7 @@ export function buildSessionRoutes(
     // 路径：body 带附件即 400，含附件的 lane 条目升级即 409——与前端禁用「立即
     // 引导」同门，不让附件在升级路径上静默消失。
     'POST /sessions/:id/steer': withAuth((body, params) => {
-      const data = (body ?? {}) as { text?: string; laneId?: string; images?: unknown; documents?: unknown }
+      const data = (body ?? {}) as { text?: string; laneId?: string; images?: unknown; documents?: unknown; archives?: unknown }
       const laneId = typeof data.laneId === 'string' && data.laneId.trim() ? data.laneId.trim() : undefined
       const text = typeof data.text === 'string' && data.text.trim() ? data.text.trim() : undefined
       if (!laneId && !text) {
@@ -1048,7 +1117,8 @@ export function buildSessionRoutes(
       // 文案误导（R4，2026-09-21 独立反证审查）。
       const hasAttachments =
         (Array.isArray(data.images) && data.images.length > 0) ||
-        (Array.isArray(data.documents) && data.documents.length > 0)
+        (Array.isArray(data.documents) && data.documents.length > 0) ||
+        (Array.isArray(data.archives) && data.archives.length > 0)
       if (hasAttachments) {
         return {
           status: 400,
@@ -1091,7 +1161,7 @@ export function buildSessionRoutes(
     // 同步入口，归并路径不能 await，故抽取必须发生在入队时）。排队总量也受单轮
     // 上限约束——超限在此显式 400，不留到归并时静默截断。
     'POST /sessions/:id/queue': withAuth(async (body, params) => {
-      const data = (body ?? {}) as { text?: string; images?: unknown; documents?: unknown }
+      const data = (body ?? {}) as { text?: string; images?: unknown; documents?: unknown; archives?: unknown }
       if (!data.text || typeof data.text !== 'string' || !data.text.trim()) {
         return { status: 400, body: { error: 'Missing or empty "text" field' } }
       }
@@ -1103,6 +1173,10 @@ export function buildSessionRoutes(
       if (docsCheck.error) {
         return { status: 400, body: { error: docsCheck.error } }
       }
+      const archivesCheck = validateArchivesPayload(data.archives)
+      if (archivesCheck.error) {
+        return { status: 400, body: { error: archivesCheck.error } }
+      }
       const id = params!.id!
       const images = imagesCheck.images
       const documents = docsCheck.documents
@@ -1113,18 +1187,32 @@ export function buildSessionRoutes(
       if (documents && documents.length > 0) {
         attachmentText = (await extractDocumentsToText(documents)) ?? undefined
       }
+      // 压缩包同构：入队时完成持久化 + 句柄拼接（归并路径不能 await）。句柄文本
+      // 接在文档抽取块之后（documents 之后、排队文本之前），引用随条目归并进下轮
+      // user 事件。预算拒绝不落 discard——落盘幂等（docId=内容哈希），孤儿随会话回收。
+      const archivePersist = await persistArchivesForPrompt(manager, id, archivesCheck.archives)
+      if (archivePersist && 'error' in archivePersist) return { status: 400, body: { error: archivePersist.error } }
+      const attachParts = [attachmentText, archivePersist?.handleText].filter((s) => s)
+      if (attachParts.length > 0) attachmentText = attachParts.join('\n\n---\n\n')
       const result = manager.queue(id, data.text.trim(), {
         ...(images?.length ? { images } : {}),
         ...(attachmentText ? { attachmentText } : {}),
         ...(documents?.length ? { documentNames: documents.map((d) => d.name), documents } : {}),
+        ...(archivePersist?.eventRefs.length ? { archiveRefs: archivePersist.eventRefs } : {}),
       })
       if (result === 'not_found') return { status: 404, body: { error: 'Session not found' } }
       if (result === 'idle') {
         return { status: 409, body: { error: 'Session is not running; use /prompt to start a turn', code: 'idle' } }
       }
-      if (result === 'image_budget' || result === 'document_budget') {
+      if (result === 'image_budget' || result === 'document_budget' || result === 'archive_budget') {
         // 文案在失败路径现算：配额是 lane 当前占用，失败瞬间读一次即够。
-        const usage = manager.queuedAttachmentUsage(id) ?? { images: 0, documents: 0 }
+        const usage = manager.queuedAttachmentUsage(id) ?? { images: 0, documents: 0, archives: 0 }
+        if (result === 'archive_budget') {
+          return {
+            status: 400,
+            body: { error: `排队中已有 ${usage.archives} 个压缩包，单轮上限 ${MAX_ARCHIVES}`, code: 'queue_archive_budget' },
+          }
+        }
         return result === 'image_budget'
           ? {
               status: 400,
@@ -1262,11 +1350,24 @@ export function buildSessionRoutes(
       let mainCacheWrite = 0
       let mainReasoning = 0
       const mainModel = rec.model
+      const mainProvider = mainModel
+        ? (providers[config?.provider.default ?? '']?.models.some(model => model.id === mainModel)
+          ? config?.provider.default
+          : Object.entries(providers).find(([, provider]) => provider.models?.some(model => model.id === mainModel))?.[0])
+        : undefined
+      let mainCost = 0
 
       for (const ev of events.events) {
         if (ev.type === 'turn_complete') {
           const data = ev.data as { usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number; reasoning_tokens?: number } }
           if (data.usage) {
+            mainCost += computeUsageCost({
+              input_tokens: Math.max(0, (data.usage.input_tokens ?? mainInput) - mainInput),
+              output_tokens: Math.max(0, (data.usage.output_tokens ?? mainOutput) - mainOutput),
+              cache_read_input_tokens: Math.max(0, (data.usage.cache_read_input_tokens ?? mainCacheRead) - mainCacheRead),
+              cache_creation_input_tokens: Math.max(0, (data.usage.cache_creation_input_tokens ?? mainCacheWrite) - mainCacheWrite),
+              reasoning_tokens: Math.max(0, (data.usage.reasoning_tokens ?? mainReasoning) - mainReasoning),
+            }, findUsagePricing(providers, mainProvider, mainModel, ev.ts)).total
             mainInput = data.usage.input_tokens ?? mainInput
             mainOutput = data.usage.output_tokens ?? mainOutput
             mainCacheRead = data.usage.cache_read_input_tokens ?? mainCacheRead
@@ -1298,17 +1399,18 @@ export function buildSessionRoutes(
         if (!workerId) continue
 
         const usage = data.usage
-        const model = data.model
-        const provider = data.provider
-        const pricing = findModelPricing(providers, provider, model)
+        const existing = workers.get(workerId)
+        const model = data.model ?? existing?.model
+        const provider = data.provider ?? existing?.provider
+        const pricing = findUsagePricing(providers, provider, model, ev.ts)
         const costBreakdown = computeUsageCost(
           usage
             ? {
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-                cache_read_input_tokens: usage.cache_read_input_tokens,
-                cache_creation_input_tokens: usage.cache_creation_input_tokens,
-                reasoning_tokens: usage.reasoning_tokens,
+                input_tokens: Math.max(0, (usage.input_tokens ?? existing?.inputTokens ?? 0) - (existing?.inputTokens ?? 0)),
+                output_tokens: Math.max(0, (usage.output_tokens ?? existing?.outputTokens ?? 0) - (existing?.outputTokens ?? 0)),
+                cache_read_input_tokens: Math.max(0, (usage.cache_read_input_tokens ?? existing?.cacheReadTokens ?? 0) - (existing?.cacheReadTokens ?? 0)),
+                cache_creation_input_tokens: Math.max(0, (usage.cache_creation_input_tokens ?? existing?.cacheWriteTokens ?? 0) - (existing?.cacheWriteTokens ?? 0)),
+                reasoning_tokens: Math.max(0, (usage.reasoning_tokens ?? existing?.reasoningTokens ?? 0) - (existing?.reasoningTokens ?? 0)),
               }
             : undefined,
           pricing,
@@ -1325,8 +1427,7 @@ export function buildSessionRoutes(
         // priorUsage 回种后的净增累计，见 coordinator.ts「usage-ledger 对齐」段），
         // 因此逐字段取「最后一个非零值」而不是相加——同一批 token 在多次 activity
         // 事件里重复上报时，相加会按事件数把它记 N 次（主会话那侧同族问题的实测
-        // 放大倍数：19×）。cost 由该快照派生，同样取末值。
-        const existing = workers.get(workerId)
+        // 放大倍数：19×）。成本按快照增量与事件时间累计，重复快照不产生费用。
         const prevInput = existing?.inputTokens ?? 0
         const prevOutput = existing?.outputTokens ?? 0
         const prevCacheRead = existing?.cacheReadTokens ?? 0
@@ -1340,7 +1441,7 @@ export function buildSessionRoutes(
         const nextCacheWrite = cacheWriteTokens || prevCacheWrite
         const nextReasoning = reasoningTokens || prevReasoning
         const nextTotal = totalTokens || prevTotal
-        const nextCost = costBreakdown.total || prevCost
+        const nextCost = prevCost + costBreakdown.total
 
         const worker = {
           workerId,
@@ -1398,26 +1499,16 @@ export function buildSessionRoutes(
       const workerTotalTokens = workerList.reduce((sum, w) => sum + w.totalTokens, 0)
       const workerCost = workerList.reduce((sum, w) => sum + w.cost, 0)
 
-      // Main session cost — resolve provider from model id, compute USD cost.
+      // Prefer request timestamps from the billing ledger, including retries and side paths.
+      // Old sessions without logs fall back to deltas of cumulative event snapshots.
       const mainTotalTokens = mainInput + mainOutput
-      const mainProvider = mainModel
-        ? Object.entries(providers).find(([, p]) =>
-            p.models?.some(m => m.id === mainModel),
-          )?.[0]
-        : undefined
-      const mainPricing = findModelPricing(providers, mainProvider, mainModel)
-      const mainCostBreakdown = computeUsageCost(
-        mainTotalTokens > 0
-          ? {
-              input_tokens: mainInput,
-              output_tokens: mainOutput,
-              cache_read_input_tokens: mainCacheRead,
-              cache_creation_input_tokens: mainCacheWrite,
-              reasoning_tokens: mainReasoning,
-            }
-          : undefined,
-        mainPricing,
-      )
+      try {
+        const rows = parseUsageRows(readFileSync(join(sessionsDir(rec.cwd), id, 'cache-log.jsonl'), 'utf8'))
+        if (rows.length) mainCost = rows.reduce((cost, row) => cost + computeUsageCost({
+          input_tokens: row.input, output_tokens: row.output,
+          cache_read_input_tokens: row.cacheRead, cache_creation_input_tokens: row.cacheCreate,
+        }, findUsagePricing(providers, row.provider ?? mainProvider, row.model, row.t)).total, 0)
+      } catch { /* Missing historical ledger: snapshot estimate remains available. */ }
 
       const mainSession = mainTotalTokens > 0 ? {
         inputTokens: mainInput,
@@ -1428,13 +1519,17 @@ export function buildSessionRoutes(
         totalTokens: mainTotalTokens,
         model: mainModel,
         provider: mainProvider,
-        cost: mainCostBreakdown.total,
+        cost: mainCost,
       } : null
 
       const totalCacheRead = workerCacheRead + (mainSession?.cacheReadTokens ?? 0)
       const totalCacheWrite = workerCacheWrite + (mainSession?.cacheWriteTokens ?? 0)
-      const cacheHitRate = totalCacheRead + totalCacheWrite > 0
-        ? Math.round((totalCacheRead / (totalCacheRead + totalCacheWrite)) * 100)
+      const totalInputTokens = workerInput + (mainSession?.inputTokens ?? 0)
+      // 命中率分母统一 cache-inclusive input（内核 getCacheHitRate 口径）：
+      // read/(read+write) 在 provider 不上报 cache_creation（Codex/Responses 硬编码 0）
+      // 时 read/(read+0) 恒等于 100%，且与同面板 cache 面板的 hitRate 口径不一致（2026-10-03 修复）。
+      const cacheHitRate = totalInputTokens > 0
+        ? Math.round((totalCacheRead / totalInputTokens) * 100)
         : null
 
       return {
@@ -1442,7 +1537,7 @@ export function buildSessionRoutes(
         body: {
           totals: {
             workers: workers.size,
-            inputTokens: workerInput + (mainSession?.inputTokens ?? 0),
+            inputTokens: totalInputTokens,
             outputTokens: workerOutput + (mainSession?.outputTokens ?? 0),
             cacheReadTokens: totalCacheRead,
             cacheWriteTokens: totalCacheWrite,
@@ -1467,7 +1562,9 @@ export function buildSessionRoutes(
       if (!rec) return { status: 404, body: { error: 'Session not found' } }
       const q = typeof params?.q === 'string' ? params.q : ''
       const limit = Math.min(Math.max(Number(params?.limit ?? 50) || 50, 1), 200)
-      const all = await cachedProjectFiles(rec.cwd, params?.refresh === '1')
+      const roots = rec.workspaceRoots ?? [rec.cwd]
+      const lists = await Promise.all(roots.map(async root => (await cachedProjectFiles(root, params?.refresh === '1')).map(file => roots.length > 1 ? resolve(root, file) : file)))
+      const all = [...new Set(lists.flat())]
       return { status: 200, body: { files: rankFiles(all, q, limit) } }
     }, apiToken),
 
@@ -1611,6 +1708,7 @@ export function buildSessionRoutes(
       } catch {
         return { status: 403, body: { error: 'Path outside session cwd' } }
       }
+      if (!relPath && (rec.workspaceRoots?.length ?? 1)>1) return {status:200,body:{path:'',entries:rec.workspaceRoots!.map(root=>({name:basename(root),path:root,isDirectory:true}))}}
       const entries = await listDirEntries(absDir)
       return { status: 200, body: { path: relPath, entries } }
     }, apiToken),
@@ -1657,6 +1755,8 @@ export function buildSessionRoutes(
       if (win) {
         sse.send('replay_window', { seq: 0, ts: Date.now(), type: 'replay_window', data: win })
       }
+      const delegation = manager.getDelegationSnapshot(id)
+      if (delegation) sse.send('delegation_snapshot', { seq: 0, ts: Date.now(), type: 'delegation_snapshot', data: delegation })
       // 后台任务建连快照（seq=0 合成事件，同 replay_window 语义）：服务端权威
       // running 集。内存环截尾会丢掉长寿 job 的 started 事件（回放不到）、
       // sidecar 重启后注册表全空（本地仍挂着 running）——前端据此 upsert +
@@ -1721,6 +1821,8 @@ export function buildSessionRoutes(
         const batch = deferredLive.splice(0)
         await sendCatchup(batch)
       }
+      // Snapshot capture and live handoff do not yield to new interventions.
+      sendApprovalSnapshot(manager, id, sse)
       catchingUp = false
       // A dead peer during the replay above means the subscription was created
       // after onDead already fired — close it out now instead of leaking it.
@@ -1770,16 +1872,6 @@ export function buildSessionRoutes(
         if (!rec) return { status: 404, body: { error: 'Session not found' } }
         return { status: 409, body: { error: 'Delegation request gone (timed out or already resolved)' } }
       }
-      return { status: 200, body: { ok: true } }
-    }, apiToken),
-
-    'POST /sessions/:id/interventions/:requestId/answer': withAuth((body, params) => {
-      const data = (body ?? {}) as { decision?: string; editedInput?: Record<string, unknown>; remember?: boolean }
-      const decision = data.decision ?? 'approve'
-      const ok = manager.answerIntervention(
-        params!.id!, params!.requestId!, decision, data.editedInput, data.remember === true,
-      )
-      if (!ok) return { status: 404, body: { error: 'Pending intervention not found' } }
       return { status: 200, body: { ok: true } }
     }, apiToken),
 
@@ -1991,6 +2083,13 @@ export function buildSessionRoutes(
     // Vision — serve a persisted user-attached image by id. The desktop fetches
     // this with the Bearer header (img src cannot carry headers, so the client
     // turns the bytes into a blob object URL). Binary response: take over `res`.
+    'GET /sessions/:id/tool-outputs/:outputId': withAuth((_body, params) => {
+      const text = manager.readToolOutput(params!.id!, params!.outputId!)
+      return text === undefined
+        ? { status: 404, body: { error: 'Tool output not found' } }
+        : { status: 200, body: { text } }
+    }, apiToken),
+
     'GET /sessions/:id/images/:imgId': withAuth((_body, params, headers, res) => {
       if (!res) return { status: 500, body: { error: 'Response stream is unavailable' } }
       const img = manager.readImage(params!.id!, params!.imgId!)
@@ -2245,8 +2344,13 @@ export function buildSessionRoutes(
     // Git branch graph — ASCII graph for the repo root.
     'GET /git/graph': withAuth(async (_body, params) => {
       const maxCount = params?.maxCount ? Number(params.maxCount) : undefined
-      const graph = await manager.getGitGraph(undefined, maxCount)
-      return { status: 200, body: { graph: graph.split('\n') } }
+      try {
+        const graph = await manager.getGitGraph(undefined, maxCount)
+        return { status: 200, body: { graph: graph ? graph.split('\n') : [], notARepo: false } }
+      } catch (error) {
+        if (error instanceof NonRepositoryError) return { status: 200, body: { graph: [], notARepo: true } }
+        throw error
+      }
     }, apiToken),
 
     // Working-tree changes relative to HEAD (file list only; per-file diff fetched on demand).
@@ -2497,5 +2601,11 @@ export function buildSessionRoutes(
     }, apiToken),
   }
 
+  for (const [key, handler] of Object.entries(routes)) {
+    routes[key] = (body, params, headers, res) => {
+      const rec = params?.id ? manager.getSession(params.id) : undefined
+      return rec ? withWorkspaceRoots(rec.workspaceRoots ?? [rec.cwd], () => handler(body, params, headers, res), rec.id) : handler(body, params, headers, res)
+    }
+  }
   return routes
 }
