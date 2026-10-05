@@ -381,3 +381,4 @@ contributions for this graph`；`including commit co-authors` 仅 GHES 版本成
 - #350 fix(server): 将路由和请求读取异常限制在单次请求内（CLOSED）
 - #349 fix(agent): 取消超时 hook 请求并阻止迟到副作用（CLOSED）
 - #348 fix(fs): 原子编辑保留项目文件的执行权限（CLOSED）
+- #347 fix(tools): 收口目录 grep 与断链写入的文件访问边界（CLOSED）
