@@ -34,6 +34,7 @@
  */
 
 import { spawn } from 'node:child_process'
+import { completionBatch } from '../src/tools/test-completion.js'
 import { forceKillTree } from '../src/platform.js'
 
 /** 无任何输出多久视为挂起。最慢单用例 ~40s（见 test-runner-flags.ts 依据），留足余量。 */
@@ -100,10 +101,11 @@ export function runGuardedChild(opts: GuardOptions): Promise<GuardedResult> {
       failureExcerpt: '',
     }
 
-    const child = spawn(process.execPath, opts.args, {
+    const capture = completionBatch(opts.args, opts.cwd ?? process.cwd(), opts.env ?? process.env)
+    const child = spawn(process.execPath, capture.args, {
       // Windows 的隐藏控制台需可继承，覆盖 Node 内部未提供 windowsHide 的测试 worker。
       stdio: [process.platform === 'win32' ? 'inherit' : 'ignore', 'pipe', 'pipe'],
-      env: opts.env ?? process.env,
+      env: capture.env,
       cwd: opts.cwd,
       shell: false,
       windowsHide: true,
@@ -165,6 +167,7 @@ export function runGuardedChild(opts: GuardOptions): Promise<GuardedResult> {
       // 有失败时再留一段更长的末帧（含 `failing tests:` 明细）——runner 汇总后重放，
       // 让「只 tail 看输出尾部」的用法也能直接定位失败（台账 F5）。
       result.failureExcerpt = (result.fail ?? 0) > 0 ? tailLines.slice(-FAILURE_EXCERPT_LINES).join('\n') : ''
+      capture.finish(result.code === 0 && result.killed === null && exitCode === 0)
       resolve(result)
     }
 

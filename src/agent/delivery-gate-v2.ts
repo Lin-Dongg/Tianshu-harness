@@ -153,6 +153,7 @@ export interface DeliveryReport {
 /** W1 回归防线: inputs for impacted-test coverage assessment. Both provided by
  *  the caller (deliver_task) — the gate itself stays filesystem-free. */
 export interface ModuleCoverageInput {
+  repositoryRoot?: string
   /** Meridian blast radius tests (EvidenceTracker.impactedTests). */
   impactedTests: readonly string[]
   /** Existence probe — resolves relative paths against the session cwd. */
@@ -329,15 +330,22 @@ export function createDeliveryGateV2(opts: {
     const coverage = moduleCoverage && moduleCoverage.impactedTests.length > 0
       && aggregate.attribution !== 'unverified'
       && aggregate.attribution !== 'owned_failure'
-      ? assessImpactedTestCoverage(moduleCoverage.impactedTests, allVerifications, moduleCoverage.testExists)
+      ? assessImpactedTestCoverage(moduleCoverage.impactedTests, allVerifications, moduleCoverage.testExists, moduleCoverage.repositoryRoot)
       : undefined
+    if (coverage?.failed?.length) return {
+      state: 'RED', canDeliver: false, isBlocked: true,
+      reason: `Required impacted tests failed: ${coverage.failed.join(', ')}`,
+      ownedFileCount: ownedFiles.length, externalFileCount: externalFiles.length,
+      verificationCount: allVerifications.length, ...diagnostics, latestVerificationTotals,
+      attributionClass: 'module_unverified', uncoveredImpactedTests: coverage.failed,
+    }
     if (coverage && coverage.uncovered.length > 0) {
       const sample = coverage.uncovered.slice(0, 5)
       return {
         state: 'YELLOW',
         canDeliver: true,
         isBlocked: false,
-        reason: `${ownedFiles.length} owned file(s) lack coverage for ${coverage.uncovered.length} impacted test file(s) (Meridian blast radius): ${sample.join(', ')}${coverage.uncovered.length > sample.length ? ` (+${coverage.uncovered.length - sample.length} more)` : ''}. Run these tests with explicit file targets; a full-scope label alone does not establish their coverage.`,
+        reason: `${ownedFiles.length} owned file(s) lack coverage for ${coverage.uncovered.length} impacted test file(s) (Meridian blast radius): ${sample.join(', ')}${coverage.uncovered.length > sample.length ? ` (+${coverage.uncovered.length - sample.length} more)` : ''}. Run these tests with a supported runner and record complete per-file evidence; command targets and full-scope labels alone do not prove execution.`,
         ownedFileCount: ownedFiles.length,
         externalFileCount: externalFiles.length,
         verificationCount: allVerifications.length,

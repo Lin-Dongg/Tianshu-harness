@@ -1,3 +1,5 @@
+import { prepareCompletionCapture } from './test-completion.js'
+import { verificationArgv, shellWord } from './verification-command.js'
 import { applyBatchCounts, formatTestCounts } from './test-output-counts.js'
 import { DisplayOutputBuffer } from './display-output-buffer.js'
 import { readFile, stat, glob } from 'node:fs/promises'
@@ -784,9 +786,13 @@ export function runTestCommandIn(
   // Normalize for the host OS: on Windows npm/npx/tsx are `.cmd` shims that need
   // a shell (else modern Node throws EINVAL); node/pytest spawn directly.
   // Declared commands (verify.test / fingerprint) are full shell strings.
+  const completion = prepareCompletionCapture(testCommand.shell ? testCommand.command : [testCommand.command, ...testCommand.args].map(shellWord).join(' '), cwd)
+  const capturedArgv = completion ? verificationArgv(completion.command) : undefined
+  const executionCommand = capturedArgv?.[0] ?? testCommand.command
+  const executionArgs = capturedArgv?.slice(1) ?? testCommand.args
   const spawnSpec: ResolvedTestSpawn = testCommand.shell
-    ? { command: testCommand.command, args: testCommand.args, shell: true }
-    : resolveTestSpawn(testCommand.command, testCommand.args, cwd)
+    ? { command: completion?.command ?? testCommand.command, args: testCommand.args, shell: true }
+    : resolveTestSpawn(executionCommand, executionArgs, cwd)
   return new Promise<ToolResult>((resolve) => {
       // Single-settlement guard: timeout, abort, close and error can all race
       // (e.g. the killed child's `close` fires after the timeout already
@@ -800,7 +806,7 @@ export function runTestCommandIn(
       }
       const child = deps.spawn(spawnSpec.command, spawnSpec.args, {
         cwd,
-        env: buildExecutionEnv(cwd),
+        env: { ...buildExecutionEnv(cwd), ...completion?.env },
         stdio: ['ignore', 'pipe', 'pipe'],
         shell: spawnSpec.shell,
         // Own process group on POSIX so killProcessTree can reap the whole test
@@ -845,6 +851,7 @@ export function runTestCommandIn(
 
       const timer = deps.setTimeout(async () => {
         if (!claimSettlement()) return
+        completion?.dispose()
         deps.kill(child, 'SIGTERM')
         deps.setTimeout(() => deps.kill(child, 'SIGKILL'), 3000)
         const stdoutTail = stdoutDecoder.end()
@@ -885,6 +892,7 @@ export function runTestCommandIn(
       const onAbort = () => {
         if (!claimSettlement()) return
         deps.clearTimeout(timer)
+        completion?.dispose()
         deps.kill(child, 'SIGTERM')
         deps.setTimeout(() => deps.kill(child, 'SIGKILL'), 3000)
         uiOutput.flush()
@@ -920,6 +928,7 @@ export function runTestCommandIn(
         if (testCommand.command === 'tsx' && raw.includes('EPERM') && testCommand.args[0] === '--test') {
           const args = ['--import', 'tsx', '--test', ...testCommand.args.slice(1)]
           const retryCmd: RunnableTestCommand = { ...testCommand, command: 'node', args, display: `node --import tsx --test ${testCommand.args.slice(1).join(' ')}` }
+          completion?.dispose()
           resolve(await runTestCommandIn(cwd, retryCmd, params, filter, timeout, deps))
           return
         }
@@ -941,7 +950,11 @@ export function runTestCommandIn(
         const zeroCounts = parsed.passed === 0 && parsed.failed === 0 && parsed.skipped === 0
         const invocationFailed = exitCode !== 0 && zeroCounts && testCommand.runner !== 'declared'
         const invocationGuidance = '测试运行器启动失败或崩溃。请检查测试命令是否正确，必要时用 bash 手动运行以诊断环境问题。'
+        const coverage = completion?.read(exitCode)
+        completion?.dispose()
         const verification: VerificationMetadata = {
+          ...(coverage ? { coverage } : {}),
+          ...(!coverage?.complete ? { userGuidance: '缺少完整逐文件完成证明；未知运行器或未完成执行不能补齐交付覆盖。' } : {}),
           command: testCommand.display,
           kind: 'test',
           status: exitCode === 0 ? 'passed' : invocationFailed ? 'blocked' : 'failed',
@@ -1009,6 +1022,7 @@ export function runTestCommandIn(
       })
 
       child.on('error', async (err) => {
+        completion?.dispose()
         deps.clearTimeout(timer)
         if (!claimSettlement()) return
         uiOutput.flush()

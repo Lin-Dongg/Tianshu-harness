@@ -355,7 +355,19 @@ export type VerificationBlockedReason =
   | 'timeout'               // tests timed out
   | 'invocation_failure'    // runner crashed / EPERM / could not start
 
+export interface TestCompletionCoverage {
+  version: 1
+  runId: string
+  runner: 'node-test'
+  cwd: string
+  repositoryRoot: string
+  complete: boolean
+  filtered: boolean
+  files: Array<{ path: string; outcome: 'passed' | 'failed' | 'incomplete'; tests: number; skipped: number; cancelled: number }>
+}
+
 export interface VerificationMetadata {
+  coverage?: TestCompletionCoverage
   stale?: boolean
   command: string
   status: 'passed' | 'failed' | 'blocked'

@@ -126,6 +126,24 @@ test('input validation rejects malformed finite fields and release does not inse
   assert.equal(browserErrorResponse(Error('arbitrary failure')).body.code, 'operation_failed')
 })
 
+test('a failed release still attempts the remaining held inputs and converges on retry', async () => {
+  const state = new BrowserInputState()
+  const sent: string[] = []
+  state.record({ type: 'mousePressed', button: 'left', x: 1, y: 1 })
+  state.record({ type: 'mousePressed', button: 'right', x: 1, y: 1 })
+  let failOnce = true
+  // 一项送失败不得跳过其余项——否则「右键从未被尝试释放」。
+  await assert.rejects(state.release(async (event) => {
+    sent.push(`${event.type}:${event.button}`)
+    if (failOnce) { failOnce = false; throw Error('transient') }
+  }))
+  assert.deepEqual(sent, ['mouseReleased:left', 'mouseReleased:right'])
+  // 送达的项已清账，重试只补未送达的那一项。
+  const retry: string[] = []
+  await state.release(async (event) => { retry.push(`${event.type}:${event.button}`) })
+  assert.deepEqual(retry, ['mouseReleased:left'])
+})
+
 test('overlapping driver rebinds reject the intermediate callback too', async () => {
   const first = driver(), intermediate = driver(), last = driver(), stream = new FrameStream(first.fake)
   const frames: ScreencastFrame[] = []
@@ -154,4 +172,23 @@ test('stale CDP binding never emits a release into the replacement context', asy
   }
   await assert.rejects(stream.dispatchInput({ type: 'keyDown', key: 'Enter', code: 'Enter' }, id), /target changed/)
   assert.deepEqual(d.events, [], 'a rejected press must not create a release on the new document')
+})
+
+test('frames dropped for invalid data or dimensions are counted instead of vanishing silently', async () => {
+  const d = driver(), stream = new FrameStream(d.fake), frames: ScreencastFrame[] = []
+  const unsubscribe = await stream.subscribe(frame => frames.push(frame))
+  const sink = d.callback()
+  sink({ data: 'bad', width: 0, height: 600, seq: 1 })
+  sink({ data: 'bad', width: 800, height: 0, seq: 2 })
+  sink({ data: '', width: 800, height: 600, seq: 3 })
+  assert.equal(stream.droppedFrames, 3, 'unusable frames must be observable, not silent')
+  sink({ data: 'good', width: 800, height: 600, seq: 4 })
+  assert.equal(stream.droppedFrames, 3, 'a valid frame is not a drop')
+  assert.equal(frames.at(-1)?.data, 'good')
+  // 过期帧（失效/背压）是正常路径，不计入丢弃。
+  const stale = d.callback()
+  await stream.changeInteraction()
+  stale({ data: 'stale', width: 800, height: 600, seq: 9 })
+  assert.equal(stream.droppedFrames, 3, 'stale frames are expected backpressure, not drops')
+  unsubscribe(); await tick()
 })

@@ -10,6 +10,7 @@ export class FrameStream {
   private detached = false
   private sequence = 0
   private generation = 0
+  private droppedFrameCount = 0
   private contextId = randomUUID()
   private lifecycle: Promise<unknown> = Promise.resolve()
   private unwatch?: () => void
@@ -18,6 +19,8 @@ export class FrameStream {
   get interactionId(): string { return this.contextId }
   get streaming(): boolean { return this.active }
   get subscriberCount(): number { return this.subscribers.size }
+  /** 因数据/尺寸非法而被丢弃的帧数——「面板黑屏但 streaming 仍为 true」时的可观测信号。 */
+  get droppedFrames(): number { return this.droppedFrameCount }
 
   assertInteraction(expected: unknown): void {
     if (expected === undefined) return // Legacy callers retain their wire contract.
@@ -61,8 +64,13 @@ export class FrameStream {
     return next
   }
   private stamp(frame: ScreencastFrame | null, generation: number): ScreencastFrame | null {
-    if (!frame || generation !== this.generation || this.detached ||
-      !frame.data || !Number.isFinite(frame.width) || !Number.isFinite(frame.height) || frame.width <= 0 || frame.height <= 0) return null
+    // 过期/已分离是正常路径（背压与失效），不计入丢弃统计。
+    if (!frame || generation !== this.generation || this.detached) return null
+    // 数据/尺寸非法则是异常：帧本可呈现却被丢，静默会让面板黑屏而 streaming 仍报 true。
+    if (!frame.data || !Number.isFinite(frame.width) || !Number.isFinite(frame.height) || frame.width <= 0 || frame.height <= 0) {
+      this.droppedFrameCount++
+      return null
+    }
     return { ...frame, seq: ++this.sequence, interactionId: this.contextId }
   }
   async captureFrame(opts?: ScreencastOptions): Promise<ScreencastFrame | null> {

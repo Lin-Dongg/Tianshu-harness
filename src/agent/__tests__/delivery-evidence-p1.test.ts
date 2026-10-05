@@ -143,7 +143,7 @@ it('P1: actual blocked run_tests remains blocked, and its missing-infrastructure
 })
 
 for (const path of ['tests/test_consumer.py', 'desktop/scripts/__tests__/consumer.test.ts', 'tests/consumer.test.js']) {
-  it(`P1: existing ${path} stays uncovered until an explicit test run covers it`, async () => {
+  it(`P1: existing ${path} stays uncovered without a completion receipt`, async () => {
     await withWorkspace(async cwd => {
       file(cwd, path)
       const ctx = context()
@@ -152,7 +152,7 @@ for (const path of ['tests/test_consumer.py', 'desktop/scripts/__tests__/consume
       assert.equal(blocked.calls, 0)
       assert.match(blocked.result.content, /impacted tests/)
       ctx.ledger.record({ type: 'verification', command: `test ${path}`, status: 'passed', meta: { scope: 'targeted', kind: 'test', targetFiles: [path] } })
-      assert.equal((await commit(ctx, cwd, [path])).calls, 1, 'a supported targeted runner can discharge this obligation')
+      assert.equal((await commit(ctx, cwd, [path])).calls, 0, 'legacy target selection is not completion proof')
     })
   })
 }

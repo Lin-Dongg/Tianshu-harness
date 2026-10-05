@@ -109,6 +109,11 @@ export class BrowserDebugSession {
     return this.frames.streaming
   }
 
+  /** 因数据/尺寸非法被丢弃的帧数——「面板黑屏但 streaming=true」时的可观测信号。 */
+  get droppedFrames(): number {
+    return this.frames.droppedFrames
+  }
+
   /** 取一张当前画面（连接瞬间补首帧，避免静态页黑屏）。无能力时返回 null。 */
   async captureFrame(opts?: ScreencastOptions): Promise<ScreencastFrame | null> {
     return await this.frames.captureFrame(opts)

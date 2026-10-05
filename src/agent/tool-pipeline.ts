@@ -1852,6 +1852,8 @@ async function executeToolUseInner(
           const m: Record<string, unknown> = { scope: v?.scope ?? (filter ? 'targeted' : 'full') }
           if (v) {
             if (v.kind) m.kind = v.kind
+            if (v.coverage) m.coverage = v.coverage
+            if (v.userGuidance) m.userGuidance = v.userGuidance
             m.exitCode = v.exitCode
             m.passed = v.passed
             m.failed = v.failed

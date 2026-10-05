@@ -14,7 +14,7 @@
 # 用法:
 #   bash scripts/dispose-community-pr.sh <PR#> [--sync-commit <hash>] [--note "自定义附注"] [--push] [--dry-run]
 # 环境:
-#   PUB_DIR  公开仓 checkout（默认 /Users/banxia/app/Tianshu，与 sync-to-public.sh 同）
+#   PUB_DIR  公开仓 checkout（默认 $HOME/app/Tianshu，与 sync-to-public.sh 同口径）
 #   GH_REPO  公开仓（默认 huiliyi37/Tianshu-Tui）
 #   OWNER    仓库拥有者 login（默认 huiliyi37，署名过滤用）
 #
@@ -29,7 +29,7 @@ SYNC_COMMIT=""
 NOTE=""
 DO_PUSH=0
 DRY=0
-PUB_DIR="${PUB_DIR:-/Users/banxia/app/Tianshu}"
+PUB_DIR="${PUB_DIR:-$HOME/app/Tianshu}"
 GH_REPO="${GH_REPO:-huiliyi37/Tianshu-harness}"
 OWNER="${OWNER:-huiliyi37}"
 

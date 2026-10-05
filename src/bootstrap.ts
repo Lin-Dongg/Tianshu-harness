@@ -1,3 +1,4 @@
+import { resolveDeliveryImpact } from './agent/delivery-impact.js'
 /**
  * bootstrap.ts — 共享初始化层，由 T9 ANSI 唯一生产入口 src/main.ts 调用。
  *
@@ -809,6 +810,7 @@ export function createInteractiveToolRegistry(
     meridianIndexer: refs.meridianIndexer,
     getTaskContract: () => refs.getTaskContract?.(),
     getImpactedTests: () => refs.getImpactedTests?.() ?? [],
+    resolveDeliveryImpact: (cwd, files) => resolveDeliveryImpact(cwd, files, refs.meridianIndexer),
     // P4 收束闸：PAL 收敛案件快照（闭包现读 store——B1Context 每次调用现构造，
     // hook 无法"写入"它；这是与其他 getter 一致的既有注入模式）
     getPalConvergedCases: () => refs.getProblemAttackStore?.()?.convergedCasesSnapshot() ?? [],

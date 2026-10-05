@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -29,6 +30,8 @@ export async function runVerification(command: string, failTest: boolean, ownFai
     if (!options.noTestInfra) writeFileSync(join(cwd, 'package.json'), JSON.stringify({ type: 'module', private: true, scripts: { test: 'node --test', typecheck: 'node -e \"process.exit(0)\"', lint: 'node -e \"process.exit(0)\"', build: 'node -e \"process.exit(0)\"' } }))
     writeFileSync(join(cwd, 'good.test.mjs'), "import { test } from 'node:test'; test('passing fixture', () => {});\n")
     writeFileSync(join(cwd, 'bad.test.mjs'), `import { test } from 'node:test'; import assert from 'node:assert/strict'; test('fixture assertion', () => assert.equal(1, ${failTest ? 2 : 1}));\n`)
+    execFileSync('git', ['init', '-q'], { cwd })
+    execFileSync('git', ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.com', 'commit', '--allow-empty', '-qm', 'fixture'], { cwd })
     const ledger = createTaskLedger({ taskId: 'bash-evidence-test' })
     ledger.record({ type: 'file_write', path: 'feature.js' })
     if (ownFailingTest) ledger.record({ type: 'file_write', path: 'bad.test.mjs' })

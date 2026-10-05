@@ -268,9 +268,7 @@ export class MeridianDb {
 
       for (const imp of result.imports) {
         const firstSymbol = result.symbols[0]
-        if (firstSymbol) {
-          insertEdge.run(firstSymbol.id, `${imp}:*:0`, 'imports', 1.0, 'extracted')
-        }
+        insertEdge.run(firstSymbol?.id ?? `${result.filePath}:*:0`, `${imp}:*:0`, 'imports', 1.0, 'extracted')
       }
     })
     tx()
@@ -424,16 +422,17 @@ export class MeridianDb {
   }
 
   /** Get files that depend on the given file (reverse edges: who imports/calls into this file) */
-  getReverseDependents(filePath: string): Array<{ file: string; kind: string; weight: number }> {
+  getReverseDependents(filePath: string): Array<{ file: string; kind: string; weight: number; confidence?: EdgeConfidence }> {
     return this.db.prepare(`
       SELECT DISTINCT
         substr(e.source_id, 1, instr(e.source_id, ':') - 1) as file,
         e.kind,
-        e.weight
+        e.weight,
+        e.confidence
       FROM edges e
       WHERE e.target_id GLOB ?
         AND substr(e.source_id, 1, instr(e.source_id, ':') - 1) != ?
-    `).all(`${globEscape(filePath)}:*`, filePath) as Array<{ file: string; kind: string; weight: number }>
+    `).all(`${globEscape(filePath)}:*`, filePath) as Array<{ file: string; kind: string; weight: number; confidence?: EdgeConfidence }>
   }
 
   /** Get files this file depends on via imports edges (P2-2 出边 API，与入边对称）。

@@ -1,3 +1,4 @@
+import type { DeliveryImpact } from './delivery-impact.js'
 import { getEffectiveVerifications } from './verification-attribution.js'
 import { captureCommitVersion } from './commit-version.js'
 /**
@@ -199,6 +200,7 @@ export interface B1Context {
   /** W1 回归防线: Meridian blast-radius tests (EvidenceTracker.impactedTests).
    *  Absent → coverage check disabled (unchanged behavior). */
   getImpactedTests?: () => string[]
+  resolveDeliveryImpact?: (cwd: string, files: readonly string[]) => Promise<DeliveryImpact>
   /** P4 收束闸：PAL 收敛案件快照（bootstrap 闭包现读 store）。收敛假设的
    *  targets 完全没进本次交付范围 → 弱 advisory 提示，绝不阻断。 */
   getPalConvergedCases?: () => import('./problem-attack-loop.js').ConvergedCaseEntry[]
@@ -487,10 +489,15 @@ export function createDeliverTaskTool(getB1Context: (params?: ToolCallParams) =>
       if (currentDirtyFiles) ctx.ownership.autoOwnFromBaseline(currentDirtyFiles)
       // W1 回归防线: feed Meridian blast radius into the gate. existsSync filters
       // deleted/renamed tests (static-analysis false positives) into "uncoverable".
-      const impactedTests = ctx.getImpactedTests?.() ?? []
+      const dirtySet = currentDirtyFiles ? new Set(currentDirtyFiles) : undefined
+      const scopeFiles = [...new Set([...ctx.ownership.getOwnedFiles(), ...ctx.ownership.getCoOwnedFiles()])].filter(file => !dirtySet || dirtySet.has(file))
+      const impact = ctx.resolveDeliveryImpact ? await ctx.resolveDeliveryImpact(params.cwd, scopeFiles) : undefined
+      if (impact && !impact.resolved) return { content: impact.reason ?? 'impact_unresolved', isError: true, errorKind: 'delivery_gate' }
+      const impactedTests = impact?.requiredTests ?? ctx.getImpactedTests?.() ?? []
       const moduleCoverage = impactedTests.length > 0
         ? {
             impactedTests,
+            repositoryRoot: params.cwd,
             testExists: (p: string) => existsSync(isAbsolute(p) ? p : join(params.cwd, p)),
           }
         : undefined
@@ -528,6 +535,11 @@ export function createDeliverTaskTool(getB1Context: (params?: ToolCallParams) =>
           ? `Verifications: ${report.verificationCount}`
           : 'Verifications: none (no tests were run for this task)',
       ]
+      if (impact) {
+        lines.push(`Impact policy ${impact.policyVersion ?? 1}: ${impact.requiredTests.length} required, ${impact.advisoryTests.length} advisory test(s).`)
+        for (const test of impact.requiredTests.slice(0, 5)) lines.push(`  ${test}: ${(impact.reasons?.[test] ?? []).map(step => `${step.from} → ${step.to} (${step.kind}/${step.confidence})`).join('; ') || 'modified test'}`)
+        if (impact.advisoryTests.length) lines.push(`  Advisory: ${impact.advisoryTests.slice(0, 5).join(', ')}`)
+      }
       if (ctx.continuityStatus) lines.push(`Session evidence continuity: ${ctx.continuityStatus}`)
 
       // 层 1a: echo latest verification totals so agents copy real numbers

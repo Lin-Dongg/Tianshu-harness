@@ -1,3 +1,4 @@
+import { sealCompletionRun } from '../src/tools/test-completion.js'
 import { glob, mkdir } from 'node:fs/promises'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { constants, tmpdir } from 'node:os'
@@ -260,6 +261,7 @@ if (failureExcerpts.length > 0) {
     for (const line of excerpt.split('\n')) console.log(`  ${line}`)
   }
 }
+sealCompletionRun(batches.length, shuttingDown ? -1 : batches.length)
 const exitCode = interruptSignal !== null ? 128 + (constants.signals[interruptSignal] ?? 15) : worstExit
 // process.exit() 不等异步 stdio 排空：stdout 被管道/文件重定向时是全缓冲——主输出
 // （转发的批次流）可能丢尾、或与 stderr（无缓冲、先落盘）交错错位，表现为「失败

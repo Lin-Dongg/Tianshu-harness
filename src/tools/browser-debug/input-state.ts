@@ -32,15 +32,36 @@ export class BrowserInputState {
     if (event.type === 'keyDown') this.keys.set(event.code ?? event.key ?? '', event)
     if (event.type === 'keyUp') this.keys.delete(event.code ?? event.key ?? '')
   }
+  /**
+   * 释放所有已记录的按下项。**逐项独立发送**：一项送达失败不得跳过其余项
+   * （否则「右键从未被尝试释放」）；送达成功的立即清账，失败项保留待下次重试
+   * （与 `failed release preserves owner` 的 fail-closed 语义一致），任一失败
+   * 则在末尾整体抛出。
+   */
   async release(send: (event: BrowserInputEvent) => Promise<void>) {
-    for (const [button, event] of this.buttons) {
-      await send({ ...event, type: 'mouseReleased', buttons: 0, modifiers: 0, clickCount: 1 })
-      this.buttons.delete(button)
+    let firstFailure: unknown
+    let failed = false
+    const attempt = async (deliver: () => Promise<void>, clear: () => void): Promise<void> => {
+      try {
+        await deliver()
+        clear()
+      } catch (error) {
+        if (!failed) { failed = true; firstFailure = error }
+      }
     }
-    for (const [key, event] of this.keys) {
+    for (const [button, event] of [...this.buttons]) {
+      await attempt(
+        () => send({ ...event, type: 'mouseReleased', buttons: 0, modifiers: 0, clickCount: 1 }),
+        () => this.buttons.delete(button),
+      )
+    }
+    for (const [key, event] of [...this.keys]) {
       const { text: _text, ...rest } = event
-      await send({ ...rest, type: 'keyUp', modifiers: 0 })
-      this.keys.delete(key)
+      await attempt(
+        () => send({ ...rest, type: 'keyUp', modifiers: 0 }),
+        () => this.keys.delete(key),
+      )
     }
+    if (failed) throw firstFailure
   }
 }

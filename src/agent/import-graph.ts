@@ -137,24 +137,25 @@ function scanImportsInto(
 const ASYNC_BATCH = 40
 const yieldLoop = () => new Promise<void>((r) => setImmediate(r))
 
-async function collectTsFilesAsync(cwd: string): Promise<string[]> {
+async function collectTsFilesAsync(cwd: string, requireComplete = false): Promise<string[]> {
   const { readdir } = await import('fs/promises')
   const files: string[] = []
   const pending = [cwd]
-  while (pending.length > 0 && files.length < MAX_FILES) {
+  while (pending.length > 0 && (!requireComplete || files.length <= MAX_FILES) && files.length < MAX_FILES + (requireComplete ? 1 : 0)) {
     const dir = pending.pop()!
     let entries: import('fs').Dirent[]
     try {
       entries = await readdir(dir, { withFileTypes: true })
     } catch {
+      if (requireComplete) throw new Error('unreadable import graph directory')
       continue // 与同步版同语义：不可读子目录静默跳过（best-effort 特性）
     }
     for (const entry of entries) {
-      if (files.length >= MAX_FILES) break
+      if (files.length >= MAX_FILES + (requireComplete ? 1 : 0)) break
       if (entry.name.startsWith('.') || entry.name === 'node_modules' || entry.name === 'dist') continue
       const full = join(dir, entry.name)
       if (entry.isDirectory()) pending.push(full)
-      else if (/\.(ts|tsx)$/.test(entry.name) && !entry.name.endsWith('.d.ts')) files.push(full)
+      else if ((requireComplete ? /\.(?:[cm]?[jt]sx?|py|go)$/ : /\.(ts|tsx)$/).test(entry.name) && !entry.name.endsWith('.d.ts')) files.push(full)
     }
     await yieldLoop()
   }
@@ -168,9 +169,9 @@ async function collectTsFilesAsync(cwd: string): Promise<string[]> {
  * （2026-08 起桌面复发事故，tool-pipeline 冷库回落路径）。只可在
  * fire-and-forget 里调用，不要 await 在写工具关键路径上。
  */
-export async function buildImportGraphAsync(cwd: string): Promise<ImportGraph | null> {
+export async function buildImportGraphAsync(cwd: string, options?: { requireComplete?: boolean }): Promise<ImportGraph | null> {
   const { readFile } = await import('fs/promises')
-  const files = await collectTsFilesAsync(cwd)
+  const files = await collectTsFilesAsync(cwd, options?.requireComplete)
   if (files.length > MAX_FILES) return null
 
   const forward = new Map<string, Set<string>>()
@@ -180,7 +181,7 @@ export async function buildImportGraphAsync(cwd: string): Promise<ImportGraph | 
   for (let i = 0; i < files.length; i += ASYNC_BATCH) {
     const batch = files.slice(i, i + ASYNC_BATCH)
     const contents = await Promise.all(batch.map(async (f) => {
-      try { return await readFile(f, 'utf8') } catch { return null }
+      try { return await readFile(f, 'utf8') } catch { if (options?.requireComplete) throw new Error('unreadable import graph file'); return null }
     }))
     for (let j = 0; j < batch.length; j++) {
       const content = contents[j]

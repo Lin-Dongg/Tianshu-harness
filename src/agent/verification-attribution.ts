@@ -1,3 +1,6 @@
+import { realpathSync } from 'node:fs'
+import { resolve, relative, isAbsolute } from 'node:path'
+import { readCompletionCoverage } from '../tools/test-completion.js'
 /**
  * VerificationAttribution — 验证结果归因 (B1-4)
  *
@@ -178,12 +181,14 @@ function eventToVerificationMetadata(event: TaskLedgerEvent): VerificationMetada
     status,
     scope,
     kind: verificationKind(event.meta),
+    ...(readCompletionCoverage(event.meta?.coverage) ? { coverage: readCompletionCoverage(event.meta?.coverage) } : {}),
     exitCode: asNumber(event.meta?.exitCode, status === 'failed' ? 1 : 0),
     passed: asNumber(event.meta?.passed, status === 'passed' ? 1 : 0),
     failed: asNumber(event.meta?.failed, status === 'failed' ? 1 : 0),
     skipped: asNumber(event.meta?.skipped, 0),
     durationMs: asNumber(event.meta?.durationMs, 0),
     ...(failureKind ? { failureKind } : {}),
+    ...(asString(event.meta?.userGuidance) ? { userGuidance: asString(event.meta?.userGuidance) } : {}),
     ...(targetFiles.length > 0 ? { targetFiles } : {}),
     ...(resolvedCommand ? { resolvedCommand } : {}),
     ...(recommendedCommand ? { recommendedCommand } : {}),
@@ -201,7 +206,7 @@ function eventToVerificationMetadata(event: TaskLedgerEvent): VerificationMetada
 function verificationKey(event: TaskLedgerEvent): string {
   const command = event.command ?? 'unknown'
   const scope = event.meta?.scope ?? 'targeted'
-  const identity = `${verificationKind(event.meta) ?? 'unknown'}::${asString(event.meta?.verificationPhase) ?? 'in-place'}::${asString(event.meta?.snapshotRef) ?? 'legacy'}`
+  const identity = `${verificationKind(event.meta) ?? 'unknown'}::${asString(event.meta?.verificationPhase) ?? 'in-place'}::${asString(event.meta?.snapshotRef) ?? asString(event.meta?.workspaceFingerprint) ?? 'legacy'}`
   const resolvedCommand = asString(event.meta?.resolvedCommand) ?? ''
 
   // meta.targetFiles (populated by tools like run_tests) is authoritative:
@@ -209,6 +214,8 @@ function verificationKey(event: TaskLedgerEvent): string {
   // Using it prevents key mismatch when the same tests are run with
   // different filter syntax (e.g. "volatile-snapshot.test" vs
   // "src/prompt/__tests__/volatile-snapshot.test.ts").
+  const coverage = readCompletionCoverage(event.meta?.coverage)
+  if (coverage) return `completion::${coverage.runner}::${coverage.cwd}::${scope}::${coverage.filtered}::${coverage.files.map(f => f.path).sort().join('|')}::${identity}`
   const metaTargetFiles = getMetaTargetFiles(event.meta)
   const cmdTargetFiles = extractTestFiles(command)
   const resolvedTargetFiles = extractTestFiles(resolvedCommand)
@@ -313,22 +320,17 @@ export type AttributionClass =
 // 不触发升级；仅"存在且从未被 passed 验证覆盖"的测试才计入 uncovered。
 
 export interface ImpactedTestCoverage {
+  failed?: string[]
   /** Tests that exist on disk but were never covered by a passed verification. */
   uncovered: string[]
   /** Tests from the impact set that no longer exist (deleted/renamed) — recorded, never blocking. */
   uncoverable: string[]
 }
 
+function canonicalRoot(path: string): string { try { return realpathSync(path) } catch { return resolve(path) } }
+
 function normalizePathForMatch(p: string): string {
   return p.replace(/\\/g, '/').replace(/^\.\//, '')
-}
-
-/** Suffix-tolerant path equality: 'src/a/__tests__/b.test.ts' matches
- *  'a/__tests__/b.test.ts' and vice versa (verification target files may be
- *  recorded relative to different roots than Meridian paths). */
-function pathsMatch(a: string, b: string): boolean {
-  if (a === b) return true
-  return a.endsWith(`/${b}`) || b.endsWith(`/${a}`)
 }
 
 /**
@@ -342,17 +344,27 @@ export function assessImpactedTestCoverage(
   impactedTests: readonly string[],
   verifications: readonly VerificationMetadata[],
   existsFn: (path: string) => boolean,
+  repositoryRoot?: string,
 ): ImpactedTestCoverage {
   if (impactedTests.length === 0) return { uncovered: [], uncoverable: [] }
 
-  const passed = verifications.filter(v => v.status === 'passed' && v.kind === 'test' && v.scope !== 'unknown')
-
-  const coveredFiles: string[] = []
-  for (const v of passed) {
-    const targets = v.targetFiles && v.targetFiles.length > 0
-      ? v.targetFiles
-      : [...extractTestFiles(v.command), ...extractTestFiles(v.resolvedCommand ?? '')]
-    for (const t of targets) coveredFiles.push(normalizePathForMatch(t))
+  const coveredFiles = new Set<string>()
+  const failedFiles = new Set<string>()
+  for (const v of verifications) {
+    const c = readCompletionCoverage(v.coverage)
+    if (repositoryRoot) {
+      if (!c) continue
+      const inside = relative(canonicalRoot(c.repositoryRoot), canonicalRoot(repositoryRoot))
+      if (isAbsolute(inside) || inside === '..' || inside.startsWith('../') || inside.startsWith('..\\')) continue
+    }
+    const pathForScope = (path: string) => repositoryRoot && c
+      ? normalizePathForMatch(relative(canonicalRoot(repositoryRoot), resolve(canonicalRoot(c.repositoryRoot), path)))
+      : normalizePathForMatch(path)
+    if (!v.stale && v.status === 'failed' && v.kind === 'test' && c) for (const f of c.files) if (f.outcome === 'failed') failedFiles.add(pathForScope(f.path))
+    if (v.stale || v.status !== 'passed' || v.kind !== 'test' || v.exitCode !== 0 || !c?.complete || c.filtered) continue
+    for (const f of c.files) {
+      if (f.outcome === 'passed' && f.tests > f.skipped && f.cancelled === 0) coveredFiles.add(pathForScope(f.path))
+    }
   }
 
   const uncovered: string[] = []
@@ -363,11 +375,12 @@ export function assessImpactedTestCoverage(
       continue
     }
     const normalized = normalizePathForMatch(test)
-    if (!coveredFiles.some(c => pathsMatch(normalized, c))) {
+    if (!coveredFiles.has(normalized)) {
       uncovered.push(test)
     }
   }
-  return { uncovered, uncoverable }
+  const failed = impactedTests.filter(test => existsFn(test) && failedFiles.has(normalizePathForMatch(test)))
+  return { uncovered, uncoverable, ...(failed.length ? { failed } : {}) }
 }
 
 export interface AttributionResult {

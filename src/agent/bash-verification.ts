@@ -1,11 +1,18 @@
 import { basename } from 'node:path'
+import { classifyVerificationCommand, verificationArgv } from '../tools/verification-command.js'
 import { applyBatchCounts, type TestCounts } from '../tools/test-output-counts.js'
 import type { ToolResult, VerificationMetadata } from '../tools/types.js'
 
 /** This parser only classifies an already executed command; it never executes it. */
 export function inferBashVerificationScope(command: string): Pick<VerificationMetadata, 'scope' | 'targetFiles' | 'kind'> {
-  if (/[;&|<>`\n\r]/.test(command)) return { scope: 'unknown' }
-  const tokens = command.match(/"[^"]*"|'[^']*'|[^\s]+/g)?.map(t => t.replace(/^['"]|['"]$/g, '')) ?? []
+  const tokens = verificationArgv(command)
+  if (!tokens) return { scope: 'unknown' }
+  const invocationInfo = classifyVerificationCommand(command)
+  if (invocationInfo.nodeTest || invocationInfo.batchRunner) {
+    return { kind: 'test', scope: invocationInfo.filtered ? 'unknown' : invocationInfo.targets.length ? 'targeted' : 'full', ...(invocationInfo.targets.length ? { targetFiles: invocationInfo.targets } : {}) }
+  }
+  if (tokens[0] === 'rtk') { tokens.shift(); if (String(tokens[0]) === 'proxy') tokens.shift() }
+  if (tokens[0] === 'rtk') return { scope: 'unknown' }
   const executable = basename((tokens[0] ?? '').replaceAll('\\', '/')).replace(/\.(?:exe|cmd)$/i, '')
   const args = tokens.slice(1)
   const invocation = [executable, ...args].join(' ')
@@ -58,7 +65,9 @@ export function buildBashVerification(
   const counts: TestCounts = { passed, failed, skipped, exitCode: exitCode ?? -1, failures: [] }
   applyBatchCounts(output, counts)
   ;({ passed, failed, skipped } = counts)
-  const scope = inferBashVerificationScope(command)
+  const scope = result?.verification?.coverage
+    ? { kind: 'test' as const, scope: result.verification.scope, targetFiles: result.verification.targetFiles ?? inferBashVerificationScope(command).targetFiles }
+    : inferBashVerificationScope(command)
   const status = outcome.isError || result?.isError || timedOut || failed > 0 || (exitCode !== undefined && exitCode !== 0)
     ? 'failed' : exitCode === 0 && scope.scope !== 'unknown' ? 'passed' : 'blocked'
   const failureKind = timedOut ? 'timeout'
@@ -67,6 +76,8 @@ export function buildBashVerification(
     : undefined
   return {
     command, status, ...scope, passed, failed, skipped, countsReliable: counts.countsReliable,
+    ...(result?.verification?.coverage ? { coverage: result.verification.coverage } : {}),
+    ...(status === 'blocked' || scope.kind === 'test' && !result?.verification?.coverage?.complete ? { userGuidance: classifyVerificationCommand(command).reason ?? '缺少完整逐文件完成证明；请用支持的运行器重新验证。' } : {}),
     ...(exitCode !== undefined ? { exitCode } : {}),
     ...(failureKind ? { failureKind } : {}),
   }

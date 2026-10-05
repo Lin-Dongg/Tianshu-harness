@@ -149,6 +149,7 @@ export function buildBrowserRoutes(
             mode: s.mode,
             headless: s.headless,
             streaming: s.streaming,
+            droppedFrames: s.droppedFrames ?? 0,
             url: s.driver.currentUrl(),
             pageUrls: s.driver.pageUrls(),
           }

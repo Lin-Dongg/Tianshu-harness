@@ -43,3 +43,9 @@ describe('包装对象的可选面转发对账', () => {
       `包装对象漏转发这些面（管理器会静默拿到 undefined）：${missing.join(', ')}`)
   })
 })
+
+it('all shared tool registries resolve current delivery impact rather than historical accumulated tests', () => {
+  const bootstrap = readFileSync(join(process.cwd(), 'src/bootstrap.ts'), 'utf8')
+  assert.match(bootstrap, /resolveDeliveryImpact: \(cwd, files\) => resolveDeliveryImpact\(cwd, files, refs\.meridianIndexer\)/)
+  assert.match(source, /createInteractiveToolRegistry\(/)
+})

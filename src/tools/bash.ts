@@ -1,3 +1,5 @@
+import { prepareCompletionCapture } from './test-completion.js'
+import { inferBashVerificationScope } from '../agent/bash-verification.js'
 import { execFileSync } from 'child_process'
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
@@ -478,8 +480,8 @@ async function executeBashOnce(params: ToolCallParams): Promise<BashExecResult> 
   const rewritten = rtkRewrite(rawCommand, params.toolUseId)
   const mirrorConfig = loadConfig({ cwd: params.cwd }).mirrors
   const rewrittenWithMirrors = rewriteGitHubUrls(rewritten, mirrorConfig)
-  const sandbox = wrapSandboxCommand(rewrittenWithMirrors, params.cwd)
-  const command = sandbox.command
+  let sandbox = wrapSandboxCommand(rewrittenWithMirrors, params.cwd)
+  let command = sandbox.command
   const timeout = resolveCallerTimeoutBudget(rawCommand, Number(params.input.timeout), 120_000) // 非正数/NaN → 默认（#187）；typecheck 形态按闸门预算只抬不压
   const startTime = Date.now()
 
@@ -531,6 +533,8 @@ async function executeBashOnce(params: ToolCallParams): Promise<BashExecResult> 
     })
   }
 
+  const completion = prepareCompletionCapture(rewrittenWithMirrors, params.cwd ?? process.cwd(), getShellCommand().kind)
+  if (completion) { sandbox = wrapSandboxCommand(completion.command, params.cwd); command = sandbox.command }
   return new Promise((resolve) => {
     const shell = getShellCommand()
     // Wrap by shell FAMILY (not fragile cmd-string matching): Git Bash needs
@@ -560,7 +564,7 @@ async function executeBashOnce(params: ToolCallParams): Promise<BashExecResult> 
       // avoids stdio handoff quirks；置于首行以落在 architecture-guards 的 ±10 行窗口内。
       windowsHide: true,
       cwd: params.cwd,
-      env: { ...sanitizeEnv(getResolvedEnv(params.cwd)), ...mirrorEnv, ...earlyFailEnv },
+      env: { ...sanitizeEnv(getResolvedEnv(params.cwd)), ...mirrorEnv, ...earlyFailEnv, ...completion?.env },
       stdio: ['ignore', 'pipe', 'pipe'],
       // detached: true breaks stdio pipes on Windows cmd.exe — the new
       // console created in detached mode doesn't connect back to the parent's
@@ -705,6 +709,9 @@ async function executeBashOnce(params: ToolCallParams): Promise<BashExecResult> 
       // a different one did.
       const headerCommand = rewritten !== rawCommand ? rewritten : rawCommand
       const meta = { command: headerCommand, exitCode, durationMs }
+      const coverage = completion?.read(exitCode)
+      completion?.dispose()
+      const verification = coverage ? { command: rawCommand, kind: 'test' as const, status: exitCode === 0 ? 'passed' as const : 'failed' as const, scope: inferBashVerificationScope(rawCommand).scope === 'targeted' ? 'targeted' as const : 'full' as const, exitCode, coverage } : undefined
       const { isError, errorClass } = classifyBashOutcome(exitCode, stderr, process.platform === 'win32')
       // Sandbox attribution: a bare "Operation not permitted" sends the model
       // into a sudo/chmod retry loop. Name the path and route it to
@@ -799,6 +806,7 @@ async function executeBashOnce(params: ToolCallParams): Promise<BashExecResult> 
             exitCode,
             command: rawCommand,
             sandboxDenial,
+          verification,
           }
         }
 
@@ -837,6 +845,7 @@ async function executeBashOnce(params: ToolCallParams): Promise<BashExecResult> 
           exitCode,
           command: rawCommand,
           sandboxDenial,
+          verification,
         }
       }
 
@@ -858,6 +867,7 @@ async function executeBashOnce(params: ToolCallParams): Promise<BashExecResult> 
         exitCode,
         command: rawCommand,
         sandboxDenial,
+        verification,
       }
     }
 
@@ -885,6 +895,7 @@ async function executeBashOnce(params: ToolCallParams): Promise<BashExecResult> 
       try {
         resolve(await buildResult(code, isTimeout))
       } catch (err) {
+        completion?.dispose()
         const msg = err instanceof Error ? err.message : String(err)
         debugLog(`[bash-buildResult-failed] exit=${code} ${msg}`)
         const tail = (stdout + (stderr ? `\n${stderr}` : '')).slice(-2000)
@@ -904,6 +915,7 @@ async function executeBashOnce(params: ToolCallParams): Promise<BashExecResult> 
       stopExecutionGuards()
       cleanupAbort()
       const cleanupResult = await killProcessTreeAsync(child)
+      completion?.dispose()
       if (cleanupResult !== 'exited') console.warn(`[process-cleanup] pid=${child.pid} status=${cleanupResult}`)
       const stdoutTail = stdoutDecoder.end()
       const stderrTail = stderrDecoder.end()
