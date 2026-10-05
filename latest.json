@@ -1,7 +1,7 @@
 {
   "version": "3.28.0",
   "notes": "v3.28.0——压缩包附件直拖（不占上下文）；Git 工作台（变更/历史/分支/PR + AI 审查）；模型异常与截断可见性（截断续写提醒/429 倒计时/错误引导）；上下文预算死锁修复；Gemini 原生协议；MCP rug-pull 防线；默认推理档 high；CLI 状态行符号化单行 + 余额角标；审批持久可恢复；P0 工具读取内存热修。完整清单见 docs/releases/v3.28.0.md。",
-  "pub_date": "2026-10-05T17:11:49.862Z",
+  "pub_date": "2026-10-05T17:24:36.238Z",
   "platforms": {
     "darwin-aarch64": {
       "url": "https://github.com/huiliyi37/Tianshu-harness/releases/download/v3.28.0/Tianshu_3.28.0_aarch64.app.tar.gz",
@@ -13,7 +13,7 @@
     },
     "windows-x86_64": {
       "url": "https://github.com/huiliyi37/Tianshu-harness/releases/download/v3.28.0/Tianshu_3.28.0_x64-setup.exe",
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR2JkY1BLWlBGZEJvMHR2SGRlK0k3eEUrTC9qR0hvRVlGUGg2bDhXM3hZYlpFTkdaUDNpVlRPc0pRYUxZUmNpZjE3SXZ6ZkhTR05FMDVMR1djRFhqb2dZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxMjEwMTc0CWZpbGU6VGlhbnNodV8zLjI4LjBfeDY0LXNldHVwLmV4ZQoxblUvSXA1OEorMG82WnpUSUVpcm9YaFExL0xLVFk1NjV1alhoRUNidU53YmplTExrc0hidUV0aWRSbDBRdnhGd3pGZGd1TVY1Y09Ja05MU1pDQnlBdz09Cg=="
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR2M1b2JocE0ra1k3SjJIQ1dtVTJJKy9HdDZmRW9CVXhORVo4b3JYUDFIc3d2ZEcxVnlycVphWENjd3JBUSsvS2dZZFV3SGZnQkRDbGZFUkxYT3lqWVFRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxMjIxMDc1CWZpbGU6VGlhbnNodV8zLjI4LjBfeDY0LXNldHVwLmV4ZQp5RTFpTzh6NkhxSnRyM3Z2Zi9pY21Sb2ZnWWZheFNPZCt3NTQ5azFxaVFyYnZqZ3VpRTNXOUNqWFVTcElXdXRZZUNtS2tSS0ZQZkdjaU9TZ0dMQ09EZz09Cg=="
     },
     "linux-x86_64": {
       "url": "https://github.com/huiliyi37/Tianshu-harness/releases/download/v3.28.0/Tianshu_3.28.0_amd64.AppImage",
