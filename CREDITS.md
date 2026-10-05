@@ -379,3 +379,4 @@ contributions for this graph`；`including commit co-authors` 仅 GHES 版本成
 - #352 fix(repo): 让 Physarum 节点冻结按指定轮次到期（CLOSED）
 - #351 perf(repo): 将 Physarum 图缩放复杂度降为线性（CLOSED）
 - #350 fix(server): 将路由和请求读取异常限制在单次请求内（CLOSED）
+- #349 fix(agent): 取消超时 hook 请求并阻止迟到副作用（CLOSED）
