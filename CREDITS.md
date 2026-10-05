@@ -393,3 +393,4 @@ contributions for this graph`；`including commit co-authors` 仅 GHES 版本成
 - #345 fix(server): project-templates 路由补存活目录守卫——防止已删工作区触发 ENOENT 崩溃（CLOSED）
 - #341 fix: Windows 全量剩余红清零——跨盘路径判定 + 七条恒红/脆弱断言收口（多轮全量 fail 0 证据）（CLOSED）
 - #340 feat: 支持 Google Gemini 原生协议（protocol: 'gemini'）（CLOSED）
+- #337 fix(server): test-key 探测透出 inferredIds——L3 推断值不再静默流入默认值（#324）（CLOSED）
