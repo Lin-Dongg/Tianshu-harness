@@ -389,3 +389,4 @@ contributions for this graph`；`including commit co-authors` 仅 GHES 版本成
 署名：y521188 <185880799+y521188@users.noreply.github.com>
 
 - #354 fix(mcp): headless loads project MCP config; stdio connect timeout reclassified as protocol（CLOSED）
+- #353 fix: 解决会话草稿技能加载、打包子进程回退、事件环内存保护及相关高危缺陷 (#338, #342, #315)（CLOSED）
