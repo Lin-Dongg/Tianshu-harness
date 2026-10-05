@@ -373,3 +373,4 @@ contributions for this graph`；`including commit co-authors` 仅 GHES 版本成
 - #317 fix(net): 系统已装 chromium 被误报"未安装"——探测/启动链补系统浏览器兜底（issue #302）（CLOSED）
 - #308 fix: 路径分隔符归一化收口 + 观察项收口——evidence 归一化误写 / Windows 反斜杠泄漏族 / 审批判定 / 测试平台化（第三、四批）（CLOSED）
 - #344 fix(server): 内存环两处无界增长收口——delegation 豁免截尾 + 字节预算 (#315)（CLOSED）
+- #343 feat(tui): 常驻余额角标——输入区状态行复用官方快照 (#98)（CLOSED）
