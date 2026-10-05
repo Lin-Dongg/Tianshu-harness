@@ -52,15 +52,15 @@ npm run package          # vsce package --no-dependencies → tianshu-vscode-<ve
 冒烟（真实 sidecar 契约，零模型调用成本）：
 
 ```bash
-node tests/smoke.e2e.ts            # 默认用根仓 dist/main.js（先在根仓 npm run build）
-node tests/smoke.e2e.ts /abs/path  # cliPath 必须绝对路径（spawn cwd 是临时目录）
+node --import tsx tests/smoke.e2e.mts            # 默认用根仓 dist/main.js（先在根仓 npm run build）
+node --import tsx tests/smoke.e2e.mts /abs/path  # cliPath 必须绝对路径（spawn cwd 是临时目录）
 ```
 
 ⚠ 开发机个人 `~/.rivet` 配置里同一 model id 挂多个 provider 时，冒烟的
 「exactly one current model」断言会环境性失败。隔离跑法：
 
 ```bash
-RIVET_HOME=$(mktemp -d)/rivet node tests/smoke.e2e.ts
+RIVET_HOME=$(mktemp -d)/rivet node --import tsx tests/smoke.e2e.mts
 # 需在该 home 放最小 config.json（model 必须含 contextWindow/maxTokens，
 # 否则 schema 校验拒启）；首启种子化较慢，健康窗口 20s 偶发超时，重跑即可
 ```
@@ -109,7 +109,7 @@ git commit && git push
 | job | 触发 | 做什么 |
 |-----|------|--------|
 | build | push/PR（paths: vscode-extension/**）+ release | typecheck + test + package，vsix 存 artifact |
-| smoke | 同上 | 根仓构建内核 → `tests/smoke.e2e.ts` 真 sidecar 契约 |
+| smoke | 同上 | 根仓构建内核 → `tests/smoke.e2e.mts` 真 sidecar 契约 |
 | runtime-bundle | release published | 四平台 matrix 出 runtime 包，`gh release upload` 挂 Release |
 | publish-vsce | release published | VS Marketplace（需 secret `VSCE_PAT`，未配） |
 | publish-ovsx | release published | Open VSX（secret `OVSX_PAT` 已配） |
