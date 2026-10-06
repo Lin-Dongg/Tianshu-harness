@@ -199,3 +199,20 @@ export function createDefaultToolRegistry(extraTools: Tool[] = [], options: Defa
   for (const tool of extraTools) registry.register(tool)
   return registry
 }
+
+/**
+ * 从一个「内建全集 + 新增」的暂存 registry 工具表里，减掉内建工具，只留新增。
+ *
+ * 用途：headless 路径用 `createDefaultToolRegistry()` 建暂存 registry 来收集插件 /
+ * MCP 工具（`src/main.ts`），但该工厂会先注册全部内建工具、`initializeMcp` 只是往
+ * 同一个 registry 上追加 `mcp__` 工具，于是 `getAll()` 结果必然含内建全集。若把这些
+ * 内建工具再整体重注册进真正的 toolRegistry，`web_fetch`/`web_search` 这类由配置生成
+ * 新实例的工具会触发 `ToolRegistry` 的「同名覆盖」安全告警（防 MCP 描述 rug-pull 的
+ * 钩子），造成每次 headless 启动误报。
+ *
+ * 不变式：并入真正 registry 的「新增工具」集合，必须减去 `builtinNames`。
+ * 同形先例：`src/main.ts` 的 pluginTools、`src/server/plugin-session-cache.ts`。
+ */
+export function excludeBuiltinTools(tools: readonly Tool[], builtinNames: ReadonlySet<string>): Tool[] {
+  return tools.filter(t => !builtinNames.has(t.definition.name))
+}

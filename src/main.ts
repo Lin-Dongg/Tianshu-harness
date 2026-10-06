@@ -315,7 +315,7 @@ async function main() {
     const { SessionContext } = await import('./agent/context.js')
     const { createAgentConfig, createMainAgentConfigInput } = await import('./agent/create-agent-config.js')
     const { MeridianIndexer } = await import('./repo/meridian-indexer.js')
-    const { createDefaultToolRegistry } = await import('./tools/default-registry.js')
+    const { createDefaultToolRegistry, excludeBuiltinTools } = await import('./tools/default-registry.js')
     const { createDeliverTaskTool } = await import('./agent/deliver-task.js')
     const { createTaskLedger } = await import('./agent/task-ledger.js')
     const { createOwnershipLedger } = await import('./agent/ownership-ledger.js')
@@ -471,7 +471,12 @@ async function main() {
     const mcpStageRegistry = createDefaultToolRegistry([], registryOptions)
     const mcpRefs = { mcpManager: null } as RuntimeRefs
     await initializeMcp(cfg, mcpStageRegistry, mcpRefs)
-    const mcpTools = mcpStageRegistry.getAll()
+    // initializeMcp 只往同一个 registry 上【追加】mcp__ 工具，不清空——getAll() 因此
+    // 返回「内建全集 + MCP」。必须减掉内建，否则下面 createAgent 里会把内建工具当 MCP
+    // 工具再注册一遍：web_fetch/web_search 因带配置为新实例，触发 ToolRegistry 的
+    // 「同名覆盖」安全告警（防 MCP 描述 rug-pull 的钩子），每次 headless 启动误报。
+    // 与上方 pluginTools、以及 plugin-session-cache.ts 同形。
+    const mcpTools = excludeBuiltinTools(mcpStageRegistry.getAll(), builtinNames)
 
     const result = await runHeadless({
       prompt: effectivePrompt,
