@@ -396,3 +396,4 @@ contributions for this graph`；`including commit co-authors` 仅 GHES 版本成
 - #337 fix(server): test-key 探测透出 inferredIds——L3 推断值不再静默流入默认值（#324）（CLOSED）
 - #362 fix(headless): mcpTools 未减内建工具——消除每次启动的「工具注册覆盖」误报（CLOSED）
 - #367 fix(tools): esbuild 平台包缺失时不再误报低风险语法提示（CLOSED）
+- #360 docs: 新增 tianshu-mcp 操作文档（三步图解快速上手）（CLOSED）
