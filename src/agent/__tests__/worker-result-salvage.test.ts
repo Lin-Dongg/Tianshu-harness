@@ -389,3 +389,27 @@ describe('runWorkerSession repair ladder (full path)', () => {
     assert.equal(run.result.failureReason, 'caller_aborted')
   })
 })
+
+describe('blocked 语义区分（2026-10-06 verifier 空转事故）', () => {
+  // 事故形态：worker 在探索中被预算/中断打断，从未进入 final-answer 阶段。
+  // 旧消息一律报 "JSON candidates found (N) but none parseable"——读起来像
+  // "写了 N 个坏报告"，实则是根本没写报告。消费方（主控/人）据此会误判为
+  // 格式问题去重派同任务，而真正该做的是缩小 objective。
+  it('文本里无 workOrderId 骨架 → 报「未产出最终报告」，而非误导性的 N candidates', () => {
+    const text = '我在追查 ledger 位置。中间片段：{"a":1}\n{"b":2}'
+    assert.throws(
+      () => parseWorkerResult(text, 'wo_x'),
+      (e: unknown) => e instanceof WorkerResultParseError
+        && /no final report|未产出/.test(e.message)
+        && !/candidates found/.test(e.message),
+    )
+  })
+
+  it('文本里有 workOrderId 骨架但 JSON 坏 → 仍报 candidates + parse errors', () => {
+    const text = '{"workOrderId":"wo_x","status":"passed","summary":"s","findings":[{"claim" "x"}]}'
+    assert.throws(
+      () => parseWorkerResult(text, 'wo_x'),
+      (e: unknown) => e instanceof WorkerResultParseError && /candidates found/.test(e.message),
+    )
+  })
+})

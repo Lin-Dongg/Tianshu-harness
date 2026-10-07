@@ -1,10 +1,11 @@
+import { createVerificationRecorder } from './verification-recorder.js'
 import type { AgentConfig, AgentCallbacks } from './loop-types.js'
 import type { TurnBudget } from './turn-budget.js'
 import type { ContentBlock } from '../api/types.js'
-import type { ToolCallParams, VerificationMetadata, ToolErrorClass } from '../tools/types.js'
+import type { ToolCallParams, ToolErrorClass } from '../tools/types.js'
 import type { TurnHarness } from './turn-harness.js'
 import type { EvidenceTrackerPublic } from './evidence.js'
-import { buildBashVerification } from './bash-verification.js'
+import { buildBashVerification, isVerificationCommand } from './bash-verification.js'
 import type { TraceStore } from './trace-store.js'
 import type { RepairHintTracker } from './repair-hint.js'
 import type { ImportGraph } from './import-graph.js'
@@ -42,7 +43,7 @@ import { suggestStrategyShift, type TrajectorySummary } from './strategy-shift.j
 import { PrewarmCache } from './prewarm.js'
 import { batchPrewarm } from './prewarm-file.js'
 
-import { compactThresholds, pruneThresholds } from '../compact/constants.js'
+import { compactThresholds } from '../compact/constants.js'
 import { getToolArtifactThreshold } from '../tools/artifact-threshold.js'
 import { extractTrailingArtifactId } from './tool-result-tiering.js'
 import { boundToolFailure, truncateToolResult } from './tool-result-truncate.js'
@@ -56,10 +57,11 @@ import type { TaskLedger } from './task-ledger.js'
 import type { P3Integration } from './p3-integration.js'
 import { buildCommitNudge } from './commit-nudge.js'
 import { repositoryCapability } from './repository-capability.js'
+import { evaluateClaimTakeover } from './claim-liveness.js'
+import { isPathClean } from '../tools/git.js'
 import { evaluateTddGate, parseTddGateConfig, EDIT_TOOLS, type TddGateConfig } from './tdd-gate.js'
 import { checkPlanMode } from './plan-mode.js'
 import { checkAskMode } from './ask-mode.js'
-import { GIT_CLEAR_RE } from '../tools/destructive-patterns.js'
 import { classifyDeclaredCommand, loadDeclaredVerify } from '../config/verify-config.js'
 import { profileIsPlanModeSafe } from './profile-registry.js'
 import { buildSensitivePreflightMessage, shouldRequireSensitivePreflight } from './sensitive-preflight.js'
@@ -67,6 +69,7 @@ import { toolTargetFromInput } from './tool-target.js'
 import { execFileGit } from '../tools/spawn-git.js'
 import { patchTargetPaths, preWriteClaimPaths } from './pre-write-claims.js'
 import { WRITE_TOOL_NAMES, extractWriteFilePaths } from '../tools/write-tool-helpers.js'
+import { snapshotOmissionNote } from '../tools/run-tests-snapshot-result.js'
 
 /** Headless prefix on denial messages — a stable marker so worker-session's
  *  detectApprovalDeadlock can distinguish "gated by approval" from "bad JSON". */
@@ -446,6 +449,8 @@ export interface ToolPipelineDeps {
   onTddBlocked?: (target?: string) => void
   /** E6 测试接缝：覆写 checkpoint 工厂以模拟创建失败。生产路径不传 → 用真实现。 */
   createCheckpoint?: typeof createCheckpoint
+  /** v2 测试接缝：覆写「该文件工作区是否干净」探针（L2/L3 判据）。生产路径不传 → 真实现。 */
+  isPathClean?: (cwd: string, relPath: string) => Promise<boolean | 'unknown'>
 }
 
 export interface ToolExecResult {
@@ -704,6 +709,9 @@ async function executeToolUseInner(
   let checkpointCreated = checkpointAlreadyCreated
   // E6：本回合首次建基线失败时置起，尾部追加给模型与用户看（见下方 checkpoint 块）。
   let checkpointFailureNote: string | undefined
+  // v2（认领即租约）：本回合 R2 写前守卫「自动接管」过的认领。供结果尾部点名——
+  // 静默接管是禁止的（设计文档 §6）。声明必须早于 R2 块（后者在函数中段）。
+  const claimTakeovers: Array<{ claimPath: string; level: string; reason: string; owner: string | null }> = []
 
   // 无进展哨兵的活动 key（工具级，2026-09-10 纵深修复）：pre 段（审批/checkpoint/
   // 快照）与 post 段（hooks/LSP/artifact/账本/影响面）都打在它上面——stall 告警
@@ -735,7 +743,9 @@ async function executeToolUseInner(
     tu = { ...tu, name: canonicalToolName }
   }
 
+  const recordVerification = createVerificationRecorder(deps)
   const params: ToolCallParams = {
+    onVerificationCompleted: recordVerification,
     input: tu.input,
     toolUseId: tu.id,
     cwd: deps.cwd,
@@ -767,6 +777,7 @@ async function executeToolUseInner(
     enterPlanMode: deps.enterPlanMode,
     exitPlanMode: deps.exitPlanMode,
     getVerificationEvidence: deps.getVerificationEvidence,
+    skillRegistry: deps.config.promptEngine.getSkillRegistry?.(),
     onSkillInvoked: deps.onSkillInvoked,
     onSkillCompleted: deps.onSkillCompleted,
     sessionModifiedFiles: [...deps.evidence.getState().filesModified],
@@ -1293,12 +1304,53 @@ async function executeToolUseInner(
       for (const claimPath of preWriteClaimPaths(tu, deps.cwd)) {
         const acquired = deps.sessionRegistry.acquireClaim(deps.sessionId, claimPath, 'exclusive')
         if (!acquired) {
-          // 多路径调用（apply_patch 补丁、ast_edit 多 paths）中途被拦时，把本次
-          // 已认领的路径放回去——否则补丁被拒却留下无主 exclusive claim（claims
-          // 表无 TTL，只随进程死亡回收），反把 peer 挡在门外。范式同 coordinator
-          // 重试认领的回滚。
-          for (const p of staked) deps.sessionRegistry.releaseClaim(deps.sessionId, p)
           const owner = deps.sessionRegistry.checkClaim(claimPath)
+          // v2（认领即租约）：先做证据体检——持有方已死（L1）或已长时间不触碰该文件
+          // 且工作区干净（L2）时**自动接管**；不再依赖「有人能答批准」，headless 也能解。
+          // 其余（陈旧但脏 L3 / 新鲜 L4 / shared_read / 时间不可解析）落回下面的显式
+          // 接管与 fail-closed 阻断，授权语义不放松。
+          const liveness = deps.sessionRegistry.claimLiveness?.(claimPath) ?? null
+          if (liveness) {
+            const fileClean = await (deps.isPathClean ?? isPathClean)(deps.cwd, claimPath)
+            const decision = evaluateClaimTakeover({ liveness, fileClean, nowMs: Date.now() })
+            if (decision.action === 'take' || decision.action === 'reap') {
+              if (liveness.ownerSessionId) deps.sessionRegistry.releaseClaim(liveness.ownerSessionId, claimPath)
+              if (deps.sessionRegistry.acquireClaim(deps.sessionId, claimPath, 'exclusive')) {
+                claimTakeovers.push({ claimPath, level: decision.level, reason: decision.reason, owner: liveness.ownerSessionId ?? null })
+                staked.push(claimPath)
+                continue
+              }
+            }
+          }
+          // 显式接管（2026-10-07）：冲突不再直接拒——先问用户「是否接管该文件」。
+          // 授权在用户手上；无人可答的环境（headless / 拒绝型 onApprovalRequired）
+          // 返回 false → 落回下面的阻断分支，fail-closed 不放松。
+          const takeoverOk = owner?.sessionId
+            ? await (async () => {
+                const r = await callbacks.onApprovalRequired(`${tu.id}:claim-takeover`, tu.name, {
+                  ...tu.input,
+                  __claimConflict: { filePath: claimPath, ownerSessionId: owner.sessionId },
+                })
+                return typeof r === 'boolean' ? r : r.approved === true
+              })()
+            : false
+          if (takeoverOk && owner?.sessionId) {
+            deps.sessionRegistry.releaseClaim(owner.sessionId, claimPath)
+            if (deps.sessionRegistry.acquireClaim(deps.sessionId, claimPath, 'exclusive')) {
+              staked.push(claimPath)
+              continue
+            }
+          }
+          // 接管被拒、或接管后仍抢不到 → 保持原阻断。多路径调用（apply_patch 补丁、
+          // ast_edit 多 paths）中途被拦时，把本次已认领的路径放回去——否则补丁被拒
+          // 却留下无主 exclusive claim（claims 表无 TTL，只随进程死亡回收），反把
+          // peer 挡在门外。范式同 coordinator 重试认领的回滚。
+          for (const p of staked) deps.sessionRegistry.releaseClaim(deps.sessionId, p)
+          // 上面若已自动接管过别的路径，回滚时把认领**还回原持有方**：夺走再放弃会让
+          // 对方以为仍持有、实际无人持有，是最坏形状。
+          for (const t of claimTakeovers) {
+            if (t.owner) deps.sessionRegistry.acquireClaim(t.owner, t.claimPath, 'exclusive')
+          }
           const ownerTag = owner?.sessionId ? `（会话 ${owner.sessionId.slice(0, 8)}）` : ''
           const blockMsg =
             `文件「${claimPath}」正被另一个会话${ownerTag}独占编辑，已阻断本次写入以避免并发冲突。` +
@@ -1378,6 +1430,7 @@ async function executeToolUseInner(
       predictedSuccess: true,
    })
     let rawToolResult: import('../tools/types.js').ToolResult | undefined
+    let snapshotOmissionGuidance = ''
 
     // VSW: for run_tests, ask the snapshot manager whether to isolate. §6 policy
     // decides; in the common single-clean-session case it returns null → params
@@ -1386,8 +1439,9 @@ async function executeToolUseInner(
     if (tu.name === 'run_tests' && deps.verificationSnapshotManager) {
       try {
         touchActivity(activityKey, `tool:${tu.name}:pre:snapshot`)
-        const plan = await deps.verificationSnapshotManager.prepare(deps.ownershipLedger?.getOwnedFiles() ?? [])
-        if (plan) params.verificationSnapshot = { path: plan.path, snapshotRef: plan.snapshotRef }
+        const plan = await deps.verificationSnapshotManager.prepare([...(deps.ownershipLedger?.getOwnedFiles() ?? []), ...(deps.ownershipLedger?.getCoOwnedFiles() ?? [])])
+        if (plan) params.verificationSnapshot = { path: plan.path, snapshotRef: plan.snapshotRef, repositoryRoot: deps.cwd, ...(plan.omittedDirtyFiles !== undefined ? { omittedDirtyFiles: plan.omittedDirtyFiles } : {}) }
+        if (plan) snapshotOmissionGuidance = snapshotOmissionNote(plan)
       } catch {
         // degrade to in-place
       }
@@ -1402,8 +1456,9 @@ async function executeToolUseInner(
           if (polluted) {
             const mgr = deps.verificationSnapshotManager
             params.prepareRetrySnapshot = async () => {
-              const retry = await mgr.prepareRetry(deps.ownershipLedger?.getOwnedFiles() ?? [])
-              return retry ? { path: retry.path, snapshotRef: retry.snapshotRef } : null
+              const retry = await mgr.prepareRetry([...(deps.ownershipLedger?.getOwnedFiles() ?? []), ...(deps.ownershipLedger?.getCoOwnedFiles() ?? [])])
+              if (retry) snapshotOmissionGuidance = snapshotOmissionNote(retry)
+              return retry ? { path: retry.path, snapshotRef: retry.snapshotRef, repositoryRoot: deps.cwd, ...(retry.omittedDirtyFiles !== undefined ? { omittedDirtyFiles: retry.omittedDirtyFiles } : {}) } : null
             }
           }
         } catch { /* attribution retry is best-effort */ }
@@ -1503,6 +1558,10 @@ async function executeToolUseInner(
       isError: harnessResult.isError,
    }) ?? {}
     let finalContent = postHookResult.result ?? harnessResult.content
+    const declaredVerificationKind = tu.name === 'bash' ? classifyDeclaredCommand(bashCommand, loadDeclaredVerify(deps.cwd)) : undefined
+    const bashVerification = tu.name === 'bash' && !rawToolResult?.backgroundJobId
+      && (isVerificationCommand(bashCommand) || declaredVerificationKind)
+      ? buildBashVerification(rawToolResult?.command ?? bashCommand, rawToolResult, harnessResult) : undefined
     // Normalize: strip trailing whitespace to produce stable byte sequences
     // for DeepSeek exact-prefix cache. Non-deterministic trailing whitespace
     finalContent = finalContent.trimEnd()
@@ -1696,6 +1755,26 @@ async function executeToolUseInner(
       finalContent = `${finalContent}\n\n${checkpointFailureNote}`
     }
 
+    // v2：自动接管必须点名（静默接管是禁止的）。追加在结果尾部 = 对话历史末尾、
+    // 模型与 UI 都能看到；**不新增注入点、已冻结前缀字节不变**（不碎前缀缓存）。
+    if (claimTakeovers.length > 0) {
+      const notes = claimTakeovers
+        .map((t) => `[claim-takeover] 已接管会话 ${t.owner ? t.owner.slice(0, 8) : '(无主)'} 对「${t.claimPath}」的独占认领（判据 ${t.level}：${t.reason}）。`)
+        .join('\n')
+      finalContent = `${finalContent}\n\n${notes}`
+      for (const t of claimTakeovers) {
+        console.warn(`[claim-takeover] ${t.claimPath} ← ${t.owner ?? '(无主)'} via ${t.level}：${t.reason}`)
+      }
+    }
+
+    // 工具尾部反馈在 artifact/截断后追加，模型与 UI 都能收到；不改变验证状态。
+    if (bashVerification?.userGuidance && bashVerification.status !== 'failed') {
+      finalContent += `\n\n[验证反馈] ${bashVerification.status === 'blocked' ? '该命令未取得可归因的验证证据，不能据此认定测试失败。' : '该命令未取得完整覆盖证明。'}\n${bashVerification.userGuidance}`
+    }
+    if (snapshotOmissionGuidance && !finalContent.includes(snapshotOmissionGuidance.trim())) {
+      finalContent += snapshotOmissionGuidance
+    }
+
     // Normalize isError: tools may omit isError on success (undefined),
     // but the TUI treats undefined as a streaming chunk that never
     // commits to scrollback. Force false so terminal results render.
@@ -1820,27 +1899,13 @@ async function executeToolUseInner(
               priority: 1,
             })
           }
-       } else if (/\b(tsc|typecheck|check|test|jest|vitest|mocha|pytest|eslint|lint|build)\b/.test(cmd) || classifyDeclaredCommand(cmd, loadDeclaredVerify(deps.cwd))) {
-          const verification = buildBashVerification(rawToolResult?.command ?? cmd, rawToolResult, harnessResult)
-          const declaredKind = classifyDeclaredCommand(cmd, loadDeclaredVerify(deps.cwd))
+       } else if (bashVerification) {
+          const verification = bashVerification
+          const declaredKind = declaredVerificationKind
           const errorClass = rawToolResult?.errorClass ?? (harnessResult.isError ? harnessResult.errorClass : undefined)
-          const timedOut = verification.failureKind === 'timeout'
-          const { command: verificationCommand, status: testStatus, ...verificationMeta } = verification
-          deps.taskLedger.record({
-            type: 'verification',
-            command: verificationCommand,
-            status: testStatus,
-            meta: {
-              ...verificationMeta,
-              ...(errorClass ? { errorClass } : {}),
-              ...(timedOut ? { timedOut: true } : {}),
-              ...(declaredKind ? { declared: true, kind: declaredKind } : {}),
-            },
-          })
-          // bash 跑测试/typecheck/lint 也归零 TDD 门禁——否则 agent 用 bash npm test
-          // 而非 run_tests 工具时门禁计数器永远不重置，第 4 次编辑必误报拦截。
-          deps.evidence.trackVerification(verification)
-          deps.destructiveGate?.noteVerification(testStatus)
+          recordVerification({ ...verification, ...(declaredKind ? { kind: declaredKind } : {}) }, { meta: {
+            ...(errorClass ? { errorClass } : {}), ...(verification.failureKind === 'timeout' ? { timedOut: true } : {}), ...(declaredKind ? { declared: true } : {}),
+          } })
        } else {
           deps.taskLedger.record({ type: 'tool_exec', tool: tu.name, meta: { command: cmd.slice(0, 200) } })
        }
@@ -1848,40 +1913,8 @@ async function executeToolUseInner(
         const filter = typeof tu.input.filter === 'string' ? tu.input.filter : undefined
         const command = filter ? `run_tests ${filter}` : 'run_tests'
         const verification = rawToolResult?.verification
-        const buildMeta = (v?: VerificationMetadata): Record<string, unknown> => {
-          const m: Record<string, unknown> = { scope: v?.scope ?? (filter ? 'targeted' : 'full') }
-          if (v) {
-            if (v.kind) m.kind = v.kind
-            if (v.coverage) m.coverage = v.coverage
-            if (v.userGuidance) m.userGuidance = v.userGuidance
-            m.exitCode = v.exitCode
-            m.passed = v.passed
-            m.failed = v.failed
-            m.skipped = v.skipped
-            m.durationMs = v.durationMs
-            m.resolvedCommand = v.command
-            m.recommendedCommand = v.command
-            if (v.failureKind) m.failureKind = v.failureKind
-            // blockedReason 此前在 ledger 边界被丢弃，导致 run_tests 明明判定
-            // blockedReason: 'timeout'，下游只看到 status failed + 计数全 0，
-            // 又退回「像是崩溃」的推断（2026-09-22）。
-            if (v.blockedReason) m.blockedReason = v.blockedReason
-            if (v.targetFiles) m.targetFiles = v.targetFiles
-            // VSW: carry snapshot identity + phase so the gate can apply
-            // staleness supersession and integration_conflict attribution.
-            if (v.snapshotRef) m.snapshotRef = v.snapshotRef
-            if (v.verificationPhase) m.verificationPhase = v.verificationPhase
-            if (v.isolatedPassed !== undefined) m.isolatedPassed = v.isolatedPassed
-            if (v.countsReliable !== undefined) m.countsReliable = v.countsReliable
-          }
-          return m
-        }
-        deps.taskLedger.record({ type: 'verification', command, status: verification?.status ?? (harnessResult.isError ? 'failed' : 'blocked'), meta: buildMeta(verification) })
-        // VSW two-phase: record the integration (Phase B) verification too so a
-        // Phase B failure surfaces as a non-blocking integration_conflict.
-        for (const extra of rawToolResult?.extraVerifications ?? []) {
-          deps.taskLedger.record({ type: 'verification', command, status: extra.status, meta: buildMeta(extra) })
-        }
+        recordVerification(verification ?? { command, status: harnessResult.isError ? 'failed' : 'blocked', scope: filter ? 'targeted' : 'full' }, { command })
+        for (const extra of rawToolResult?.extraVerifications ?? []) recordVerification(extra, { command })
      } else if (tu.name === 'deliver_task' && tu.input.commit === true && !harnessResult.isError) {
         // Successful scoped commit changed git state — invalidate the frozen
         // git-status snapshot so the next appendix rebuild shows the post-commit
@@ -2094,9 +2127,8 @@ async function executeToolUseInner(
       // run_tests returns VerificationMetadata, but this was never fed into
       // EvidenceTracker — leaving deliveryStatus stuck at 'unverified' and
       // buildDeliveryGate.canClaimComplete always false.
-      if (rawToolResult.verification) {
-        deps.evidence.trackVerification(rawToolResult.verification)
-        deps.destructiveGate?.noteVerification(rawToolResult.verification.status)
+      if (rawToolResult.verification && !deps.taskLedger) {
+        recordVerification(rawToolResult.verification)
      }
 
       if (rawToolResult.verification && rawToolResult.verification.status !== 'passed') {
@@ -2184,7 +2216,7 @@ async function executeToolUseInner(
  * Grep output format: `relative/path.ts:42:  const x = 1`
  * We extract just the file path portion (before the first colon on each line).
  */
-function extractGrepMatchPaths(grepOutput: string, cwd: string): string[] {
+function extractGrepMatchPaths(grepOutput: string, _cwd: string): string[] {
   const seen = new Set<string>()
   const paths: string[] = []
   const MAX_FILES = 5

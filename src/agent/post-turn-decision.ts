@@ -53,7 +53,7 @@ export class PostTurnDecisionController {
     callbacks: AgentCallbacks
     signal: AbortSignal
   }): Promise<ThinkingRetryResult> {
-    if (this.deps.skipThinkingRetry || params.signal.aborted || (this.deps.maxTurns !== undefined && params.turn + 1 >= this.deps.maxTurns)) return { shouldRetry: false }
+    if (this.deps.skipThinkingRetry || params.signal.aborted || (this.deps.maxTurns !== undefined && this.deps.maxTurns > 0 && params.turn + 1 >= this.deps.maxTurns)) return { shouldRetry: false }
     const result = evaluateThinkingRetry({
       streamedText: this.deps.state.streamedText,
       collectedBlockCount: params.collectedBlockCount,

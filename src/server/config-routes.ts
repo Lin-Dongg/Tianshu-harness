@@ -32,6 +32,7 @@
  *   PUT    /config/zen                      toggle Zen Mode (explicit opt-in; next session)
  */
 import { decodeRouteParam, type RouteHandler } from './index.js'
+import { buildProviderUsageRoutes } from './provider-usage-routes.js'
 import { isAuthorizedRequest } from './auth.js'
 import { readCallAudit } from '../api/call-audit.js'
 import {
@@ -317,7 +318,7 @@ export function buildConfigRoutes(apiToken?: string, hooks?: ConfigRouteHooks): 
     try { hooks?.onProviderConfigChanged?.() } catch { /* best-effort */ }
   }
   return {
-    ...buildWorkspaceRoutes(apiToken),
+    ...buildWorkspaceRoutes(apiToken), ...buildProviderUsageRoutes(apiToken),
     // OAuth 型 provider（codex）的登录/登出路由按接缝外提（config-routes-oauth.ts），
     // 与 config-routes-keys.ts / config-routes-zen.ts 同先例。
     ...buildOAuthRoutes(apiToken, notifyProviderConfigChanged),

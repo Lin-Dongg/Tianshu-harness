@@ -27,11 +27,12 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { BASH_TOOL } from '../bash.js'
-import { isTypecheckCommand, isTestRunnerCommand, resolveCallerTimeoutBudget, resolveWatchdogTimeout, TEST_RUNNER_CALLER_BUDGET_MS, TYPECHECK_CALLER_BUDGET_MS, TYPECHECK_WATCHDOG_MARGIN_MS } from '../../lsp/typecheck-cache.js'
+import { isTypecheckCommand, isTestRunnerCommand, resolveCallerTimeoutBudget, resolveWatchdogTimeout, TEST_RUNNER_CALLER_BUDGET_MS, TYPECHECK_CALLER_BUDGET_MS, TYPECHECK_WATCHDOG_MARGIN_MS, STALE_LOCK_MS } from '../../lsp/typecheck-cache.js'
 import type { ToolCallParams } from '../types.js'
 
-/** 闸门等待上限（typecheck-cache.ts 的 STALE_LOCK_MS = 10 分钟）。 */
-const GATE_WAIT_BUDGET_MS = 10 * 60_000
+/** 闸门等待上限——直接取真源（2026-10-08 起 STALE_LOCK_MS = 5 分钟；此前硬编码
+ *  10 分钟，阈值调整时会漏改导致覆盖断言假红/假绿）。 */
+const GATE_WAIT_BUDGET_MS = STALE_LOCK_MS
 
 /** bash 工具的默认预算固定传 120s——本文件只关心 typecheck 那一支的抬升。 */
 const budgetFor = (command: string, requested: number): number =>

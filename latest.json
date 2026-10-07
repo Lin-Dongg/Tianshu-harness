@@ -1,27 +1,27 @@
 {
-  "version": "3.28.0",
-  "notes": "v3.28.0——压缩包附件直拖（不占上下文）；Git 工作台（变更/历史/分支/PR + AI 审查）；模型异常与截断可见性（截断续写提醒/429 倒计时/错误引导）；上下文预算死锁修复；Gemini 原生协议；MCP rug-pull 防线；默认推理档 high；CLI 状态行符号化单行 + 余额角标；审批持久可恢复；P0 工具读取内存热修。完整清单见 docs/releases/v3.28.0.md。",
-  "pub_date": "2026-10-05T17:24:36.238Z",
+  "version": "3.29.0",
+  "notes": "v3.29.0——多会话文件认领可接管；交付按本会话判断，项目外写入与他人失败不再假红假绿；项目配置不能再关审批和沙箱；桌面更新先验包再安装；技能在桌面与命令行共用，从新会话生效；Windows sidecar 改名为 tianshu-runtime.exe。Linux 本版提供双架构 AppImage。完整清单见 docs/releases/v3.29.0.md。",
+  "pub_date": "2026-10-07T18:03:07.254Z",
   "platforms": {
     "darwin-aarch64": {
-      "url": "https://github.com/huiliyi37/Tianshu-harness/releases/download/v3.28.0/Tianshu_3.28.0_aarch64.app.tar.gz",
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR2NkQmNNeVlYTENoNTB4SHNsSGtZdW1GTlhES0pDeFprdC9aeHQ5OFVTK2ZWQTVreEFWUTUrUjA3M0thWndwRkpsOEtGc01qQ1ZuaGhzbW5JRGR6ZGdvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxMjE5OTYyCWZpbGU6VGlhbnNodS5hcHAudGFyLmd6Ci9Kako4ZWl3Y3VOTE0zWVRPMGhkWFhxSGErNkdsTE9HeUU5Rkwwb1BoZVZkNHBUL1ZXZE9McmlXM0xFMXVZVzlJUHhLcnBmZ1VvdHIzN0lEOGRIUEJRPT0K"
+      "url": "https://github.com/huiliyi37/Tianshu-harness/releases/download/v3.29.0/Tianshu_3.29.0_aarch64.app.tar.gz",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR1FqT0IwYjJQVUtnWDR0N0djcGpIUVRtK05CazJaVGZIekxGNVRIcDhkMGsvdld4RHJiczkyek9icGJvTlE2STRHWXAzSWFaNjJ1VFg0TVFYQ2EvL3dZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxMzg1OTQ1CWZpbGU6VGlhbnNodS5hcHAudGFyLmd6CjM1cUtsRFRzVDYxb0pUU3BWbmRZRndsZU5sNUlLcFNId2VsQmkxMk04NFYvS1l3SDF0cGVOWUloek1QODN4TDhjakxOL1pPMWpRbDVqN0EzbEJwbENBPT0K"
     },
     "darwin-x86_64": {
-      "url": "https://github.com/huiliyi37/Tianshu-harness/releases/download/v3.28.0/Tianshu_3.28.0_x64.app.tar.gz",
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR1VIQXplREU2bm1PZmkzU1owOUw2bGVOajFRaHA5YWJvcDhCODY5eGZJdXd0NC9CLzgyRTZWYW9laGVCVXFCTVBxMUxZMHZOSzRaNm9ma2UyRFRDalFNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxMjIwMzA1CWZpbGU6VGlhbnNodS5hcHAudGFyLmd6CkpxUmhaZHozRG8vTWFyS3dDR2p5MHZyOUlMSkxHVTFyeUwwWjZlZGpab05pUmo4UGtib2dYTEVxK2NtVnlScW00Ky8rUmh1OEhHYUVrTkpGSCtaNUJBPT0K"
+      "url": "https://github.com/huiliyi37/Tianshu-harness/releases/download/v3.29.0/Tianshu_3.29.0_x64.app.tar.gz",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR1RKbDVFNXVPSUV2eHhEc0NWeC8rZ25PS1d6YnJXSjdQWVlETFBkYzJRdE1NWmJrdnZ6ZTA5MEdXRVFING5pZm9XZFVZRWhRUjh0R3Y2MGJLSmhiM0F3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxMzg2Mjc1CWZpbGU6VGlhbnNodS5hcHAudGFyLmd6CjVkZ1c4Q2tqcWp3QkJQa0syNWFqUDJOSHZBN1JMb3czcVhFb3RLNFhmd1RnTzltZHlmUEVybFBYWmpsOWIrblBIcDllWUJSYUNScmpQa3VKeXRMUUJ3PT0K"
     },
     "windows-x86_64": {
-      "url": "https://github.com/huiliyi37/Tianshu-harness/releases/download/v3.28.0/Tianshu_3.28.0_x64-setup.exe",
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR2M1b2JocE0ra1k3SjJIQ1dtVTJJKy9HdDZmRW9CVXhORVo4b3JYUDFIc3d2ZEcxVnlycVphWENjd3JBUSsvS2dZZFV3SGZnQkRDbGZFUkxYT3lqWVFRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxMjIxMDc1CWZpbGU6VGlhbnNodV8zLjI4LjBfeDY0LXNldHVwLmV4ZQp5RTFpTzh6NkhxSnRyM3Z2Zi9pY21Sb2ZnWWZheFNPZCt3NTQ5azFxaVFyYnZqZ3VpRTNXOUNqWFVTcElXdXRZZUNtS2tSS0ZQZkdjaU9TZ0dMQ09EZz09Cg=="
+      "url": "https://github.com/huiliyi37/Tianshu-harness/releases/download/v3.29.0/Tianshu_3.29.0_x64-setup.exe",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR2UzQ3JjaHpKY2ptYWI5YzJ4cHVPdUhoRkhaRSt6TjJhOW0vVlQ1RWdvS0o5c3dLQzFQeXB3cGlXVFVTMVJIMmpaTGZDVTFNWnN2dUF2c2V2VDkwZWdNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxMzg3MjQ4CWZpbGU6VGlhbnNodV8zLjI5LjBfeDY0LXNldHVwLmV4ZQpDVC9qZkJkcjI4QklzLzZuTXBXWUlhSTVvS2ZhK0o1cTFBQmNJNVpnc3pOeXI3ZG1pVmtnV3hGV2xtUWNUcUdveW0ySGlwYkFTV0hYOGQrSm56YlNDUT09Cg=="
     },
     "linux-x86_64": {
-      "url": "https://github.com/huiliyi37/Tianshu-harness/releases/download/v3.28.0/Tianshu_3.28.0_amd64.AppImage",
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR2FPMytOVllBb2JneTRJQVlCSDlLWUtQbWJkMDJTQ2pWVGN2RHdwSjF5QVN2dDAvNlF6VjNORkU2VUJUaXlXMUw2N05XOThXdVhkRmRkNDlma0QzTGdvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxMjEyMjIzCWZpbGU6VGlhbnNodV8zLjI4LjBfYW1kNjQuQXBwSW1hZ2UKQVFJRCtaYTlZa3dscVh4ZnNhc01WMUp6TGx4MjZySTdWQUhMdURSamQ5TjluNG5LL0wrYVptS1h3RXhNako5a2ZjMERTVHRjYlFzanhrZWswT2ZaREE9PQo="
+      "url": "https://github.com/huiliyi37/Tianshu-harness/releases/download/v3.29.0/Tianshu_3.29.0_amd64.AppImage",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR2RIMG9rUU1iOTVCNnFZdFRzUGU1VHl6bkg5eDNjNTJubHdlZ1VCRjZhQkg0VEhTdjdPYWYrUWMwM2c1R2hrMlVWNUk1RExiZDFoYWFybklVS2pEalE4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxMzkyNjg3CWZpbGU6VGlhbnNodV8zLjI5LjBfYW1kNjQuQXBwSW1hZ2UKVnBIai9VYWRHc1g3c3RtbWFPN000aGRhazFlbXZmWVJEb2FmMENqTHo4aDMxZ0tGOG5BSFFwZFd2NnZrclh2UTZUc3RLditKNkMzeVRoa0E0bFpSRHc9PQo="
     },
     "linux-aarch64": {
-      "url": "https://github.com/huiliyi37/Tianshu-harness/releases/download/v3.28.0/Tianshu_3.28.0_aarch64.AppImage",
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR1hBdG9yR0pManZ3c09OTXovemZrbmt2K3J3am5MckEyQk9wTHFFUjV2dWUrSGV2WTcrYmQxeXF6aUdIWTNBL0RoWlhFWFMrNG5oMDJ5MmorSGwrUVF3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxMjA5ODY0CWZpbGU6VGlhbnNodV8zLjI4LjBfYWFyY2g2NC5BcHBJbWFnZQpadzRBZWhWbHdObFp6SFRnUmt6V0dHQXM0NzRGL1hua2h5ZktraUxEMGFPT2ZZek5yR1cydXBoWmRvNUp5NVJnb0VwWUxoSnAvemVwa0phd2RoTG1Ddz09Cg=="
+      "url": "https://github.com/huiliyi37/Tianshu-harness/releases/download/v3.29.0/Tianshu_3.29.0_aarch64.AppImage",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR1dDYmNNdjBVZVJya3dmdXFudVpZWmhrSlJzUEFWSG8wU3pTYUV6cjE4cXhzWU1TSjh2L1JRcXpyZklvT0Z6UUUrcnFrYlpkVmM2WVN0Uk8yRHA2akFvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxMzkxMDkzCWZpbGU6VGlhbnNodV8zLjI5LjBfYWFyY2g2NC5BcHBJbWFnZQo0T3UxOTE1S0FPRWdGM0JTdm1XTzZaR3dwRDZ0T0JxaHJRR1plMjZwYXdPZEY0S1lFS2RhWG5rOUhyeExxVXVBTi9neGNHa3pTZEhFK2tBN3NzQzFBdz09Cg=="
     }
   }
 }

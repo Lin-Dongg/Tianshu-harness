@@ -6,6 +6,7 @@ import { BrowserOperationError } from './operation-error.js'
 /** Subscribers and the public sequence survive driver replacement. */
 export class FrameStream {
   private subscribers = new Set<(frame: ScreencastFrame) => void>()
+  private options: ScreencastOptions = {}
   private active = false
   private detached = false
   private sequence = 0
@@ -22,6 +23,7 @@ export class FrameStream {
   /** 因数据/尺寸非法而被丢弃的帧数——「面板黑屏但 streaming 仍为 true」时的可观测信号。 */
   get droppedFrames(): number { return this.droppedFrameCount }
 
+  setOptions(options: ScreencastOptions) { this.options = options }
   assertInteraction(expected: unknown): void {
     if (expected === undefined) return // Legacy callers retain their wire contract.
     if (typeof expected !== 'string' || expected !== this.contextId || this.detached) {
@@ -73,7 +75,7 @@ export class FrameStream {
     }
     return { ...frame, seq: ++this.sequence, interactionId: this.contextId }
   }
-  async captureFrame(opts?: ScreencastOptions): Promise<ScreencastFrame | null> {
+  async captureFrame(opts: ScreencastOptions = this.options): Promise<ScreencastFrame | null> {
     const generation = this.generation
     const driver = this.driver
     try { return this.stamp(await driver.captureFrame?.(opts) ?? null, generation) }
@@ -87,7 +89,7 @@ export class FrameStream {
     this.active = false
     await this.driver.stopScreencast?.().catch(() => {})
   }
-  private async start(opts: ScreencastOptions = {}): Promise<void> {
+  private async start(opts: ScreencastOptions = this.options): Promise<void> {
     if (this.active || this.detached || !this.subscribers.size || !this.driver.startScreencast) return
     const generation = this.generation
     try {
@@ -100,6 +102,7 @@ export class FrameStream {
   }
   async subscribe(onFrame: (frame: ScreencastFrame) => void, opts?: ScreencastOptions): Promise<() => void> {
     if (!this.driver.startScreencast) return () => {}
+    if (opts) this.options = opts
     this.subscribers.add(onFrame)
     try { await this.serialized(() => this.start(opts)) }
     catch (error) { this.subscribers.delete(onFrame); throw error }

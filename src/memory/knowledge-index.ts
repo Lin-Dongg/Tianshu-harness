@@ -16,6 +16,7 @@
 
 import { existsSync, statSync, readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
+import { projectStateAllowed } from '../config/project-trust.js'
 import { BM25Index } from '../search/text-index.js'
 import { VectorIndex } from '../search/vector-index.js'
 import { reciprocalRankFusion } from '../search/hybrid-search.js'
@@ -83,9 +84,11 @@ export class KnowledgeIndex {
     this.persistent = new SQLiteKnowledgeIndex(cwd)
   }
 
-  /** 源数据指纹：memory.jsonl mtime+size + md 文件列表 mtimes。变化才重建。 */
+  /** 源数据指纹：memory.jsonl mtime+size + md 文件列表 mtimes + 信任态。变化才重建。
+   *  trust 位（2026-10-07 审计 Finding 1b/1e）：/trust 后指纹变化自动触发重建，
+   *  search 热路径无需逐次判门。 */
   private fingerprint(): string {
-    const parts: string[] = []
+    const parts: string[] = [projectStateAllowed(this.cwd) ? 'trust:1' : 'trust:0']
     const dir = join(this.cwd, '.rivet', 'knowledge')
     const memPath = join(dir, 'memory.jsonl')
     try {
@@ -121,6 +124,10 @@ export class KnowledgeIndex {
     this.entriesById.clear()
     this.mdChunksById.clear()
     this.playbookById.clear()
+    this._chainIssues = []
+    // 未授信项目不建索引（2026-10-07 审计 Finding 1b/1e）：adaptive 记忆注入与
+    // recall 工具都读不到内容。指纹含 trust 位，/trust 后自动重建恢复。
+    if (!projectStateAllowed(this.cwd)) return
     // 向量不清：id 稳定（entry id / file+chunk），provider 增量补缺
 
     // ① 结构化条目（含历史——validity 过滤在 search 时做，支持 includeHistory）

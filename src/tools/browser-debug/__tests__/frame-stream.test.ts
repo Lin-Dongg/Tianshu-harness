@@ -144,3 +144,22 @@ test('rebind 启动失败：不留下「正在推流」的假状态', async () =
   assert.equal(stream.streaming, false)
   assert.equal(stream.subscriberCount, 1, '失败不清订阅者——可等下一次重建再试')
 })
+
+
+test('preview quality and viewport survive initial snapshot, refresh and driver rebind', async () => {
+  const calls: ScreencastOptions[] = []
+  const driver = () => asDriver({
+    startScreencast: async (opts: ScreencastOptions) => { calls.push(opts) },
+    stopScreencast: async () => {},
+    captureFrame: async (opts: ScreencastOptions) => { calls.push(opts); return { data: 'jpeg', width: 390, height: 844, seq: 1 } },
+  })
+  const stream = new FrameStream(driver()), options = { quality: 90, maxWidth: 390, maxHeight: 844 }
+  stream.setOptions(options)
+  await stream.captureFrame()
+  const unsubscribe = await stream.subscribe(() => {}, options)
+  await stream.refresh()
+  await stream.rebind(driver())
+  assert.ok(calls.length >= 6)
+  assert.ok(calls.every(opts => JSON.stringify(opts) === JSON.stringify(options)))
+  unsubscribe(); stream.clear()
+})

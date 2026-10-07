@@ -16,13 +16,12 @@
  * 未必是它（安装目录 / 启动目录）。缺省才回落到 process.cwd()。
  */
 
-import { existsSync, readFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { dirname } from 'node:path'
 import type { RouteHandler } from './index.js'
 import { isAuthorizedRequest } from './auth.js'
 import { isKnownWorkspace, UNKNOWN_WORKSPACE_ERROR } from './workspace-guard.js'
 import { findProjectConfig } from '../config/manager.js'
-import { isProjectTrusted, isTrustPromptDismissed, trustProject, untrustProject, dismissProjectTrustPrompt, findSensitiveProjectKeys, listTrustedProjectEntries } from '../config/project-trust.js'
+import { isProjectTrusted, isTrustPromptDismissed, trustProject, untrustProject, dismissProjectTrustPrompt, detectProjectTrustStakes, listTrustedProjectEntries } from '../config/project-trust.js'
 
 function withAuth(handler: RouteHandler, apiToken?: string): RouteHandler {
   return async (body, params, headers, res) => {
@@ -33,20 +32,12 @@ function withAuth(handler: RouteHandler, apiToken?: string): RouteHandler {
   }
 }
 
-/** 未授信时会被剥离（配置键）或禁用（hooks）的东西——UI 据此说明「授信能得到什么」。 */
-function collectStakes(projectDir: string): { sensitiveKeys: string[]; hasHooks: boolean } {
-  let sensitiveKeys: string[] = []
-  const projectPath = join(projectDir, '.rivet-config.json')
-  if (existsSync(projectPath)) {
-    try {
-      const raw = JSON.parse(readFileSync(projectPath, 'utf-8')) as Record<string, unknown>
-      sensitiveKeys = findSensitiveProjectKeys(raw)
-    } catch {
-      /* 坏 JSON 由 loadConfig 抛 ConfigLoadError 负责报错，这里不重复 */
-    }
-  }
-  return { sensitiveKeys, hasHooks: existsSync(join(projectDir, '.rivet', 'hooks.json')) }
-}
+/** 未授信时会被剥离（配置键）或禁用（hooks / skills / rules）的东西——UI 据此说明
+ *  「授信能得到什么」。**单一真源**：与 CLI 启动提示共用 detectProjectTrustStakes
+ *  （此前是本文件自实现的 collectStakes，2026-10-07 审计给 stakes 扩字段时合并，
+ *  防双实现漂移）。安全档位（approval / unsandboxed / permissions）由永久门剥离，
+ *  授信**也不**生效，不算「授信能得到什么」——单列 `ignoredSafetyKeys`，避免弹窗
+ *  误导用户以为授信会启用审批（它们只来自全局配置 / CLI / 运行时）。 */
 
 function resolveDir(raw: unknown): string | undefined {
   return typeof raw === 'string' && raw.trim() ? raw.trim() : undefined
@@ -85,7 +76,7 @@ export function buildTrustRoutes(
           trusted: isProjectTrusted(projectDir),
           /** 用户曾选「不再提示」——桌面端别再弹引导。 */
           dismissed: isTrustPromptDismissed(projectDir),
-          stakes: collectStakes(projectDir),
+          stakes: detectProjectTrustStakes(projectDir),
         },
       }
     }, apiToken),

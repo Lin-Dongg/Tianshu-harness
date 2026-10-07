@@ -50,6 +50,7 @@ describe('plan tool close — evidence gate', () => {
       verificationCount: 1,
       supersededFailures: 0,
       staleSnapshotDropped: 0,
+      staleFingerprintDropped: 0,
       staleFailureCandidates: 0,
       toolInvocationFailureCandidates: [],
       ...over,
@@ -214,7 +215,7 @@ describe('plan close — 闭环即解锁(自动退出 plan mode)', () => {
   const greenGate = (): { assessDelivery: () => DeliveryGateResult; getVerificationEvidence: () => VerificationSummary } => ({
     assessDelivery: () => ({
       state: 'GREEN', canDeliver: true, isBlocked: false, ownedFileCount: 1, externalFileCount: 0,
-      verificationCount: 2, supersededFailures: 0, staleSnapshotDropped: 0, staleFailureCandidates: 0,
+      verificationCount: 2, supersededFailures: 0, staleSnapshotDropped: 0, staleFingerprintDropped: 0, staleFailureCandidates: 0,
       toolInvocationFailureCandidates: [],
     }),
     getVerificationEvidence: () => ({ total: 2, verified: 2, pending: 0, files: [{ path: 'src/foo.ts', level: 'tested' }] }),
@@ -223,7 +224,7 @@ describe('plan close — 闭环即解锁(自动退出 plan mode)', () => {
   const redGate = (): { assessDelivery: () => DeliveryGateResult } => ({
     assessDelivery: () => ({
       state: 'RED', canDeliver: false, isBlocked: true, ownedFileCount: 1, externalFileCount: 0,
-      verificationCount: 0, supersededFailures: 0, staleSnapshotDropped: 0, staleFailureCandidates: 0,
+      verificationCount: 0, supersededFailures: 0, staleSnapshotDropped: 0, staleFingerprintDropped: 0, staleFailureCandidates: 0,
       toolInvocationFailureCandidates: [],
     }),
   })

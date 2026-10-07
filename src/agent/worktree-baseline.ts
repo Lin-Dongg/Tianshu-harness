@@ -31,6 +31,9 @@ export interface WorktreeBaseline {
   getHead(): string
   /** Is this file pre-existing (not owned by current task)? */
   isExternal(filePath: string | null | undefined): boolean
+  /** 基线是否完整建立（git 可用且成功捕获）。不完整时 isExternal 恒真、无法区分
+   *  外部性——调用方据此不要把「本会话 ledger 写过」的铁证降级为 co-owned（issue #369）。 */
+  isComplete(): boolean
   /** All external files (dirty + untracked), deduplicated and sorted */
   getExternalFiles(): string[]
   getExternalDirtyCount(): number
@@ -73,6 +76,10 @@ export function createWorktreeBaseline(snapshot: BaselineSnapshot): WorktreeBase
     return externalSet.has(filePath)
   }
 
+  function isComplete(): boolean {
+    return snapshot.complete !== false
+  }
+
   function getExternalFiles(): string[] {
     return [...externalSet].sort()
   }
@@ -108,6 +115,7 @@ export function createWorktreeBaseline(snapshot: BaselineSnapshot): WorktreeBase
     getBranch,
     getHead,
     isExternal,
+    isComplete,
     getExternalFiles,
     getExternalDirtyCount,
     getExternalUntrackedCount,

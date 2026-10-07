@@ -82,7 +82,7 @@ const outcome = await runTypecheckShared({
       case 'wait-timeout':
         return note(`等待 ${secs(event.waitedMs)} 未果，改为自己跑`)
       case 'stale-lock-cleared':
-        return note(`清理了陈旧的锁${event.holderPid ? `（pid ${event.holderPid} 已不存在）` : ''}`)
+        return note(`清理了陈旧的锁${event.holderPid ? `（pid ${event.holderPid}：失联或持有超龄）` : ''}`)
       case 'ran':
         return note(`实跑 ${secs(event.durationMs)}${event.cached ? '' : '（结果未缓存）'}`)
     }

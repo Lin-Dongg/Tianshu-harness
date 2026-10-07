@@ -1139,4 +1139,128 @@ describe('GALAXY_PLAN_PRECHECK', () => {
     assert.ok(perspectives.every(r => r.parallelism === 'expert'), '多视角属 EP 语义')
     assert.notEqual(perspectives[0]!.authority, perspectives[1]!.authority, '组内 authority 不同才构成对照')
   })
+
+  it('rejects weighted_confidence policy (incompatible with multi-dimensional reporting)', async () => {
+    const calls: Array<{ requests: DelegationRequest[] }> = []
+    const tool = createGalaxyTool(capturingCoordinator(calls))
+
+    const result = await tool.execute({
+      toolUseId: 'tu_weighted',
+      cwd: '/repo',
+      input: {
+        objective: 'test weighted_confidence rejection',
+        dimensions: [
+          { name: 'frontend', objective: 'implement UI', authority: 'wenqu' },
+          { name: 'backend', objective: 'implement API', authority: 'tianji' },
+          { name: 'review', objective: 'review changes', authority: 'yaoguang' },
+          { name: 'tests', objective: 'add tests', authority: 'tianxuan' },
+        ],
+        policy: 'weighted_confidence',
+        autoReview: false,
+        confirm: true,
+      },
+    })
+
+    assert.equal(result.isError, true)
+    assert.ok(result.content.includes('星河已拦截'))
+    assert.ok(result.content.includes('weighted_confidence'))
+    assert.ok(result.content.includes('选择单一结果并丢弃其他维度'))
+    assert.equal(calls.length, 0, 'should not dispatch with weighted_confidence policy')
+  })
+
+  it('rejects first_success policy (incompatible with multi-dimensional reporting)', async () => {
+    const calls: Array<{ requests: DelegationRequest[] }> = []
+    const tool = createGalaxyTool(capturingCoordinator(calls))
+
+    const result = await tool.execute({
+      toolUseId: 'tu_first',
+      cwd: '/repo',
+      input: {
+        objective: 'test first_success rejection',
+        dimensions: [
+          { name: 'frontend', objective: 'implement UI', authority: 'wenqu' },
+          { name: 'backend', objective: 'implement API', authority: 'tianji' },
+        ],
+        policy: 'first_success',
+        autoReview: false,
+        confirm: true,
+      },
+    })
+
+    assert.equal(result.isError, true)
+    assert.ok(result.content.includes('星河已拦截'))
+    assert.ok(result.content.includes('first_success'))
+    assert.equal(calls.length, 0)
+  })
+
+  it('rejects majority policy (incompatible with multi-dimensional reporting)', async () => {
+    const calls: Array<{ requests: DelegationRequest[] }> = []
+    const tool = createGalaxyTool(capturingCoordinator(calls))
+
+    const result = await tool.execute({
+      toolUseId: 'tu_majority',
+      cwd: '/repo',
+      input: {
+        objective: 'test majority rejection',
+        dimensions: [
+          { name: 'frontend', objective: 'implement UI', authority: 'wenqu' },
+          { name: 'backend', objective: 'implement API', authority: 'tianji' },
+        ],
+        policy: 'majority',
+        autoReview: false,
+        confirm: true,
+      },
+    })
+
+    assert.equal(result.isError, true)
+    assert.ok(result.content.includes('星河已拦截'))
+    assert.ok(result.content.includes('majority'))
+    assert.equal(calls.length, 0)
+  })
+
+  it('allows all_required policy (regression test)', async () => {
+    const calls: Array<{ requests: DelegationRequest[] }> = []
+    const tool = createGalaxyTool(capturingCoordinator(calls))
+
+    const result = await tool.execute({
+      toolUseId: 'tu_all_required',
+      cwd: '/repo',
+      input: {
+        objective: 'test all_required acceptance',
+        dimensions: [
+          { name: 'frontend', objective: 'implement UI', authority: 'wenqu' },
+          { name: 'backend', objective: 'implement API', authority: 'tianji' },
+        ],
+        policy: 'all_required',
+        autoReview: false,
+        confirm: true,
+      },
+    })
+
+    assert.equal(result.isError, undefined, `unexpected error: ${result.content}`)
+    assert.equal(calls.length, 1, 'should dispatch with all_required policy')
+  })
+
+  it('allows primary_decides policy (regression test)', async () => {
+    const calls: Array<{ requests: DelegationRequest[] }> = []
+    const tool = createGalaxyTool(capturingCoordinator(calls))
+
+    const result = await tool.execute({
+      toolUseId: 'tu_primary',
+      cwd: '/repo',
+      input: {
+        objective: 'test primary_decides acceptance',
+        dimensions: [
+          { name: 'frontend', objective: 'implement UI', authority: 'wenqu' },
+          { name: 'backend', objective: 'implement API', authority: 'tianji' },
+        ],
+        policy: 'primary_decides',
+        autoReview: false,
+        confirm: true,
+      },
+    })
+
+    assert.equal(result.isError, undefined, `unexpected error: ${result.content}`)
+    assert.equal(calls.length, 1, 'should dispatch with primary_decides policy')
+  })
 })

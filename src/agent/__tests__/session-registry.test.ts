@@ -263,6 +263,90 @@ describe('SessionRegistry', () => {
       assert.equal(claims.length, 2)
     })
   })
+
+  // v2（认领即租约）：文件级租约凭据 —— claimLiveness 用 join 一次取齐判定
+  // 所需字段（owner pid / 存活 / claim 类型 / 最后触碰时刻），补上 checkClaim
+  // 只返回三列、判定函数拿不到 pid 与文件的接口缺口。
+  describe('claimLiveness（v2 文件级租约凭据）', () => {
+    it('returns null for an unclaimed file', () => {
+      assert.equal(registry.claimLiveness('src/foo.ts'), null)
+    })
+
+    it('exposes owner pid, liveness and claim type after acquire', () => {
+      registry.register('sess-1', '/project')
+      registry.acquireClaim('sess-1', 'src/foo.ts', 'exclusive')
+      const live = registry.claimLiveness('src/foo.ts')
+      assert.ok(live, 'claimLiveness must return a row for a claimed file')
+      assert.equal(live.ownerSessionId, 'sess-1')
+      assert.equal(live.claimType, 'exclusive')
+      assert.equal(live.ownerPid, process.pid)
+      assert.equal(live.ownerAlive, true)
+      assert.equal(typeof live.lastTouchedAt, 'string')
+    })
+
+    it('refreshes lastTouchedAt when the same session re-acquires (write-touch)', async () => {
+      registry.register('sess-1', '/project')
+      registry.acquireClaim('sess-1', 'src/foo.ts', 'exclusive')
+      const first = registry.claimLiveness('src/foo.ts')!.lastTouchedAt
+      await new Promise((r) => setTimeout(r, 5))
+      registry.acquireClaim('sess-1', 'src/foo.ts', 'exclusive')
+      const second = registry.claimLiveness('src/foo.ts')!.lastTouchedAt
+      assert.ok(second > first, `同会话重复认领必须刷新 lastTouchedAt：${first} -> ${second}`)
+    })
+
+    it('reports ownerPid=null for a claim whose session row is gone (L0 陈旧行)', () => {
+      // claims 行在、sessions 行无 —— 幽灵认领，判定应落 L0（回收而非"问"）
+      registry.acquireClaim('ghost-sess', 'src/foo.ts', 'exclusive')
+      const live = registry.claimLiveness('src/foo.ts')
+      assert.ok(live)
+      assert.equal(live.ownerSessionId, 'ghost-sess')
+      assert.equal(live.ownerPid, null)
+    })
+
+    it('reports ownerAlive=false for a dead owner pid', () => {
+      registry.register('dead-sess', '/project')
+      registry.updatePid('dead-sess', 99999)
+      registry.acquireClaim('dead-sess', 'src/foo.ts', 'exclusive')
+      const live = registry.claimLiveness('src/foo.ts')
+      assert.ok(live)
+      assert.equal(live.ownerPid, 99999)
+      assert.equal(live.ownerAlive, false)
+    })
+  })
+
+  describe('v2 迁移：老库 claims 表无 last_touched_at 列', () => {
+    it('backfills last_touched_at from acquired_at on open', async () => {
+      const legacyDir = mkdtempSync(join(tmpdir(), 'sr-legacy-'))
+      try {
+        const { resolveBetterSqlite3 } = await import('../../repo/native-resolver.js')
+        const Database = resolveBetterSqlite3(import.meta.url)
+        if (!Database) return // 原生模块不可用（降级环境）→ 迁移路径不适用，跳过
+        const raw = new Database(join(legacyDir, 'registry.db'))
+        raw.exec(`
+          CREATE TABLE sessions (id TEXT PRIMARY KEY, pid INTEGER NOT NULL, cwd TEXT NOT NULL, started_at TEXT NOT NULL, heartbeat_at TEXT NOT NULL, role TEXT NOT NULL, task_description TEXT);
+          CREATE TABLE claims (session_id TEXT NOT NULL, file_path TEXT NOT NULL, claim_type TEXT NOT NULL, acquired_at TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')));
+        `)
+        raw.prepare('INSERT INTO sessions VALUES (?,?,?,?,?,?,?)')
+          .run('old-sess', process.pid, '/project', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z', 'standalone', null)
+        raw.prepare('INSERT INTO claims (session_id, file_path, claim_type, acquired_at) VALUES (?,?,?,?)')
+          .run('old-sess', 'src/legacy.ts', 'exclusive', '2026-01-01T00:00:00.000Z')
+        raw.close()
+
+        const legacy = await SessionRegistry.create(legacyDir)
+        try {
+          const live = legacy.claimLiveness('src/legacy.ts')
+          assert.ok(live, '迁移补列后 claimLiveness 必须能读到老库的 claim')
+          assert.equal(live.lastTouchedAt, '2026-01-01T00:00:00.000Z', '历史行应回填为 acquired_at（已知活动下界）')
+          assert.equal(live.ownerPid, process.pid)
+          assert.equal(live.ownerAlive, true)
+        } finally {
+          legacy.close()
+        }
+      } finally {
+        rmSync(legacyDir, { recursive: true, force: true })
+      }
+    })
+  })
 })
 
 // D-2: better-sqlite3 拿不到时 nullDb 降级桩的契约。README 与源码注释承诺

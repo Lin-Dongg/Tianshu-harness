@@ -26,9 +26,12 @@ import { fetch as undiciFetch, ProxyAgent } from 'undici'
 import type { RouteHandler } from './index.js'
 import { withAuth } from './routes.js'
 import { resolveProxyForUrl } from '../tools/net/proxy-resolver.js'
+import { cachedAccountSync, confirmedAccountPart, mergeAccountSnapshot, type AccountSyncResult } from '../auth/account-sync.js'
 import { rivetHome } from '../config/paths.js'
-import { accountDeviceFingerprint } from '../auth/account-device.js'
+import { serverLogger } from './logger.js'
+import { accountDeviceFingerprint, isValidDeviceFingerprint } from '../auth/account-device.js'
 import * as accountModule from '../auth/account.js'
+import { activateAccountLicense } from '../auth/account-license.js'
 import type {
   AccountProfile,
   AccountProfileSnapshot,
@@ -39,6 +42,7 @@ import type {
   RequestDeviceCodeOpts,
   StellarIdentity,
 } from '../auth/account.js'
+import type { ActivateAccountLicenseCode, ActivateAccountLicenseResult } from '../auth/account-license.js'
 import type { TokenStore, TokenData } from '../auth/token-store.js'
 
 /**
@@ -48,11 +52,13 @@ import type { TokenStore, TokenData } from '../auth/token-store.js'
  * 「凭据进文件、不进响应体」这条不变量只有真实磁盘能证。
  */
 export interface AccountApi {
+  fetchAccountSnapshot?(accessToken: string, opts?: FetchInjection): Promise<AccountSyncResult>
   cancelDeviceCode?(deviceCode: string, opts?: FetchInjection): Promise<boolean>
   revokeAccountSession?(accessToken: string, opts?: FetchInjection): Promise<boolean>
   requestDeviceCode(opts: RequestDeviceCodeOpts): Promise<DeviceCreateResult>
   checkDeviceOnce(deviceCode: string, opts?: FetchInjection): Promise<DevicePollResult>
   fetchAccountProfile(accessToken: string, opts?: FetchInjection): Promise<AccountProfile | null>
+  refreshAccountTokenWithStatus?(refreshToken: string, opts?: FetchInjection): Promise<{ poll: DevicePollResult | null; code: AccountSyncResult['code'] }>
   refreshAccountToken?(refreshToken: string, opts?: FetchInjection): Promise<DevicePollResult | null>
   accountStore(rivetHome: string): TokenStore
   saveAccountToken(store: TokenStore, poll: DevicePollResult): TokenData
@@ -69,6 +75,13 @@ export interface AccountApi {
   accountIdentityUrl(): string
   /** 官网账号与授权页 URL（个人中心权益面板「在官网查看账号与授权」的目标）。 */
   accountManageUrl(): string
+  /**
+   * 用账号凭据代跑设备许可恢复（官网 EF `tui-account-activate`）。
+   *
+   * 凭据消费收在这一侧的原因见该函数的注释：`account.json` 是密文信封，
+   * 壳解不开。壳只接已签名的 grant。
+   */
+  activateAccountLicense(accessToken: string, licenseId: string, deviceId: string, opts?: FetchInjection): Promise<ActivateAccountLicenseResult>
 }
 
 export interface AccountRoutesDeps {
@@ -118,11 +131,13 @@ function buildProxyFetch(deps: AccountRoutesDeps): FetchLike | undefined {
 
 function defaultAccountApi(): AccountApi {
   return {
+    fetchAccountSnapshot: accountModule.fetchAccountSnapshot,
     requestDeviceCode: accountModule.requestDeviceCode,
     cancelDeviceCode: accountModule.cancelDeviceCode,
     revokeAccountSession: accountModule.revokeAccountSession,
     checkDeviceOnce: accountModule.checkDeviceOnce,
     fetchAccountProfile: accountModule.fetchAccountProfile,
+    refreshAccountTokenWithStatus: accountModule.refreshAccountTokenWithStatus,
     refreshAccountToken: accountModule.refreshAccountToken,
     accountStore: accountModule.accountStore,
     saveAccountToken: accountModule.saveAccountToken,
@@ -135,7 +150,34 @@ function defaultAccountApi(): AccountApi {
     isAccountIdentityStale: accountModule.isAccountIdentityStale,
     accountIdentityUrl: accountModule.accountIdentityUrl,
     accountManageUrl: accountModule.accountManageUrl,
+    activateAccountLicense,
   }
+}
+
+/**
+ * 恢复失败码 → HTTP 状态。
+ *
+ * 401/404 保留原语义（凭据失效 / 官网版本不支持）；官网明确拒绝的业务码走 403
+ * （请求本身没问题，是被服务端驳回）；传输与协议故障走 502。前端只读 `body.error`
+ * 拿文案，状态码是给日志与第三方集成看的。
+ */
+const ACTIVATE_STATUS: Record<ActivateAccountLicenseCode, number> = {
+  ok: 200,
+  auth_required: 401,
+  endpoint_unavailable: 404,
+  device_mismatch: 403,
+  license_not_owned: 403,
+  pro_required: 403,
+  activation_limit_reached: 403,
+  activation_revoked: 403,
+  code_revoked: 403,
+  license_expired: 403,
+  code_not_found: 403,
+  trial_already_used: 403,
+  network_error: 502,
+  timeout: 502,
+  protocol_error: 502,
+  service_error: 502,
 }
 
 export function buildAccountRoutes(deps: AccountRoutesDeps): Record<string, RouteHandler> {
@@ -206,17 +248,39 @@ export function buildAccountRoutes(deps: AccountRoutesDeps): Record<string, Rout
       const before = current()
       if (!before) return false
       if (before.expiresAt <= Date.now() + 60_000 && before.refreshToken && api.refreshAccountToken) {
-        const rotated = await api.refreshAccountToken(before.refreshToken, { fetchImpl })
+        const renewal = api.refreshAccountTokenWithStatus ? await api.refreshAccountTokenWithStatus(before.refreshToken, { fetchImpl }) : undefined
+        const rotated = renewal ? renewal.poll : await api.refreshAccountToken(before.refreshToken, { fetchImpl })
         const fresh = current()
         if (!rotated?.accessToken || !fresh) {
           if (!fresh && rotated?.accessToken) { try { await api.revokeAccountSession?.(rotated.accessToken, { fetchImpl }) } catch {} }
-          if (fresh) lastRefresh = { accessToken: activeToken, at: Date.now(), ok: false }
+          if (fresh) {
+            if (renewal) store.save({ ...fresh, accountSync: mergeAccountSnapshot(cachedAccountSync(fresh), { code: renewal.code, elapsedMs: 0 }) } as TokenData)
+            lastRefresh = { accessToken: activeToken, at: Date.now(), ok: false }
+          }
           return false
         }
         store.save({ ...fresh, accessToken: rotated.accessToken, refreshToken: rotated.refreshToken,
           expiresAt: Date.now() + (rotated.expiresIn ?? 3600) * 1000 })
         activeToken = rotated.accessToken
         if (refreshJob?.accessToken === accessToken) refreshJob.accessToken = activeToken
+      }
+      if (api.fetchAccountSnapshot) {
+        const result = await api.fetchAccountSnapshot(activeToken, { fetchImpl })
+        const fresh = current()
+        if (!fresh) return false
+        const accountSync = mergeAccountSnapshot(cachedAccountSync(fresh), result)
+        const snapshot = accountSync.snapshot
+        const identity = result.snapshot?.identity
+        const profile = result.snapshot?.profile
+        const next = { ...fresh, accountSync,
+          ...(identity && confirmedAccountPart(identity) ? { identity: identity.data ? { ...identity.data, fetchedAt: identity.fetchedAt! } : undefined } : {}),
+          ...(profile && confirmedAccountPart(profile) && profile.data ? { profile: { ...profile.data, fetchedAt: profile.fetchedAt!, unconfirmed: [] } } : {}),
+        }
+        store.save(next)
+        const parts = result.snapshot ? [result.snapshot.identity, result.snapshot.profile, result.snapshot.entitlements] : []
+        const ok = result.code === 'ok' && parts.every(confirmedAccountPart)
+        lastRefresh = { accessToken: activeToken, fromToken: accessToken, at: Date.now(), ok, partial: !ok && parts.some(confirmedAccountPart) }
+        return result.code === 'ok' && Boolean(snapshot) && Boolean(identity && confirmedAccountPart(identity))
       }
       const results = await Promise.allSettled([identityTask(), profileTask(), contactTask()])
       const succeeded = results.map(result => result.status === 'fulfilled' && result.value)
@@ -306,10 +370,19 @@ export function buildAccountRoutes(deps: AccountRoutesDeps): Record<string, Rout
       } }
       const cached = api.cachedAccountIdentity(token)
       const profile = api.cachedAccountProfile(token)
-      if (token.expiresAt <= Date.now() + 60_000 || profile?.unconfirmed?.length || api.isAccountIdentityStale(cached?.fetchedAt ?? 0) || api.isAccountIdentityStale(profile?.fetchedAt ?? 0) || !profile?.account) {
+      const accountSync = cachedAccountSync(token)
+      const stale = api.fetchAccountSnapshot
+        ? !accountSync || Date.now() - accountSync.checkedAt > 30_000
+        : token.expiresAt <= Date.now() + 60_000 || Boolean(profile?.unconfirmed?.length) || api.isAccountIdentityStale(cached?.fetchedAt ?? 0) || api.isAccountIdentityStale(profile?.fetchedAt ?? 0) || !profile?.account
+      if (accountSync?.code !== 'auth_required' && stale) {
         void refreshAccount(store, token.accessToken)
       }
       return { status: 200, body: {
+        authStatus: accountSync?.code === 'auth_required' ? 'reauth_required' : accountSync?.code === 'ok' ? 'authenticated' : 'unverified',
+        syncCode: accountSync?.code,
+        syncParts: accountSync?.snapshot ? { profile: accountSync.snapshot.profile.status, identity: accountSync.snapshot.identity.status, entitlements: accountSync.snapshot.entitlements.status } : undefined,
+        entitlements: accountSync?.snapshot?.entitlements.data,
+        entitlementsFetchedAt: accountSync?.snapshot?.entitlements.fetchedAt,
         loggedIn: true, email: profile?.account?.email ?? null, userId: accountModule.jwtSubject(token.accessToken) ?? profile?.account?.userId ?? null,
         username: profile?.account?.username ?? null,
         displayName: profile?.account?.displayName ?? null, joinedAt: profile?.account?.joinedAt ?? null,
@@ -331,8 +404,35 @@ export function buildAccountRoutes(deps: AccountRoutesDeps): Record<string, Rout
       const renewed = lastRefresh?.fromToken === token.accessToken && lastRefresh.accessToken === fresh?.accessToken
       if (started !== generation || (fresh?.accessToken !== token.accessToken && !renewed)) return { status: 200, body: { refreshed: false, stellarId: null, primaryDomain: null, title: null } }
       const identity = api.cachedAccountIdentity(fresh)?.identity
-      return { status: 200, body: { refreshed, complete: lastRefresh?.accessToken === fresh?.accessToken && lastRefresh.ok, stellarId: identity?.stellarId ?? null,
+      return { status: 200, body: { code: cachedAccountSync(fresh)?.code, parts: cachedAccountSync(fresh)?.snapshot ? { profile: cachedAccountSync(fresh)!.snapshot!.profile.status, identity: cachedAccountSync(fresh)!.snapshot!.identity.status, entitlements: cachedAccountSync(fresh)!.snapshot!.entitlements.status } : undefined, refreshed, complete: lastRefresh?.accessToken === fresh?.accessToken && lastRefresh.ok, stellarId: identity?.stellarId ?? null,
         primaryDomain: identity?.primaryDomain ?? null, title: identity?.title ?? null } }
+    }),
+    // 设备许可恢复：凭据消费的唯一入口（壳不解析 account.json）。
+    //
+    // 两步走是刻意的：这里只负责「用凭据换签名 grant」，验签与落盘仍在壳里
+    // （Ed25519 信任根只有一份）。所以本路由**不写任何许可文件**，也不回传凭据。
+    'POST /account/activate-device': guard(async body => {
+      const input = (body ?? {}) as { licenseId?: unknown; deviceId?: unknown }
+      const licenseId = typeof input.licenseId === 'string' ? input.licenseId : ''
+      const deviceId = typeof input.deviceId === 'string' ? input.deviceId : ''
+      // 设备指纹由壳算（machine-uid，`activation::device_id`）后带上来——sidecar
+      // 拿不到硬件 ID，自己造一个会 bind 到错误设备。形状校验与 device flow 同一处。
+      if (!licenseId || licenseId.length > 128) return { status: 400, body: { error: 'invalid_license' } }
+      if (!isValidDeviceFingerprint(deviceId)) return { status: 400, body: { error: 'invalid_device' } }
+      const store = api.accountStore(deps.rivetHome)
+      const credential = store.load()?.accessToken
+      if (!credential) return { status: 401, body: { error: 'auth_required' } }
+      const started = Date.now()
+      const result = await api.activateAccountLicense(credential, licenseId, deviceId, { fetchImpl })
+      // 失败留一行：这个端点曾在生产无声失败（壳读不到密文凭据、恒 auth_required），
+      // 日志只记分类与耗时，不记凭据也不记响应体。
+      if (result.code !== 'ok') serverLogger.warn('[account-activate] 设备许可恢复未成功', { code: result.code, elapsedMs: Date.now() - started })
+      // 请求在途时换了号或登出：迟到的 grant 不许应用。这条不变量原本住在壳里
+      // （account_activation.rs 的 account_credential 比对），凭据消费搬过来后
+      // 它只能住在这里——壳读不到凭据文件，也就无从判断。
+      if (store.load()?.accessToken !== credential) return { status: 409, body: { error: 'account_changed' } }
+      if (result.code !== 'ok') return { status: ACTIVATE_STATUS[result.code] ?? 502, body: { error: result.code } }
+      return { status: 200, body: { grant: result.grant } }
     }),
     'POST /account/cancel': guard(async () => {
       generation++

@@ -15,6 +15,11 @@ import { skillRegistry } from '../../skills/skill-loader.js'
 import { EventEmitter } from 'node:events'
 import type { ServerResponse } from 'node:http'
 
+// 信任门族（2026-10-07 审计修复）：loadProjectSkills 现带信任门——本文件的 /skills
+// 相关用例（loadErrors 可见性等）验「授信项目」正常语义；未授信拒绝语义在
+// src/config/__tests__/project-trust-surface-gates.test.ts 覆盖。node:test 文件级进程隔离。
+process.env.RIVET_TRUST_PROJECT = '1'
+
 const TOKEN = 'secret-token'
 const AUTH = { authorization: `Bearer ${TOKEN}` }
 
@@ -1045,7 +1050,9 @@ test('GET /skills + POST /skills toggles enablement', async () => {
   assert.equal(res.status, 200)
   assert.ok(Array.isArray((res.body as { skills: unknown[] }).skills))
 
-  const toggled = await router('POST', `/sessions/${id}/skills`, { name: 'demo', enabled: false }, AUTH)
+  const skill = (res.body as { skills: Array<{ name: string }> }).skills[0]!
+  assert.ok(skill, 'fixture exposes at least one pinned builtin skill')
+  const toggled = await router('POST', `/sessions/${id}/skills`, { name: skill.name, enabled: false }, AUTH)
   assert.equal(toggled.status, 200)
   assert.equal((toggled.body as { enabled: boolean }).enabled, false)
 

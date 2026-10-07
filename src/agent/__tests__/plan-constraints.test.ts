@@ -6,6 +6,11 @@ import { join, resolve } from 'node:path'
 import { extractPlanConstraints, renderPlanConstraints, resolvePlanConstraints, constraintsFromUnifiedPlan, findApprovedPlanConstraints, resetApprovedPlanCache, type PlanConstraint } from '../plan-constraints.js'
 import { withPlanConstraints } from '../coordinator.js'
 
+// 信任门族（2026-10-07 审计修复）：resolvePlanContract / findApprovedPlanConstraints
+// 现带信任门——本文件验「授信项目的计划约束解析」正常语义；未授信拒绝语义在
+// src/config/__tests__/project-trust-surface-gates.test.ts 覆盖。node:test 文件级进程隔离。
+process.env.RIVET_TRUST_PROJECT = '1'
+
 /** D5 计划「## 反目标」真实片段。 */
 const D5_MARKDOWN = `# D5 编排入口归层
 

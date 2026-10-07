@@ -1,3 +1,4 @@
+import { sessionSkillSnapshot } from '../skills/session-skill-snapshot.js'
 import { buildSessionVitals } from './session-vitals-builder.js'
 import { currentWorkspaceRoots } from '../tools/workspace-context.js'
 import { observePal } from './pal-observation.js'
@@ -664,6 +665,12 @@ export class AgentLoop {
     suppressedCount: number
     /** 各 outcome 累计（ok/type_errors/timeout/spawn_error/busy/backoff）。 */
     outcomes: Record<import('./theta-check.js').ThetaOutcome, number>
+    /** 连续 no-fresh-verdict 次数——智能触发的判据（theta-controller.shouldTriggerOnMiss）。
+     *  必须在这里初始化：缺省 undefined 会让累加点算出 NaN，此后 `NaN >= 3` 恒假，
+     *  「连续 miss 触发真跑」整条路径静默失效（2026-10-07）。 */
+    consecutiveNoFreshVerdict: number
+    /** 触发真跑的累计次数——用于遥测。 */
+    triggeredRuns: number
   } = {
     lastReason: null,
     lastDurationMs: null,
@@ -674,6 +681,8 @@ export class AgentLoop {
     cooldownUntilTurn: 0,
     suppressedCount: 0,
     outcomes: { ok: 0, type_errors: 0, timeout: 0, spawn_error: 0, busy: 0, backoff: 0, 'no-fresh-verdict': 0 },
+    consecutiveNoFreshVerdict: 0,
+    triggeredRuns: 0,
   }
   /** Max theta checks per session. Prevents runaway tsc spawning. */
   thetaRequestsThisTurn = 0
@@ -785,6 +794,7 @@ export class AgentLoop {
     cwd?: string,
   ) {
       this.config = config; this.session = session;
+    if (config.sessionId) config.promptEngine.setSkillRegistry(sessionSkillSnapshot(cwd ?? process.cwd(), config.sessionId))
     if (!this.config.permissionsOverlay) {
       this.config.permissionsOverlay = createPermissionOverlay()
     }

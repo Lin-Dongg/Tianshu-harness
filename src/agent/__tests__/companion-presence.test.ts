@@ -4,6 +4,11 @@ import { mkdirSync, rmSync, existsSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { loadPresence, writePresence, formatPresenceForAppendix, type CompanionPresenceEntry } from '../companion-presence.js'
 
+// 信任门族（2026-10-07 审计修复）：本文件验「授信项目的 presence 读写」正常语义
+//（write→load 往返用例依赖读侧放行）；未授信拒绝语义在
+// src/config/__tests__/project-trust-surface-gates.test.ts 覆盖。node:test 文件级进程隔离。
+process.env.RIVET_TRUST_PROJECT = '1'
+
 const TMP = join(process.cwd(), '.test-tmp', 'companion-presence-test')
 
 describe('companion-presence', () => {

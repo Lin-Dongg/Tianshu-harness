@@ -87,3 +87,36 @@ test('run_tests timeout claims settlement before synchronous child close and fin
   assert.equal(persistCalls, 1, 'raw output must be persisted exactly once')
   assert.equal(decoderEnds, 2, 'stdout and stderr decoders finalize exactly once each')
 })
+
+test('EPERM fallback receives only remaining budget and cannot spawn after exhaustion', async () => {
+  for (const elapsed of [40, 60]) {
+    const clock = Date.now
+    const base = clock()
+    let spent = 0, spawns = 0
+    Date.now = () => base + spent
+    const children = [new FakeChild(), new FakeChild()], timers = new ManualTimers()
+    const deps: RunTestCommandDeps = {
+      spawn: () => children[spawns++]!, kill: () => {}, persist: async () => '/tmp/eperm-output',
+      setTimeout: (callback, ms) => timers.setTimeout(callback, ms), clearTimeout: handle => timers.clearTimeout(handle),
+      createDecoder: () => ({ write: (data: Buffer) => data.toString(), end: () => '' }),
+    }
+    try {
+      const command: RunnableTestCommand = { type: 'run', command: 'tsx', args: ['--test'], display: 'tsx --test', runner: 'node-test', scope: 'full' }
+      const pending = runTestCommandIn('/tmp', command, { input: {}, toolUseId: 'eperm-budget', cwd: '/tmp' }, undefined, 50, deps)
+      children[0]!.stderr.write('EPERM')
+      spent = elapsed
+      children[0]!.emit('close', 1, null)
+      if (elapsed < 50) {
+        assert.equal(spawns, 2)
+        assert.ok(timers.tasks.some(task => task.ms === 10 && !task.cleared))
+        children[1]!.emit('close', 0, null)
+        assert.equal((await pending).isError, false)
+      } else {
+        assert.equal(spawns, 1, 'exhausted retry must not spawn')
+        const result = await pending
+        assert.equal(result.verification?.status, 'blocked')
+        assert.equal(result.verification?.failureKind, 'timeout')
+      }
+    } finally { for (const child of children) child.emit('close', 1, null); Date.now = clock }
+  }
+})

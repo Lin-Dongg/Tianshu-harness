@@ -7,10 +7,10 @@ import type { MeridianIndexer } from '../repo/meridian-indexer.js'
 import { isMeridianIndexablePath } from '../repo/meridian-indexer.js'
 import { analyzeImpact, type ImpactResult, type ImpactStep } from '../repo/meridian-impact.js'
 import { buildImportGraphAsync } from './import-graph.js'
+import { isTestEntry as testPath } from '../repo/test-entry.js'
 
 export interface DeliveryImpact extends Partial<ImpactResult> { resolved: boolean; reason?: string; requiredTests: string[]; advisoryTests: string[] }
 const exec = promisify(execFile)
-const testPath = (path: string) => /(?:\.(?:test|spec)\.|(?:^|\/)__tests__\/|(?:^|\/)test\/)/.test(path)
 
 /** Recompute from current dirty ownership; history is diagnostic, never obligation. */
 export async function resolveDeliveryImpact(cwd: string, files: readonly string[], indexer?: MeridianIndexer | null): Promise<DeliveryImpact> {

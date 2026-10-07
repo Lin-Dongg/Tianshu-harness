@@ -265,4 +265,91 @@ describe('syntaxCheck', async () => {
       assert.equal(await syntaxCheck('/a/file.txt', 'hello'), null)
     })
   })
+
+  describe('esbuild 基础设施故障不得渲染成语法提示（issue #366）', async () => {
+    // Windows 包缺 @esbuild/win32-x64（交叉构建时静默漏 stage）→ esbuild 抛的
+    // 安装手册曾被当作「语法检查提示」回显给模型：标题说语法、正文是安装说明、
+    // 末尾又说「经二次确认语法正确」。这组用例钉死三道闸门。
+    const PLATFORM_PKG_MISSING = () =>
+      new Error(
+        'The package "@esbuild/win32-x64" could not be found, and is needed by esbuild.\n' +
+          '\n' +
+          'If you are installing esbuild with npm, make sure that you don\'t specify the\n' +
+          '"--no-optional" or "--omit=optional" flags. The "optionalDependencies" feature\n' +
+          'of "package.json" is used by esbuild to install the correct binary executable\n' +
+          'for your current platform.',
+      )
+
+    /** 用给定失败替换 cpu 池的 worker 通道，返回调用计数；退出时复位。 */
+    async function withFailingWorker<T>(
+      makeError: () => Error,
+      body: (calls: () => number) => Promise<T>,
+    ): Promise<T> {
+      const { cpuPool } = await import('../../workers/cpu-pool.js')
+      const original = cpuPool.run.bind(cpuPool)
+      let calls = 0
+      ;(cpuPool as unknown as { run: typeof cpuPool.run }).run = (async () => {
+        calls++
+        throw makeError()
+      }) as typeof cpuPool.run
+      _resetEsbuildCacheForTest()
+      try {
+        return await body(() => calls)
+      } finally {
+        ;(cpuPool as unknown as { run: typeof cpuPool.run }).run = original
+        _resetEsbuildCacheForTest()
+      }
+    }
+
+    it('平台包缺失 → 静默降级，且连续写入触发熔断（不再每次交一次调用税）', async () => {
+      await withFailingWorker(PLATFORM_PKG_MISSING, async calls => {
+        for (let i = 0; i < 4; i++) {
+          const r = await checkSyntax('/a/script.js', 'const a = 1;\n')
+          assert.equal(r.warning, null, `第 ${i + 1} 次写入不应出现任何提示`)
+          assert.equal(r.fatal, null, '工具链故障绝不能被当成致命语法错误')
+        }
+        assert.ok(calls() <= 2, `worker 调用应被熔断器截断在阈值 2，实际 ${calls()}`)
+      })
+    })
+
+    it('无法分类的非结构化失败 → 静默降级（fail-closed 兜底闸门）', async () => {
+      await withFailingWorker(
+        () => new Error('some toolchain failure we cannot classify\nsecond line'),
+        async () => {
+          const r = await checkSyntax('/a/script.ts', 'const x: number = 1;')
+          assert.equal(r.warning, null)
+          assert.equal(r.fatal, null)
+        },
+      )
+    })
+
+    it('worker 标记 infra 的失败 → 静默降级', async () => {
+      await withFailingWorker(
+        () => Object.assign(new Error('spawn failed with EACCES'), { infra: true }),
+        async () => {
+          const r = await checkSyntax('/a/script.mjs', 'export const a = 1;')
+          assert.equal(r.warning, null)
+          assert.equal(r.fatal, null)
+        },
+      )
+    })
+
+    it('真正的语法错误仍然报（闸门不得吞掉业务信号）', async () => {
+      const r = await checkSyntax('/a/script.js', 'const a = ;')
+      assert.ok(r.warning, '语法错误必须仍然可见')
+      assert.ok(r.fatal, '双方都拒绝时仍应是致命错误')
+    })
+
+    it('源码中的环境故障关键词不能吞掉语法错误或触发熔断', async () => {
+      _resetEsbuildCacheForTest()
+      try {
+        for (const word of ['ENOENT', '@esbuild/foo', 'timed out', 'terminated', 'unavailable', 'could not be found', 'no such file', 'ordinary']) {
+          const result = await checkSyntax('/a/script.js', `const a = 1 ${JSON.stringify(word)};`)
+          assert.ok(result.fatal, `包含 ${word} 的真正语法错误必须报告，且不能熔断后续检查`)
+        }
+      } finally {
+        _resetEsbuildCacheForTest()
+      }
+    })
+  })
 })

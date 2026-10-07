@@ -12,10 +12,15 @@ import { spawnHidden } from './spawn-hidden.js'
 import { killProcessTree } from './process-kill.js'
 import { persistRawOutput, buildUiOutput } from './output-store.js'
 import { getResolvedEnv } from './resolved-env.js'
+import { createRequire } from 'node:module'
+import { randomUUID } from 'node:crypto'
+import { completionFacts } from './verification-facts.js'
 import { toPosixPath } from '../path-format.js'
 import { loadDeclaredVerify } from '../config/verify-config.js'
 import { detectProjectFingerprint } from '../repo/project-fingerprint.js'
 import { OutputStreamBudget } from './output-stream-budget.js'
+import { snapshotOmissionNote, snapshotTestResult } from './run-tests-snapshot-result.js'
+import { verificationTimeout, runTestsTimeoutMs, verificationBudgetStop } from './verification-budget.js'
 
 /** context-collapse 靠此正则解析 formatOutput 摘要行；改文案必须与消费方同步（常量共享，禁止两边各自手抄）。 */
 export const RUN_TESTS_PASSED_RE = /(\d+)\s+通过/
@@ -62,27 +67,19 @@ export interface TestSpawnDeps {
   exists: (p: string) => boolean
 }
 
-/**
- * Normalize a test-runner spawn for the host OS.
- *
- * On Windows the runners `npm` / `npx` / `tsx` (and vitest/jest, which we invoke
- * via `npx`) are `.cmd` shims, not `.exe`. Modern Node refuses to spawn a
- * `.cmd`/`.bat` without `shell: true` (throws EINVAL), so spawning them directly
- * silently breaks the whole verification gate on Windows. This mirrors the
- * established pattern in `theta-check.ts::resolveTscCommand` and
- * `lsp/client.ts::runTscSubprocess`: on win32, route `.cmd` runners through a
- * shell and quote any path/arg containing spaces (e.g. `C:\Users\My Name`).
- *
- * `node` / `pytest` are real executables → spawned directly (no shell). On
- * non-Windows hosts everything is spawned directly.
- */
+/** Resolve project-local tsx on POSIX; Windows .cmd runners retain shell quoting. */
 export function resolveTestSpawn(
   command: string,
   args: readonly string[],
   cwd: string,
   deps: TestSpawnDeps = { isWindows: process.platform === 'win32', exists: existsSync },
 ): ResolvedTestSpawn {
-  if (!deps.isWindows) return { command, args: [...args], shell: false }
+  if (!deps.isWindows) {
+    if (command !== 'tsx') return { command, args: [...args], shell: false }
+    let cli = join(cwd, 'node_modules', 'tsx', 'dist', 'cli.mjs')
+    try { cli = createRequire(join(cwd, 'package.json')).resolve('tsx/cli') } catch { /* Missing local dependency is an invocation error, never an install. */ }
+    return { command: process.execPath, args: [cli, ...args], shell: false }
+  }
 
   // shell:true 让 Node 把 argv 拼成单条 cmd.exe 命令行——引号必须覆盖一切
   // 非安全字符（空白、& | < > ^ ( ) 等元字符），否则仓库可控的文件名
@@ -633,15 +630,16 @@ export const RUN_TESTS_TOOL: Tool = {
       type: 'object',
       properties: {
         filter: { type: 'string', description: '测试文件名、词干或相对路径（不是测试名）。留空跑全量。' },
-        timeout: { type: 'integer', description: '超时时间（毫秒，默认：120000）' },
+        timeout: { type: 'integer', description: '整次验证的总预算（毫秒，默认：120000），隔离、集成与归因重试共用。' },
       },
     },
   },
 
   async execute(params: ToolCallParams) {
     const filter = params.input.filter as string | undefined
-    const timeout = (params.input.timeout as number) ?? 120_000
+    const timeout = verificationTimeout(params.input.timeout)
     const startTime = Date.now()
+    const remaining = () => Math.max(0, timeout - (Date.now() - startTime))
     const testCommand = await buildTestCommand(params.cwd, filter)
 
     if (testCommand.type === 'blocked') {
@@ -659,73 +657,57 @@ export const RUN_TESTS_TOOL: Tool = {
     const plan = params.verificationSnapshot
     if (!plan) {
       // Default in-place verification — unchanged single-phase path.
-      const inPlace = await runTestCommandIn(params.cwd, testCommand, params, filter, timeout)
+      const inPlace = await runTestCommandIn(params.cwd, testCommand, params, filter, remaining())
 
-      // C3: failure-attribution retry. Only wired by the pipeline when live
-      // pollution signals exist (peer sessions / workspace mutations). A
-      // snapshot-pass after a live-fail means the failure came from the
-      // polluted working tree, not the owned changes.
-      if (inPlace.isError && params.prepareRetrySnapshot) {
+      // C3 compares live failure with the owned snapshot; the gate checks proof.
+      if (inPlace.isError && !params.abortSignal?.aborted && remaining() > 0 && inPlace.verification?.failureKind !== 'timeout' && params.prepareRetrySnapshot) {
         let retryPlan: VerificationSnapshotPlan | null = null
         try { retryPlan = await params.prepareRetrySnapshot() } catch { /* degrade: keep in-place result */ }
         if (retryPlan) {
-          const isolated = await runTestCommandIn(retryPlan.path, testCommand, params, filter, timeout)
+          const isolated = await runTestCommandIn(retryPlan.path, testCommand, params, filter, remaining(), defaultRunTestDeps, retryPlan.repositoryRoot)
           tagVerification(isolated, 'isolated', retryPlan.snapshotRef)
           if (!isolated.isError) {
+            const comparisonId = randomUUID()
+            tagVerification(inPlace, 'integration', retryPlan.snapshotRef)
+            for (const phase of [isolated, inPlace]) if (phase.verification) phase.verification.comparisonId = comparisonId
             const note = `\n\n[C3 归因重试] 测试在实时工作区 FAILED，但在归属变更的隔离快照中 PASSED。两个环境结果不一致；保留失败记录并检查失败位置或隔离对照，不能仅据此认定由其他会话引入。`
             const result: ToolResult = {
               ...isolated,
-              content: `[实时工作区] FAILED\n${typeof inPlace.content === 'string' ? inPlace.content.slice(0, 1500) : ''}\n\n[隔离快照] PASSED\n${isolated.content}${note}`,
+              content: `[实时工作区] FAILED\n${typeof inPlace.content === 'string' ? inPlace.content.slice(0, 1500) : ''}\n\n[隔离快照] PASSED\n${isolated.content}${snapshotOmissionNote(retryPlan)}${note}`,
               isError: false,
             }
             if (inPlace.verification) result.extraVerifications = [inPlace.verification]
             return result
           }
-          // Failed in isolation too → genuinely broken code; report the
-          // in-place result with the attribution confirmed.
-          inPlace.content += `\n\n[C3 归因重试] 在隔离快照中也 FAILED——两个环境均失败；尚不能区分归属缺陷与共同基线问题。`
+          // Keep live failure; an incomplete retry cannot establish isolation failure.
+          inPlace.content += `${snapshotOmissionNote(retryPlan)}\n\n[C3 归因重试] ${isolated.verification?.status === 'blocked' ? `未完成 — ${isolated.content}` : '在隔离快照中也 FAILED——两个环境均失败；尚不能区分归属缺陷与共同基线问题。'}`
           if (isolated.verification) inPlace.extraVerifications = [isolated.verification]
         }
       }
       return inPlace
     }
 
-    // VSW two-phase: Phase A in the isolated snapshot (blocking gate), Phase B in
-    // the live tree against current HEAD (advisory integration check). Phase A's
-    // result is primary; Phase B rides along as an extra verification so the gate
-    // can flag integration_conflict without blocking delivery.
-    const phaseA = await runTestCommandIn(plan.path, testCommand, params, filter, timeout)
+    // Record both executions; only matched complete proofs can waive integration failure.
+    const comparisonId = randomUUID()
+    const phaseA = await runTestCommandIn(plan.path, testCommand, params, filter, remaining(), defaultRunTestDeps, plan.repositoryRoot)
     tagVerification(phaseA, 'isolated', plan.snapshotRef)
 
-    const phaseB = await runTestCommandIn(params.cwd, testCommand, params, filter, timeout)
+    // 阶段 A（隔离）失败即已定论：门禁只在「隔离通过」时才认集成差异
+    // （isolatedPassed）。此时再跑一遍实时工作区只会多付一整轮测试时间
+    // （2026-10-06 全量实测每次多约 64s）并把失败信息翻倍。
+    if (phaseA.isError) {
+      return snapshotTestResult(phaseA, plan)
+    }
+
+    const phaseB = await runTestCommandIn(params.cwd, testCommand, params, filter, remaining())
     tagVerification(phaseB, 'integration', plan.snapshotRef)
+    for (const phase of [phaseA, phaseB]) if (phase.verification) phase.verification.comparisonId = comparisonId
     if (phaseB.verification) phaseB.verification.isolatedPassed = !phaseA.isError && phaseA.verification?.status === 'passed'
 
-    const phaseBNote = phaseB.isError
-      ? phaseB.verification?.isolatedPassed
-        ? `\n\n[阶段 B · 当前 HEAD 集成] FAILED — 归属变更在隔离环境已通过；这是并发变更冲突。合并前请 rebase/协调。交付不会因此被阻断。`
-        : `\n\n[阶段 B · 当前 HEAD 集成] FAILED — 隔离验证未通过，不能归因为并发冲突；请诊断阶段 A 的失败。`
-      : `\n\n[阶段 B · 当前 HEAD 集成] 已通过。`
-    const result: ToolResult = {
-      ...phaseA,
-      content: `[阶段 A · 隔离快照] ${phaseA.content}${phaseBNote}`,
-      // Phase A governs isError (the blocking gate); Phase B is advisory only.
-      isError: phaseA.isError,
-    }
-    if (phaseB.verification) result.extraVerifications = [phaseB.verification]
-    return result
+    return snapshotTestResult(phaseA, plan, phaseB)
   },
 
-  timeoutMs(params?: ToolCallParams): number {
-    const requested = params?.input.timeout
-    const testTimeout = typeof requested === 'number' && Number.isFinite(requested) && requested > 0
-      ? requested
-      : 120_000
-    // Keep the outer tool-pipeline timeout slightly above run_tests' own
-    // timer so timeout results can return structured VerificationMetadata
-    // instead of being converted into an untracked pipeline exception.
-    return testTimeout + 5_000
-  },
+  timeoutMs: runTestsTimeoutMs,
 
   requiresApproval(): boolean {
     return false
@@ -781,12 +763,14 @@ export function runTestCommandIn(
   filter: string | undefined,
   timeout: number,
   deps: RunTestCommandDeps = defaultRunTestDeps,
+  repositoryRoot?: string,
 ): Promise<ToolResult> {
   const startTime = Date.now()
+  if (params.abortSignal?.aborted || timeout <= 0) return Promise.resolve(verificationBudgetStop(testCommand, startTime, params.abortSignal?.aborted ? 'cancelled' : 'timeout'))
   // Normalize for the host OS: on Windows npm/npx/tsx are `.cmd` shims that need
   // a shell (else modern Node throws EINVAL); node/pytest spawn directly.
   // Declared commands (verify.test / fingerprint) are full shell strings.
-  const completion = prepareCompletionCapture(testCommand.shell ? testCommand.command : [testCommand.command, ...testCommand.args].map(shellWord).join(' '), cwd)
+  const completion = prepareCompletionCapture(testCommand.shell ? testCommand.command : [testCommand.command, ...testCommand.args].map(shellWord).join(' '), cwd, 'bash', repositoryRoot)
   const capturedArgv = completion ? verificationArgv(completion.command) : undefined
   const executionCommand = capturedArgv?.[0] ?? testCommand.command
   const executionArgs = capturedArgv?.slice(1) ?? testCommand.args
@@ -897,7 +881,7 @@ export function runTestCommandIn(
         deps.setTimeout(() => deps.kill(child, 'SIGKILL'), 3000)
         uiOutput.flush()
         uiOutput.dispose()
-        resolve({ content: '测试已被用户中止。', uiContent: '⏹ 已中止', displayOutput: displayOutput.text(), displayOutputTruncated: true, command: testCommand.display, isError: false })
+        resolve({ ...verificationBudgetStop(testCommand, startTime, 'cancelled'), uiContent: '⏹ 已中止', displayOutput: displayOutput.text(), displayOutputTruncated: true, command: testCommand.display })
       }
       if (signal) {
         if (signal.aborted) onAbort()
@@ -929,7 +913,7 @@ export function runTestCommandIn(
           const args = ['--import', 'tsx', '--test', ...testCommand.args.slice(1)]
           const retryCmd: RunnableTestCommand = { ...testCommand, command: 'node', args, display: `node --import tsx --test ${testCommand.args.slice(1).join(' ')}` }
           completion?.dispose()
-          resolve(await runTestCommandIn(cwd, retryCmd, params, filter, timeout, deps))
+          resolve(await runTestCommandIn(cwd, retryCmd, params, filter, Math.max(0, timeout - (Date.now() - startTime)), deps, repositoryRoot))
           return
         }
 
@@ -938,6 +922,9 @@ export function runTestCommandIn(
 
         const parsed = parseOutput(raw, testCommand.runner)
         parsed.exitCode = exitCode
+        const coverage = completion?.read(exitCode)
+        completion?.dispose()
+        Object.assign(parsed, completionFacts(coverage))
         const formatted = formatOutput(parsed)
         const truncated = truncateOutput(formatted)
         const rawPath = await deps.persist(params.toolUseId, raw)
@@ -950,8 +937,6 @@ export function runTestCommandIn(
         const zeroCounts = parsed.passed === 0 && parsed.failed === 0 && parsed.skipped === 0
         const invocationFailed = exitCode !== 0 && zeroCounts && testCommand.runner !== 'declared'
         const invocationGuidance = '测试运行器启动失败或崩溃。请检查测试命令是否正确，必要时用 bash 手动运行以诊断环境问题。'
-        const coverage = completion?.read(exitCode)
-        completion?.dispose()
         const verification: VerificationMetadata = {
           ...(coverage ? { coverage } : {}),
           ...(!coverage?.complete ? { userGuidance: '缺少完整逐文件完成证明；未知运行器或未完成执行不能补齐交付覆盖。' } : {}),
@@ -966,6 +951,7 @@ export function runTestCommandIn(
           countsReliable: parsed.countsReliable,
           durationMs,
           timestamp: startTime,
+          ...completionFacts(coverage),
           ...(invocationFailed
             ? {
                 failureKind: 'tool_invocation_failure' as const,

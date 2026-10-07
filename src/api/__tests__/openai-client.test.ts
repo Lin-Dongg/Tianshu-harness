@@ -1193,3 +1193,134 @@ describe('image_strip recovery', () => {
     }
   })
 })
+
+describe('DSML tool-calls-in-content recovery', () => {
+  // DeepSeek 系网关/中转会把工具调用以 DSML 标记文本回传（真实抓样 2026-10-06，
+  // 外部用户会话 2026100677724c4ca112：23/182 条记录如此泄漏）。竖线是 U+FF5C
+  // 全角字符，与半角 | 都需容忍。
+  const V = '\uFF5C'
+  const dsmlEdit = [
+    `<${V}DSML${V}tool_calls>`,
+    `<${V}DSML${V}invoke name="edit_file">`,
+    `<${V}DSML${V}parameter name="file_path" string="true">D:/market_terminal/factor_lab/lab.py</${V}DSML${V}parameter>`,
+    `<${V}DSML${V}parameter name="old_string" string="true">code = fn[:6]</${V}DSML${V}parameter>`,
+    `<${V}DSML${V}parameter name="new_string" string="true">code = fn[len(mk):][:6]</${V}DSML${V}parameter>`,
+    `</${V}DSML${V}invoke>`,
+    `</${V}DSML${V}tool_calls>`,
+  ].join('\n')
+
+  function sseStream(frames: string[]): ReadableStream<Uint8Array> {
+    const encoder = new TextEncoder()
+    return new ReadableStream({
+      start(controller) {
+        for (const f of frames) controller.enqueue(encoder.encode(f))
+        controller.close()
+      },
+    })
+  }
+  const frame = (content: string) =>
+    `data: ${JSON.stringify({ choices: [{ delta: { content }, index: 0, finish_reason: 'stop' }] })}\n\n`
+
+  async function run(content: string, toolsDeclared = true) {
+    const client = new OpenAIClient(TEST_CONFIG)
+    const response = new Response(sseStream([frame(content), 'data: [DONE]\n\n']))
+    const blocks: any[] = []
+    await (client as any).parseStreamFromReader(
+      response.body!.getReader(),
+      { onTextDelta: () => {}, onContentBlock: (b: any) => blocks.push(b) },
+      undefined, undefined, undefined, undefined, undefined, toolsDeclared,
+    )
+    return blocks
+  }
+
+  it('recovers DSML markup into a tool_use block instead of silently dropping the call', async () => {
+    const blocks = await run(dsmlEdit)
+    const toolUses = blocks.filter(b => b.type === 'tool_use')
+    assert.equal(toolUses.length, 1, 'DSML markup must become a tool_use — zero tool calls ends the turn silently')
+    assert.equal(toolUses[0].name, 'edit_file')
+    assert.deepEqual(toolUses[0].input, {
+      file_path: 'D:/market_terminal/factor_lab/lab.py',
+      old_string: 'code = fn[:6]',
+      new_string: 'code = fn[len(mk):][:6]',
+    })
+    assert.equal(blocks.filter(b => b.type === 'text').length, 0, 'markup must not also persist as visible text')
+  })
+
+  it('keeps surrounding prose visible while stripping the markup region', async () => {
+    const prose = '先修 lab.py 的 `list_local_codes`。'
+    const blocks = await run(`${prose}\n\n${dsmlEdit}`)
+    assert.equal(blocks.filter(b => b.type === 'tool_use').length, 1)
+    const texts = blocks.filter(b => b.type === 'text')
+    assert.equal(texts.length, 1)
+    assert.equal(texts[0].text, prose, 'markup stripped, prose preserved')
+  })
+
+  it('recovers parallel invokes and types non-string parameters', async () => {
+    const content = [
+      `<${V}DSML${V}tool_calls>`,
+      `<${V}DSML${V}invoke name="read_file">`,
+      `<${V}DSML${V}parameter name="file_path" string="true">/tmp/a</${V}DSML${V}parameter>`,
+      `</${V}DSML${V}invoke>`,
+      `<${V}DSML${V}invoke name="grep">`,
+      `<${V}DSML${V}parameter name="max_results" string="false">20</${V}DSML${V}parameter>`,
+      `</${V}DSML${V}invoke>`,
+      `</${V}DSML${V}tool_calls>`,
+    ].join('\n')
+    const toolUses = (await run(content)).filter(b => b.type === 'tool_use')
+    assert.equal(toolUses.length, 2)
+    assert.deepEqual(toolUses[0].input, { file_path: '/tmp/a' })
+    assert.deepEqual(toolUses[1].input, { max_results: 20 }, 'string="false" parameters parse as JSON')
+  })
+
+  it('does not fire when the request declared no tools (report channel must stay untouched)', async () => {
+    const blocks = await run(dsmlEdit, false)
+    assert.equal(blocks.filter(b => b.type === 'tool_use').length, 0)
+    const texts = blocks.filter(b => b.type === 'text')
+    assert.equal(texts.length, 1)
+    assert.equal(texts[0].text, dsmlEdit, 'no-tools calls keep the raw text for the existing reporter guard')
+  })
+})
+
+describe('inline reasoning tag stripping', () => {
+  function sseStream(frames: string[]): ReadableStream<Uint8Array> {
+    const encoder = new TextEncoder()
+    return new ReadableStream({
+      start(controller) {
+        for (const f of frames) controller.enqueue(encoder.encode(f))
+        controller.close()
+      },
+    })
+  }
+  const frame = (content: string) =>
+    `data: ${JSON.stringify({ choices: [{ delta: { content }, index: 0, finish_reason: 'stop' }] })}\n\n`
+
+  it('strips a stray closing tag from the persisted text block (real 2026-10-06 capture)', async () => {
+    const client = new OpenAIClient(TEST_CONFIG)
+    const response = new Response(sseStream([frame('</think>好，这次 grep 返回了。'), 'data: [DONE]\n\n']))
+    const blocks: any[] = []
+    await (client as any).parseStreamFromReader(
+      response.body!.getReader(),
+      { onTextDelta: () => {}, onContentBlock: (b: any) => blocks.push(b) },
+    )
+    const texts = blocks.filter(b => b.type === 'text')
+    assert.equal(texts.length, 1)
+    assert.equal(texts[0].text, '好，这次 grep 返回了。')
+  })
+
+  it('never leaks a tag split across deltas into the live stream, and keeps it out of the block too', async () => {
+    const client = new OpenAIClient(TEST_CONFIG)
+    const response = new Response(sseStream([
+      frame('我先看'), frame('看文件。'), frame('</thi'), frame('nk>'), frame('结论是 A。'),
+      'data: [DONE]\n\n',
+    ]))
+    const live: string[] = []
+    const blocks: any[] = []
+    await (client as any).parseStreamFromReader(
+      response.body!.getReader(),
+      { onTextDelta: (t: string) => live.push(t), onContentBlock: (b: any) => blocks.push(b) },
+    )
+    assert.equal(live.join(''), '我先看看文件。结论是 A。')
+    assert.ok(!live.join('').includes('think'), '实时流一个标签字符都不许漏')
+    assert.equal(blocks.filter(b => b.type === 'text')[0]!.text, '我先看看文件。结论是 A。')
+  })
+})

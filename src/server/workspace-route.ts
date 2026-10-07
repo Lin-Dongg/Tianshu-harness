@@ -15,6 +15,7 @@ import { rivetHome } from '../config/paths.js'
 import { getWorkspaceConfig, setWorkspaceConfig } from '../config/workspace-config.js'
 import { sessionScratchRoot } from './workspace.js'
 import { buildFileContextRoutes } from './file-context-routes.js'
+import { buildSkillManagementRoutes } from './skill-management-routes.js'
 import { buildWorkspaceSkillsRoutes } from './workspace-skills-route.js'
 
 function withAuth(handler: RouteHandler, apiToken?: string): RouteHandler {
@@ -36,6 +37,7 @@ export function buildWorkspaceRoutes(apiToken?: string): Record<string, RouteHan
   return {
     ...buildFileContextRoutes(apiToken),
     ...buildWorkspaceSkillsRoutes(apiToken),
+    ...buildSkillManagementRoutes(apiToken),
     'POST /workspace/validate-roots': withAuth(body => {
       try { return { status: 200, body: { roots: validateWorkspaceRoots((body as { roots?: unknown })?.roots) } } }
       catch (error) { return { status: 400, body: { error: (error as Error).message } } }

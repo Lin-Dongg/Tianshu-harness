@@ -2,6 +2,7 @@ import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { formatAskUserQuestion } from '../ask-user-question.js'
 import { getTheme } from '../../theme.js'
+import { displayWidth } from '../../width.js'
 
 const theme = getTheme()
 function stripAnsi(s: string): string {
@@ -48,5 +49,21 @@ describe('formatAskUserQuestion', () => {
     const lines = formatAskUserQuestion({ content: 'OK?', columns: 60 }, theme)
     assert.ok(stripAnsi(lines[0]!).startsWith('┌'))
     assert.ok(stripAnsi(lines[lines.length - 1]!).startsWith('└'))
+  })
+
+  it('keeps archived questions neutral and does not ask for an answer again', () => {
+    for (const [state, title] of [['answered', '已提交回答'], ['discussion', '转入讨论'], ['unanswered', '未作答']] as const) {
+      const card = formatAskUserQuestion({ content: '选择范围？', columns: 60, state }, theme).map(stripAnsi).join('\n')
+      assert.match(card, new RegExp(title))
+      assert.doesNotMatch(card, /需要你的回答/)
+    }
+  })
+
+  it('fits a narrow terminal without losing Chinese or emoji content', () => {
+    const content = '中文选项👨‍👩‍👧‍👦'.repeat(8)
+    const plain = formatAskUserQuestion({ content, columns: 35 }, theme).map(stripAnsi)
+    assert.ok(plain.every(line => displayWidth(line) <= 35))
+    const body = plain.slice(3, -1).map(line => line.slice(2, -2).trimEnd()).join('')
+    assert.equal(body, content)
   })
 })

@@ -17,6 +17,8 @@
 export type StopReasonSource =
   /** Model produced a final answer with no tool call. Voluntary. */
   | 'natural-finish'
+  /** No visible answer after bounded recovery (or recovery unavailable). Fault. */
+  | 'no-answer'
   /** A tool (e.g. ask_user_question) requested turn termination. Voluntary. */
   | 'end-turn'
   /** Score-based convergence hard abort. Guard-forced. */
@@ -65,6 +67,8 @@ export function describeStopReason(r: StopReason): string {
   switch (r.source) {
     case 'natural-finish':
       return '✓ 任务完成（模型主动收尾）'
+    case 'no-answer':
+      return '⏹ 未完成：模型未返回有效答案，自动恢复未能完成。发送「继续」可重试。'
     case 'end-turn':
       return '✓ 回合结束（工具请求交回控制权）'
     case 'convergence-abort':

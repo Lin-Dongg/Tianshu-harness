@@ -68,7 +68,7 @@ it('parses later failing batches instead of reporting the first batch as zero fa
   assert.equal(parsed.passed, 4); assert.equal(parsed.failed, 1)
   assert.equal(parseOutput('ℹ tests 2\nℹ pass 2\nℹ fail 0\n✖ actual failure\n', 'node-test').countsReliable, false)
 })
-it('real run_tests two-phase path never claims isolation passed when both phases fail', async () => {
+it('real run_tests isolated failure skips integration and never claims isolation passed', async () => {
   const cwd = mkdtempSync(join(home, 'tests-')), isolated = mkdtempSync(join(home, 'snapshot-'))
   for (const root of [cwd, isolated]) {
     mkdirSync(join(root, 'test'))
@@ -77,7 +77,9 @@ it('real run_tests two-phase path never claims isolation passed when both phases
   }
   const result = await RUN_TESTS_TOOL.execute({ cwd, toolUseId: 'two-phase', input: {}, verificationSnapshot: { path: isolated, snapshotRef: 'version' } })
   assert.equal(result.isError, true); assert.doesNotMatch(result.content, /隔离环境已通过/)
-  assert.equal(result.extraVerifications?.[0]?.isolatedPassed, false)
+  assert.equal(result.verification?.status, 'failed')
+  assert.equal(result.extraVerifications, undefined)
+  assert.match(result.content, /跳过/)
   assert.match(readFileSync(result.rawPath!, 'utf8'), /actual failure/)
 })
 

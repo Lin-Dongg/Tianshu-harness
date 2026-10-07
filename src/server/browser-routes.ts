@@ -187,14 +187,16 @@ export function buildBrowserRoutes(
       // 不监听它，keepalive 与帧订阅都会泄漏、引用计数永不归零（浏览器永远在推流）。
       res.on('close', cleanup)
 
-      void session.captureFrame().then((frame) => {
+      const size = getSession(key)?.driver.viewportSize()
+      const frameOptions = key.startsWith('context-') ? { quality: 90, maxWidth: size?.width ?? 1280, maxHeight: size?.height ?? 800 } : undefined
+      void session.captureFrame(frameOptions).then((frame) => {
         if (frame && !closed && !sse.isClosed()) sse.send('frame', frame)
       })
 
       try {
         unsubscribe = await session.subscribeFrames((frame) => {
           if (!closed) sse.send('frame', frame)
-        })
+        }, frameOptions)
       } catch (err) {
         sse.send('error', { message: err instanceof Error ? err.message : String(err) })
         sse.close()

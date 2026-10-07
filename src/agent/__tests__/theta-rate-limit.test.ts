@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { createThetaController, THETA_MAX_SESSION, THETA_MAX_PER_TURN, type ThetaControllerHost, type ThetaTelemetryState } from '../theta-controller.js'
+import { createThetaController, THETA_MAX_SESSION, THETA_MAX_PER_TURN, type ThetaControllerHost, type ThetaRunner, type ThetaTelemetryState } from '../theta-controller.js'
 import type { ThetaCheckResult, ThetaOutcome } from '../theta-check.js'
 
 /**
@@ -22,6 +22,8 @@ function makeTelemetry(over: Partial<ThetaTelemetryState> = {}): ThetaTelemetryS
     cooldownUntilTurn: 0,
     suppressedCount: 0,
     outcomes: { ok: 0, type_errors: 0, timeout: 0, spawn_error: 0, busy: 0, backoff: 0, 'no-fresh-verdict': 0 },
+    consecutiveNoFreshVerdict: 0,
+    triggeredRuns: 0,
     ...over,
   }
 }
@@ -43,7 +45,7 @@ function result(outcome: ThetaOutcome, errors: string[] = []): ThetaCheckResult 
 }
 
 /** 同步 runner——把 controller 的 async 流程收进微任务，测试无需等待真实 tsc。 */
-function syncRunner(r: ThetaCheckResult): (cwd: string) => Promise<ThetaCheckResult> {
+function syncRunner(r: ThetaCheckResult): ThetaRunner {
   return async () => r
 }
 

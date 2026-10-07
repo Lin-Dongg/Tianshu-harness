@@ -18,6 +18,7 @@
  */
 
 export interface EarlyCliHandlers {
+  skills: (args: string[]) => Promise<{ output: string; exitCode: number }>
   config: (args: string[]) => Promise<void> | void
   provider: (args: string[]) => Promise<void> | void
   serve: (args: string[]) => Promise<void> | void
@@ -44,6 +45,10 @@ export interface EarlyCliRouteOptions {
 /** 真实处理器：每个分支的 import 都发生在函数体内，保持 launcher 静态图轻量。 */
 export function createEarlyCliHandlers(cwd: string = process.cwd()): EarlyCliHandlers {
   return {
+    skills: async (args) => {
+      const { runSkillsCLI } = await import('./skills-cli.js')
+      return runSkillsCLI(args, { cwd })
+    },
     config: async (args) => {
       const { runConfigCLI } = await import('../config/manager.js')
       await runConfigCLI(args)
@@ -125,6 +130,12 @@ export async function routeEarlyCli(
     ...options.io,
   }
 
+  if (args[0] === 'skills') {
+    const { output, exitCode } = await handlers.skills(args.slice(1))
+    ;(exitCode === 0 ? io.stdout : io.stderr)(output + '\n')
+    if (exitCode !== 0) io.exit(exitCode)
+    return true
+  }
   if (args[0] === 'config') {
     await handlers.config(args.slice(1))
     return true

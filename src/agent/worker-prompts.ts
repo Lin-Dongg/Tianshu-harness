@@ -204,6 +204,13 @@ export interface WorkerPromptOptions {
   reportContract?: 'inline-json' | 'finalized'
 }
 
+/** 全 profile 通用的收敛纪律（2026-10-06 verifier 空转事故）。
+ *  事故：verifier profile 没有这条纪律（当时只有 code_scout/doc_scout 的
+ *  expertisePrompt 里有），它在"追查 ledger"死胡同里空转到预算耗尽、被中断、
+ *  未产出报告。纪律靠 per-profile 手写必然漏（20 个 profile 漏了 18 个）——
+ *  故落在所有 worker 共享的通用段，不依赖各 expertisePrompt 记得写。 */
+const CONVERGENCE_DISCIPLINE = '收敛纪律：同一目标连续 3 次工具调用无新增信息（同 pattern 无果 / 重读同一 file:line / 同路径重复列目录）→ 立即停止探索，用已捕获的证据出报告。「已证无」是结论，不是继续搜索的理由——换第 4 个 grep pattern 期望把它翻出来，是 2026-07-17 与 2026-10-06 两次事故的共同形态。'
+
 export function buildWorkerPrompt(order: WorkOrder, _authoritySuffix?: string, opts?: WorkerPromptOptions): string {
   // V3 Component A: domain identity is now injected via bindSessionDomain →
   // setActiveDomain into the frozen <star-domain> prefix (worker-session.ts
@@ -236,6 +243,9 @@ export function buildWorkerPrompt(order: WorkOrder, _authoritySuffix?: string, o
   if (profilePrompt) {
     parts.push('', profilePrompt)
   }
+
+  // 收敛纪律对所有 profile 生效——不依赖每条 expertisePrompt 各自记得写。
+  parts.push('', CONVERGENCE_DISCIPLINE)
 
   // Inject project self-discovery for read-only workers (exploration profiles)
   if (!hasWriteTools) {

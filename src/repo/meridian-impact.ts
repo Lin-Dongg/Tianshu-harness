@@ -1,4 +1,5 @@
 import type { MeridianDb } from './meridian-db.js'
+import { isTestEntry as isTestFile } from './test-entry.js'
 
 export interface ImpactStep { from: string; to: string; kind: string; confidence?: string }
 export interface ImpactResult {
@@ -34,7 +35,7 @@ export function analyzeImpact(
   // Collect tests for changed files
   for (const file of changedFiles) {
     for (const t of db.getTestsFor(file)) {
-      tests.add(t)
+      if (isTestFile(t)) tests.add(t)
     }
   }
 
@@ -114,7 +115,7 @@ export function analyzeImpact(
     advisoryFrontier = next
   }
   for (const file of changedFiles) {
-    for (const test of db.getTestsFor(file)) if (!reasons[test]) reasons[test] = [{ from: file, to: test, kind: 'tested_by', confidence: 'inferred' }]
+    for (const test of db.getTestsFor(file)) if (isTestFile(test) && !reasons[test]) reasons[test] = [{ from: file, to: test, kind: 'tested_by', confidence: 'inferred' }]
     for (const neighbor of db.getCoEditNeighbors(file)) if (isTestFile(neighbor.file) && !reasons[neighbor.file]) reasons[neighbor.file] = [{ from: file, to: neighbor.file, kind: 'co_edit', confidence: 'inferred' }]
   }
   for (const test of required) tests.add(test)
@@ -128,12 +129,6 @@ export function analyzeImpact(
     tests: [...tests],
     totalImpact: direct.size + transitive.size,
   }
-}
-
-const TEST_PATTERNS = ['.test.', '.spec.', '__tests__/', 'test/']
-
-function isTestFile(filePath: string): boolean {
-  return TEST_PATTERNS.some(p => filePath.includes(p))
 }
 
 /**

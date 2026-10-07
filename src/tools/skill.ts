@@ -40,8 +40,9 @@ skill 是可复用的工作流 playbook。available-skills 区块列出了每个
       return { content: '错误：name 必填', isError: true }
     }
     const name = raw.trim()
+    const registry = params.skillRegistry ?? skillRegistry
 
-    const skill = skillRegistry.get(name) ?? skillRegistry.list().find(s => s.name.toLowerCase() === name.toLowerCase())
+    const skill = registry.get(name) ?? registry.list().find(s => s.name.toLowerCase() === name.toLowerCase())
     if (!skill) {
       // Retired skills map to native flows instead of a hard error — old plan
       // texts still say "使用 executing-plans", and the model may call this
@@ -53,7 +54,7 @@ skill 是可复用的工作流 playbook。available-skills 区块列出了每个
           uiContent: `已映射到原生流程：${name}`,
         }
       }
-      const available = skillRegistry.list().map(s => s.name).sort()
+      const available = registry.list().map(s => s.name).sort()
       const list = available.length > 0 ? available.join(', ') : '（未加载任何 skill）'
       return {
         content: `未找到 skill：「${name}」。\n可用 skill：${list}`,
@@ -66,6 +67,8 @@ skill 是可复用的工作流 playbook。available-skills 区块列出了每个
       return { content: `Skill「${skill.name}」已标记为完成。`, uiContent: `已完成 skill：${skill.name}` }
     }
 
+    if ((skill.mode ?? skill.metadata?.defaultMode) === 'off') return { content: `Skill「${skill.name}」已停用。请先启用。`, isError: true }
+    if ((skill.mode ?? skill.metadata?.defaultMode) === 'manual') return { content: `Skill「${skill.name}」仅手动使用。请用户通过 /skill ${skill.name} 调用。`, isError: true }
     params.onSkillInvoked?.(skill.name)
 
     const body = `<skill name="${skill.name}">\n${skill.body}\n</skill>`
@@ -73,7 +76,7 @@ skill 是可复用的工作流 playbook。available-skills 区块列出了每个
     if (!skill.skillDir) {
       return { content: body, uiContent: `已加载 skill：${skill.name}` }
     }
-    const files = listSkillFiles(skill.skillDir)
+    const files = skill.files ?? listSkillFiles(skill.skillDir)
     if (files.length === 0) {
       return { content: body, uiContent: `已加载 skill：${skill.name}` }
     }

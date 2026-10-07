@@ -3,11 +3,31 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, writeFileSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { SkillRegistry } from '../skill-loader.js'
+import { SkillRegistry, registerBuiltinSkills } from '../skill-loader.js'
 
 const big = (n: number): string => 'x'.repeat(n)
 
 describe('skill discovery (Tier-1)', () => {
+  it('does not advertise the retired built-in leave ritual, even when wrapping up', () => {
+    const reg = new SkillRegistry()
+    registerBuiltinSkills(reg)
+
+    const block = reg.renderDiscoveryBlock('wrap up and leave a mark')!
+    assert.ok(block.includes('name="skill-management"'))
+    assert.ok(!block.includes('name="leave-ritual"'))
+    assert.equal(reg.get('leave-ritual'), undefined)
+  })
+
+  it('still loads an explicitly installed project leave ritual', () => {
+    const root = mkdtempSync(join(tmpdir(), 'rivet-project-ritual-'))
+    writeFileSync(join(root, 'leave-ritual.md'), '---\nname: leave-ritual\ndescription: Project departure workflow\n---\n\nProject-owned ritual.', 'utf-8')
+    const reg = new SkillRegistry()
+    registerBuiltinSkills(reg)
+    assert.deepEqual(reg.loadFromDirectory(root).loaded, ['leave-ritual'])
+    assert.ok(reg.renderDiscoveryBlock('wrap up')!.includes('name="leave-ritual"'))
+    assert.ok(reg.renderInvokedSkillsBlock(['leave-ritual'], root)!.includes('Project-owned ritual.'))
+  })
+
   it('renders only name+description, never the body', () => {
     const reg = new SkillRegistry()
     reg.register({

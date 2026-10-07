@@ -15,6 +15,9 @@ const deliverySessions = new WeakMap<TuiApp, { epoch: number; deliveries: Map<st
 
 export function attachDecisionSession(app: TuiApp, current: () => AgentLoop, onPlan?: (slug: string) => void): void {
   const agent = current()
+  // 面板接管提问的呈现：ask_user_question 的卡片改由面板结算时归档，
+  // 不再在工具结果到达时提前落进对话历史（见 TuiApp.handleToolResult）。
+  app.decisionPanelsAttached = true
   agent.onPlanApprovalRequested = info => {
     const generation = app.runGen, epoch = app.decisions.epoch
     setImmediate(() => {

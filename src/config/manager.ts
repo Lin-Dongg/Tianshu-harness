@@ -1,7 +1,7 @@
 import { readFileSync, existsSync } from 'fs'
 import { writeFileAtomicSync } from '../fs-atomic.js'
 import { resolve, join, dirname } from 'path'
-import { isProjectTrusted, stripUntrustedProjectKeys, notifyUntrustedOnce, findSensitiveProjectKeys } from './project-trust.js'
+import { isProjectTrusted, stripUntrustedProjectKeys, stripProjectSafetyKeys, findForbiddenProjectSafetyKeys, notifyProjectSafetyKeysIgnored, notifyUntrustedOnce, findSensitiveProjectKeys } from './project-trust.js'
 import { z } from 'zod'
 import { resolveProfileName, resolveProfileOverlay, resolveHookDisabledEnv } from './profile.js'
 import { unBakeProfileOverlay } from './profile-persist.js'
@@ -16,6 +16,7 @@ import { migrateProviderToKeys, keyRefFor, defaultKeyOf, keyRefReferrers } from 
 import { injectProviderKeys, stripProviderKeys, writeProviderKeysFile, providerKeysPath } from './provider-keys-store.js'
 import { assertDefaultModelRef } from './contract-models.js'
 import { migrateDeepseekVisionExpRetirement, migrateDeepseekV4FlashRetirement } from './preset-model-retirement.js'
+import { migrateInvalidWorkerTiers } from './worker-tier-repair.js'
 import { writeSecret, readSecret, deleteSecret } from './secrets-store.js'
 import { invalidateToolPreset } from '../tools/tool-preset.js'
 import { invalidatePromptBlocks } from '../prompt/block-policy.js'
@@ -444,9 +445,10 @@ export function loadConfig(options?: {
     const protoChanged = migrateAnthropicProtocol(cpMigrated)
     const backfillChanged = migratePresetModelBackfill(cpMigrated)
     const aliasStripped = migrateStripModelAlias(cpMigrated)
+    const tierRepaired = migrateInvalidWorkerTiers(cpMigrated)
     // Write back if any migration modified the raw config so the fix
     // persists across restarts (one-shot, idempotent).
-    if (cpMigrated !== raw || dsChanged || flashChanged || visionExpRetired || v4FlashRetired || keysMoved || searchKeysMoved || capsChanged || protoChanged || backfillChanged || aliasStripped) {
+    if (cpMigrated !== raw || dsChanged || flashChanged || visionExpRetired || v4FlashRetired || keysMoved || searchKeysMoved || capsChanged || protoChanged || backfillChanged || aliasStripped || tierRepaired) {
       try {
         writeFileAtomicSync(configPath, JSON.stringify(cpMigrated, null, 2) + '\n')
       } catch {
@@ -467,13 +469,20 @@ export function loadConfig(options?: {
     migrateLegacyCapabilities(cpMigrated)
     migrateAnthropicProtocol(cpMigrated)
     migrateStripModelAlias(cpMigrated)
-    // 信任门：项目配置可能来自不可信仓库。未授信时剥离安全敏感键再合并
-    // （SECURITY.md 信任边界——仓库内容不能自我授权审批豁免/进程拉起/出口改向）。
     const projectDir = dirname(projectPath)
+    // 永久门：安全档位（审批 / 沙箱豁免 / 授权规则）是「用户本人的安全决定」，
+    // 不是「项目内容配置」——仓库内容不得设置，**授信与否都剥离**。先于信任门
+    // 执行，两层互不覆盖（安全键归永久门，其余敏感键归信任门）。参照
+    // deepseek-harness：approval policy 无外部 config store，工作目录文件零路径。
+    const forbiddenSafetyKeys = findForbiddenProjectSafetyKeys(cpMigrated)
+    if (forbiddenSafetyKeys.length > 0) notifyProjectSafetyKeysIgnored(projectDir, forbiddenSafetyKeys)
+    const safetyStripped = stripProjectSafetyKeys(cpMigrated)
+    // 信任门：项目配置可能来自不可信仓库。未授信时剥离其余安全敏感键再合并
+    // （SECURITY.md 信任边界——仓库内容不能自我授权进程拉起/出口改向）。
     const trusted = isProjectTrusted(projectDir)
     const effective = trusted
-      ? cpMigrated
-      : stripUntrustedProjectKeys(cpMigrated)
+      ? safetyStripped
+      : stripUntrustedProjectKeys(safetyStripped)
     if (!trusted) {
       // 仅在实际剥到键时提示——无敏感键的项目零打扰。
       const stripped = findSensitiveProjectKeys(cpMigrated)

@@ -1,0 +1,7 @@
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { RuntimeSessionManager, type ManagedAgent, type SessionPersistenceAdapter } from '../session-manager.js'
+const persistence = (fail = false): SessionPersistenceAdapter => ({ saveRecord(){}, appendEvent(){}, loadAll:()=>[], flushThrough:async(_,seq)=>{if(fail)throw new Error('disk full');return seq},flushAllAsync:async()=>{},healthSnapshot:()=>({failedSessions:0,pendingEvents:0}) })
+function manager(fail = false) { return new RuntimeSessionManager({defaultCwd:'/tmp/update-restart-test',createAgent:()=>({} as ManagedAgent),persistence:persistence(fail)}) }
+test('real manager restart gate blocks run and delegate until cancellation',async()=>{const m=manager();try{const s=m.createSession();await m.prepareUpdateRestart(false,AbortSignal.timeout(5000));assert.equal(m.run(s.id,'must not start'),false);assert.equal((await m.delegate(s.id,{objective:'must not start'})).ok,false);assert.equal(m.isUpdateRestartPreparing(),true);m.cancelUpdateRestart();assert.equal(m.isUpdateRestartPreparing(),false)}finally{m.cancelUpdateRestart();await m.shutdownAll()}})
+test('failed persistence unlocks real manager and never acknowledges readiness',async()=>{const m=manager(true);try{m.createSession();await assert.rejects(m.prepareUpdateRestart(false,AbortSignal.timeout(5000)),/disk full/);assert.equal(m.isUpdateRestartPreparing(),false)}finally{await m.shutdownAll()}})

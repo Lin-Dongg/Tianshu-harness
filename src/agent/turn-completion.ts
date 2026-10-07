@@ -46,8 +46,7 @@ export interface CompleteTurnInput {
   callbacks: TurnCompletionCallbacks
   /** 自动续轮原因，透传给 onTurnComplete（wire 事件上的可选字段）。 */
   continuationReason?: string
-  /** 本轮流式停止原因——目前只在 'max_tokens'（输出被 token 上限截断）时由
-   *  turn-orchestrator 附上，透传给 onTurnComplete（additive wire 字段）。 */
+  /** 截断 / 无有效答案等停止原因，透传给 onTurnComplete；不进入模型历史。 */
   stopReason?: string
 }
 

@@ -6,6 +6,7 @@ import { MeridianBehavior } from './meridian-behavior.js'
 import { parseFile, parseTypeScriptFile, initParser, detectLang } from './meridian-parser.js'
 import { buildRepoMap } from './meridian-graph.js'
 import { analyzeImpact, inferTestedByTargets } from './meridian-impact.js'
+import { isTestEntry } from './test-entry.js'
 import { extractExpressRoutes, extractJsxChildren } from './meridian-framework.js'
 import { toPosixPath } from '../path-format.js'
 import type { RepoMapResult, MeridianSymbol, MeridianSymbolKind, MeridianEdge } from './meridian-types.js'
@@ -260,7 +261,7 @@ export class MeridianIndexer {
       this.db.recordAccess(rel)
 
       // Build tested_by edges if this file is a test
-      if (this.isTestFile(rel)) {
+      if (isTestEntry(rel)) {
         this.buildTestEdges(rel)
       }
 
@@ -316,7 +317,7 @@ export class MeridianIndexer {
     this.db.upsertFile({ ...result, imports: resolvedImports, symbols: [...result.symbols, ...fw.symbols] })
     // Hot-update must rebuild tested_by edges too (review LOW-1) — keep this
     // path in lockstep with indexFile.
-    if (this.isTestFile(rel)) {
+    if (isTestEntry(rel)) {
       this.buildTestEdges(rel)
     }
     for (const e of fw.edges) {
@@ -484,11 +485,6 @@ export class MeridianIndexer {
     const rel = this.toRepoRelative(filePath)
     if (rel === null) return false
     return isMeridianIndexablePath(rel)
-  }
-
-  private isTestFile(filePath: string): boolean {
-    return filePath.includes('.test.') || filePath.includes('.spec.') ||
-      filePath.includes('__tests__/') || filePath.includes('test/')
   }
 
   /** Resolve a list of raw import strings to deduped repo-relative paths.

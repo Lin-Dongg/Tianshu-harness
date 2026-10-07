@@ -1,10 +1,10 @@
 import { describe, it, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { execSync } from 'node:child_process'
-import { GIT_TOOL, getWorkingTreeFiles, getFileDiff, getFileAtBase, nullDeviceFor } from '../git.js'
+import { GIT_TOOL, getWorkingTreeFiles, getFileDiff, getFileAtBase, nullDeviceFor, isPathClean } from '../git.js'
 
 // 测试 repo 必须建在系统 tmpdir（仓库外）且路径每次唯一（mkdtemp）。
 // 曾用工作树内固定路径（.git-test-tmp）：多会话并发跑测试时，一个进程的
@@ -431,5 +431,158 @@ describe('getWorkingTreeFiles / getFileDiff (desktop changes tab)', () => {
     const paths = files.map((f) => f.path)
     assert.ok(paths.includes('src/code.ts'), 'source file should still be visible')
     assert.ok(paths.includes('.rivet/plugin-abc/index.js'), 'ignored file should appear when requested')
+  })
+})
+
+// Regression (issue #358): the session cwd is not the boundary of the work.
+// An agent may write a deliverable outside the workspace (a project-owned
+// staging area, a handoff directory); that absolute path enters the session
+// file history, and the client still has to render its diff. Before the fix
+// both helpers threw `无效文件路径` for any path outside cwd, and the three
+// routes calling them had no catch — the response degraded to a bare 500 and
+// the Changes view showed nothing for the file.
+describe('getFileDiff / getFileAtBase outside the session cwd (#358)', () => {
+  let INSIDE: string
+  let OUTSIDE: string
+
+  beforeEach(() => {
+    INSIDE = mkdtempSync(join(tmpdir(), 'rivet-git-inside-'))
+    OUTSIDE = mkdtempSync(join(tmpdir(), 'rivet-git-outside-'))
+    execSync('git init', { cwd: INSIDE })
+    execSync('git config user.email "test@test.com"', { cwd: INSIDE })
+    execSync('git config user.name "Test"', { cwd: INSIDE })
+    writeFileSync(join(INSIDE, 'base.txt'), 'base\n')
+    execSync('git add .', { cwd: INSIDE })
+    execSync('git commit -m "init"', { cwd: INSIDE })
+  })
+
+  afterEach(() => {
+    rmSync(INSIDE, { recursive: true, force: true })
+    rmSync(OUTSIDE, { recursive: true, force: true })
+  })
+
+  it('renders a full-addition diff for an absolute path outside cwd', async () => {
+    const outside = join(OUTSIDE, 'report.md')
+    writeFileSync(outside, 'line1\nline2\n')
+    const diff = await getFileDiff(INSIDE, outside)
+    assert.ok(diff.includes('+line1'), `outside file lines should render as additions:\n${diff}`)
+    assert.ok(diff.includes('+line2'))
+    // The header must carry the absolute path verbatim. git relativizes it
+    // against the filesystem root (`a/tmp/...`, leading slash dropped), which
+    // would desync the desktop diff parser's (file, oldLine, newLine) comment
+    // anchors from the path the client asked for.
+    assert.ok(diff.includes(`+++ b/${outside}`), `header should anchor on the absolute path:\n${diff}`)
+  })
+
+  it('reports exists=false at baseline for a file outside cwd', async () => {
+    const outside = join(OUTSIDE, 'report.md')
+    writeFileSync(outside, 'content\n')
+    assert.deepEqual(await getFileAtBase(INSIDE, outside), { exists: false, content: '' })
+  })
+
+  it('returns an empty diff when the outside file no longer exists', async () => {
+    // The judgement is pure string math and never touches the filesystem, so
+    // the path survives in session history after the file is moved/deleted.
+    // The diff must degrade quietly instead of rejecting the request.
+    assert.equal(await getFileDiff(INSIDE, join(OUTSIDE, 'gone.md')), '')
+  })
+
+  it('still rejects relative traversal outside cwd', async () => {
+    await assert.rejects(() => getFileDiff(INSIDE, '../outside.md'), /无效文件路径/)
+    await assert.rejects(() => getFileAtBase(INSIDE, '../outside.md'), /无效文件路径/)
+  })
+
+  // The out-of-workspace branch must not degenerate into an unbounded text-file
+  // read channel (`?path=~/.ssh/id_rsa`). The repository already has an upper
+  // bound for out-of-workspace access (request-path-access, issue #117):
+  // filesystem/system roots and sensitive filenames are never readable. The
+  // diff readers must agree with that single source of truth.
+  it('refuses an absolute path under a system root or a sensitive name', async () => {
+    const sensitive = [
+      join(homedir(), '.ssh', 'id_rsa'),
+      join(homedir(), '.env'),
+      join(homedir(), 'credentials.json'),
+      '/etc/passwd',
+    ]
+    for (const target of sensitive) {
+      await assert.rejects(() => getFileDiff(INSIDE, target), /无效文件路径/, `should refuse ${target}`)
+      await assert.rejects(() => getFileAtBase(INSIDE, target), /无效文件路径/, `should refuse ${target}`)
+    }
+  })
+
+  it('still serves a plain absolute path outside cwd (the issue #358 shape)', async () => {
+    // Guard-rail regression: the refusal above must not swallow the legitimate
+    // outside-workspace write target this fix exists to render.
+    const outside = join(OUTSIDE, 'report.md')
+    writeFileSync(outside, 'ok\n')
+    assert.ok((await getFileDiff(INSIDE, outside)).includes('+ok'))
+  })
+
+  // A whole file rendered as additions puts every source line behind a '+'
+  // prefix — so a source line that already starts with '++ ' surfaces as
+  // '+++ ', indistinguishable from a header by a bare startsWith. Rewriting it
+  // as a header silently drops the line from the rendered diff. The header pass
+  // must therefore stop at the first hunk marker.
+  it('keeps a content line that begins with "++ " intact', async () => {
+    const outside = join(OUTSIDE, 'weird.md')
+    writeFileSync(outside, '++ not a header\n')
+    const diff = await getFileDiff(INSIDE, outside)
+    assert.ok(diff.includes('+++ not a header'), `content line mangled into a header:\n${diff}`)
+  })
+})
+
+// v2（认领即租约）：L3 判据的唯一实现点。用非仓库 / 干净 / 脏 / 未跟踪 / 仅目标路径
+// 五种形状钉住语义——判错方向会让「自动接管」要么夺走他人未提交的活，要么永不生效。
+describe('isPathClean — v2 claim-lease 的工作区干净判据', () => {
+  let dir: string
+
+  const initRepo = (): void => {
+    execSync('git init', { cwd: dir })
+    execSync('git config user.email "test@test.com"', { cwd: dir })
+    execSync('git config user.name "Test"', { cwd: dir })
+  }
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'rivet-ispathclean-'))
+  })
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('非仓库 → true（无版本状态需保护，staleness 才是主守卫）', async () => {
+    assert.equal(await isPathClean(dir, 'whatever.ts'), true)
+  })
+
+  it('已提交且无改动 → true', async () => {
+    initRepo()
+    writeFileSync(join(dir, 'a.txt'), 'hello')
+    execSync('git add . && git commit -m init', { cwd: dir })
+    assert.equal(await isPathClean(dir, 'a.txt'), true)
+  })
+
+  it('有未提交改动 → false', async () => {
+    initRepo()
+    writeFileSync(join(dir, 'a.txt'), 'hello')
+    execSync('git add . && git commit -m init', { cwd: dir })
+    writeFileSync(join(dir, 'a.txt'), 'changed')
+    assert.equal(await isPathClean(dir, 'a.txt'), false)
+  })
+
+  it('未跟踪文件（??）→ false', async () => {
+    initRepo()
+    writeFileSync(join(dir, 'a.txt'), 'hello')
+    execSync('git add . && git commit -m init', { cwd: dir })
+    writeFileSync(join(dir, 'new.txt'), 'x')
+    assert.equal(await isPathClean(dir, 'new.txt'), false)
+  })
+
+  it('只对目标路径判定——别的文件的改动不干扰（-uall 限路径的语义）', async () => {
+    initRepo()
+    writeFileSync(join(dir, 'a.txt'), 'hello')
+    execSync('git add . && git commit -m init', { cwd: dir })
+    writeFileSync(join(dir, 'b.txt'), 'dirty')
+    assert.equal(await isPathClean(dir, 'a.txt'), true)
+    assert.equal(await isPathClean(dir, 'b.txt'), false)
   })
 })

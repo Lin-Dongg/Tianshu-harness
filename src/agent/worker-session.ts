@@ -35,6 +35,7 @@ import { buildDomainKnowledgeBlock, formatBatchStigmergyBlock } from './domain-k
 import type { DomainKnowledgeStore } from './domain-knowledge-store.js'
 import type { WorkerMailbox } from './worker-mailbox.js'
 import { createWorkerMailboxSender } from './worker-mailbox.js'
+import { createProgressTracker, recordToolCall, pickSteer } from './worker-progress.js'
 
 /** Max transient-retry attempts for network/API errors during worker execution.
  *  Independent of order.budget.maxRetries (which covers output parse failures). */
@@ -335,6 +336,15 @@ let TOOL_KEEPALIVE_MS = 30_000
 /** Test-only: shrink the long-tool keepalive cadence so tests don't wait 30s. */
 export function __setToolKeepaliveMs(ms: number): void { TOOL_KEEPALIVE_MS = ms }
 
+/** 这次工具结果是否"零新增信息"——空转检测用。保守：只把明确的空结果算作无进展
+ *  （宁可漏报，不可误杀有产出的探索）。出错不算空转——那是另一条通道的事。 */
+function isEmptyToolResult(result: string, isError: boolean): boolean {
+  if (isError) return false
+  const t = result.trim()
+  if (t.length === 0) return true
+  return /^(命令已执行成功，只是没有 stdout|No matches|未找到匹配|Command executed successfully)/.test(t)
+}
+
 async function runOnce(
   agent: RunnableAgent,
   prompt: string,
@@ -358,6 +368,11 @@ async function runOnce(
   // 误杀健康长任务的代价比晚杀死锁高，取此交换。
   const readsById = new Map<string, string>()
   const toolsInFlight = new Map<string, { name: string; since: number }>()
+  // 空转检测（2026-10-06 verifier 空转事故）：连续 3 次工具调用无新增信息即
+  // 通过同一个 drain 通道注入收敛 steer（append-only tail，缓存安全）。
+  let progress = createProgressTracker()
+  let pendingFingerprint = ''
+  let convergenceSent = false
   // 模型首字节等待同样可能长时间没有任何 worker 事件。单独记录最近一次
   // 活动，让 keepalive 只在真正静默时播报；这条心跳会同时喂给 TUI 和
   // coordinator 的上游活动流，避免健康请求被渲染层误报为「No response」。
@@ -415,6 +430,7 @@ async function runOnce(
       // 活动流带关键参数(name(arg))——桌面委派 UI / TUI worker mirror 直接展示,
       // 光秃工具名无法回答"它在读哪个文件/跑什么命令"。
       emitActivity('tool_use', summarizeToolUseLine(name, input))
+      pendingFingerprint = `${name}:${JSON.stringify(input ?? null)}`
     },
     onToolResult: (id, name, result, isError) => {
       toolsInFlight.delete(id)
@@ -428,6 +444,7 @@ async function runOnce(
         if (failedCommand) (transcript.failedBashCommands ??= []).push(failedCommand)
       }
       emitActivity('tool_result', name)
+      progress = recordToolCall(progress, pendingFingerprint || name, isEmptyToolResult(result ?? '', isError === true))
     },
     // usage 是累计快照（getTotalUsage）——上报累计 token 总数，供 fleet 面板实时显示。
     onTurnComplete: (usage) => {
@@ -435,7 +452,13 @@ async function runOnce(
       if (total > 0) emitActivity('turn', String(total))
     },
     // WC: 输入直达 — drain coordinator 注入的 per-order steer 队列
-    onSteerDrain: onSteerDrain ? () => onSteerDrain() : undefined,
+    // 空转收敛 steer 与外部（soft-landing / coordinator）steer 共用这一条
+    // drain 通道：收敛优先，发一次即止（决策在 worker-progress.pickSteer，可单测）。
+    onSteerDrain: () => {
+      const picked = pickSteer(progress, convergenceSent, () => onSteerDrain?.() ?? null)
+      convergenceSent = picked.convergenceSent
+      return picked.steer
+    },
     // 嵌套委派：worker 自己派的 sub-worker 活动上行（tool-pipeline 只在此回调
     // 存在时才给 delegate 工具接 onWorkerActivity——不接嵌套 worker 就不可见）。
     onDelegationActivity,

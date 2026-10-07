@@ -679,6 +679,17 @@ export class TuiApp {
   approvalModeBeforePlan: string | null = null
   /** choice-panel 当前模式：'effort' (推理强度) / 'permission' (权限选择) / 'permission-yolo-confirm' (YOLO 二次确认) / 'disconnect' (断开服务商选择) / 'disconnect-confirm' (断开二次确认) / 'disconnect-retarget' (默认 provider 改设新默认) */
   choicePanelKind: 'effort' | 'permission' | 'permission-yolo-confirm' | 'disconnect' | 'disconnect-confirm' | 'disconnect-retarget' = 'effort'
+  /**
+   * 挂起的提问卡（requestId → 卡）。ask_user_question 的结果**不再即时**落进
+   * 对话历史：同一提问同时出现在输入框上方的活动面板与 scrollback 里会被读成
+   * 两条会话线（2026-10-07 会话割裂复现）。作答/讨论只归档当前提问，退出/切会话归档全部。
+   */
+  private readonly askCards = new Map<string, { content: string; toolId: string; input?: Record<string, unknown> }>()
+  /**
+   * decision-session 是否已挂载（见 attachDecisionSession）。未挂载的宿主没有
+   * 面板承接提问，卡片必须直接落历史——否则提问会凭空消失。
+   */
+  decisionPanelsAttached = false
   readonly decisions = new DecisionController({
     changed: () => { this.inputHandoffGeneration++; if (!this.overlay.isActive()) this.input.setEscapeImmediate(this.decisions.focused); this.renderLive() },
     reveal: () => { this.detailReturn = undefined; this.planPreview = null; this.deactivateOverlay(); this.setOutputFrozen(false) },
@@ -691,7 +702,7 @@ export class TuiApp {
       this.onPlanReviewSettle(decision.action)
       return { ok: true }
     },
-    answer: text => this.submitDecisionText(text),
+    answer: (text, requestId) => this.submitDecisionText(text, requestId),
     record: text => this.commitStatic(text),
   })
   onPlanDecision?: (decision: PlanDecision) => Promise<PlanDecisionResult>
@@ -1539,7 +1550,12 @@ export class TuiApp {
         if (isError === false && result.startsWith('Sensitive-area preflight required.')) {
           this.frontend.record({ kind: 'notice', toolId: id, name, text: result }); this.commitStatic(color(result, this.theme.warning)); return
         }
-        if (isError !== undefined) this.frontend.toolResult(id, name, result, isError, rawPath, uiContent)
+        if (isError !== undefined) {
+          // 提问卡由决策面板结算时统一落历史（见 handleToolResult）：这里只推进
+          // 前端工具记账，不让卡片以「工具结果」形态提前进入历史。
+          if (name === 'ask_user_question' && !isError) this.frontend.deferAskResult(id)
+          else this.frontend.toolResult(id, name, result, isError, rawPath, uiContent)
+        }
         this.handleToolResult(id, name, result, isError, rawPath, uiContent)
       },
       onTurnComplete: (usage, turnNumber, isFinal, _evidenceSummary, _continuationReason, stopReason) => { this.frontend.flushText(); void this.handleTurnComplete(usage, turnNumber, isFinal ?? true, stopReason) },
@@ -1562,6 +1578,7 @@ export class TuiApp {
         // source is skipped here because onAutonomyCheckpoint renders the
         // richer digest card for it.
         if (phase === 'stop-reason') {
+          if (detail?.source === 'no-answer') this.mainTaskFailed = true
           if (detail?.voluntary === false && detail.source !== 'checkpoint') {
             const label = phaseStatusLabel(phase, detail)
             if (label) this.commitStatic(color(label, this.theme.warning))
@@ -1689,6 +1706,9 @@ export class TuiApp {
     return true
   }
   async setUIHistorySession(path: string, priorMessages = false): Promise<void> {
+    // 换会话前把悬着的提问归档进**当前**（旧）会话历史——frontend 尚未切到新
+    // history，此刻写入才落在旧会话里；否则旧会话回看时会缺掉这次提问。
+    this.archiveAskCards()
     this.decisions.clear()
     this.historyOpenGeneration++
     this.historyOpening = false
@@ -1865,7 +1885,7 @@ export class TuiApp {
   private contractBypass = false
 
   /** 输入提交主流程（InputLine onSubmit 回调；原构造器闭包提取，逻辑零改动）。 */
-  private async handleInputSubmit(text: string, images?: string[], decision = false): Promise<void> {
+  private async handleInputSubmit(text: string, images?: string[], decision = false, questionRequestId?: string): Promise<void> {
     // 提交 = 继续对话：取消 Ctrl+C 退出确认（同 Esc/编辑键/粘贴，防残留误退）。
     if (this.inputController.ctrlCPendingSince > 0) this.inputController.clearExitConfirm()
     // 入口先规范化图片数组，后续气泡/渲染/回调看到的是同一份。
@@ -1945,7 +1965,7 @@ export class TuiApp {
     // 照常提交。
     if (this.abortSettling && !this.isAgentRunSettling()) { this.abortSettling = false; this.abortSteerBackfill = false }
     if (this.abortSettling && trimmed) {
-      this.commitUserPrompt(trimmed, images)
+      this.commitUserPrompt(trimmed, images, questionRequestId)
       this.pendingSubmitAfterAbort = { text: trimmed, ...(images ? { images } : {}) }
       this.renderLive()
       return
@@ -1954,7 +1974,7 @@ export class TuiApp {
     // W4a: agent 执行中 → 入队（turn 边界 drain 注入）。
     // 同时立即 commit 用户气泡到 scrollback，确保用户始终能看到自己说了什么。
     if (this.agentBusy && trimmed) {
-      await this.awaitUserCommit(trimmed, images)
+      await this.awaitUserCommit(trimmed, images, questionRequestId)
       this.steerBuffer.push(trimmed)
       // 插话只走文本：图片暂存到下一轮随 prompt 发出，并明确告知去向。此前这里是
       // 静默丢弃——气泡里图已经显示出来了，用户以为模型看到了，实际从未收到。
@@ -1996,7 +2016,7 @@ export class TuiApp {
     // Commit user message to scrollback（steer 已单独 commit 时跳过）
     if (trimmed) {
       if (!steerMerged) {
-        await this.awaitUserCommit(submitText.trim(), images)
+        await this.awaitUserCommit(submitText.trim(), images, questionRequestId)
       }
       // 新 run 启动前丢弃上一 run 未 finalize 的流式残留：blockWriter 缓冲
       // 与 streamRenderer pending 若不清，会把上一轮文字追加进新轮输出。
@@ -3986,6 +4006,7 @@ export class TuiApp {
 
   /** 销毁资源 */
   dispose(): void {
+    this.archiveAskCards()
     this.decisions.clear()
     this.rejectPendingApprovals()
     this.cancelPlanAutoApprove()
@@ -4039,7 +4060,30 @@ export class TuiApp {
     return this.screenReader
   }
 
-  /** 将静态文本提交到 scrollback（slash command 输出等） */
+  /**
+   * 落一张提问卡进对话历史（frontend 记录 + scrollback）。
+   * 两条通道都要写：fullscreen 下 commit 输出被抑制、history 是唯一可见路径，
+   * classic 下反过来——与其它工具结果的落法同构。
+   */
+  private commitAskCard(card: { content: string; toolId: string; input?: Record<string, unknown> }, state: 'pending' | 'answered' | 'discussion' | 'unanswered'): void {
+    const text = formatAskUserQuestion({ content: card.content, columns: this.columns, state }, this.theme).join('\n')
+    this.frontend.record({ kind: 'tool', toolId: card.toolId, name: 'ask_user_question', input: card.input, text, isError: false })
+    this.commitBlock(text)
+  }
+
+  /**
+   * 归档挂起的提问卡：传 requestId 只归档那一张，不传则全部（退出/会话切换前）。
+   * 消费即删除，重复调用不会重复落卡（失败重试/多发一条消息都安全）。
+   */
+  private archiveAskCards(requestId?: string, state: 'answered' | 'discussion' | 'unanswered' = 'unanswered'): void {
+    for (const id of requestId === undefined ? [...this.askCards.keys()] : [requestId]) {
+      const card = this.askCards.get(id)
+      if (!card) continue
+      this.askCards.delete(id)
+      this.commitAskCard(card, state)
+    }
+  }
+
   commitStatic(text: string, opts?: { isError?: boolean }): void {
     this.frontend.record({ kind: opts?.isError ? 'error' : 'boundary', text, isError: opts?.isError })
     // isError：错误类系统消息以 ✗ + error 色高亮，避免与普通输出混为一谈。
@@ -4079,10 +4123,10 @@ export class TuiApp {
    * where SlashRouter already has a resolved prompt from resolveAppPromptInput.
    * Commits the user prompt to scrollback and fires onSubmitCallback.
    */
-  async submitDecisionText(text: string): Promise<void> {
+  async submitDecisionText(text: string, questionRequestId?: string): Promise<void> {
     if (this.agentBusy || this.agentRunningProbe?.()) throw new Error('模型正在收尾，请稍后重试')
     if (!this.onSubmitCallback) throw new Error('回答提交入口未连接')
-    await this.handleInputSubmit(text, undefined, true)
+    await this.handleInputSubmit(text, undefined, true, questionRequestId)
   }
 
   submitText(text: string, images?: string[], options: import('../../agent/input-origin.js').InputOptions = { origin: 'runtime_command' }): void {
@@ -4330,7 +4374,10 @@ export class TuiApp {
    * 所属用户气泡下方、先于 assistant 输出」；该 Promise resolve 的值
    * 表示写入是否成功。
    */
-  private commitUserPrompt(content: string, images?: string[]): Promise<boolean> | null {
+  private commitUserPrompt(content: string, images?: string[], questionRequestId?: string): Promise<boolean> | null {
+    // 只归档这次作答/讨论对应的提问；全部归档会把后续排队的活动卡提前落历史。
+    const requestId = questionRequestId ?? this.decisions.question?.id
+    if (requestId) this.archiveAskCards(requestId, questionRequestId ? 'answered' : 'discussion')
     if (!this.isAgentActive()) { this.currentTaskTitle = content.split('\n')[0]!.slice(0, 80); this.mainTaskFailed = false; this.mainTaskStopped = false; this.mainTaskEnded = undefined }
     this.frontend.record({ kind: 'user', text: content + (images?.length ? `\n[${images.length}张图片附件]` : '') })
     const protocol = imageProtocol()
@@ -4375,8 +4422,8 @@ export class TuiApp {
   }
 
   /** Await a queued user commit and surface a display failure without blocking delivery. */
-  private async awaitUserCommit(content: string, images?: string[]): Promise<boolean> {
-    const pending = this.commitUserPrompt(content, images)
+  private async awaitUserCommit(content: string, images?: string[], questionRequestId?: string): Promise<boolean> {
+    const pending = this.commitUserPrompt(content, images, questionRequestId)
     const written = pending ? await pending : true
     if (!written) {
       try {
@@ -5277,9 +5324,16 @@ export class TuiApp {
     }
 
     // ask_user_question 用模态化边框卡片渲染，确保问题和选项完整可见。
-    if (name === 'ask_user_question') {
-      const formatted = formatAskUserQuestion({ content: finalContent, columns: this.columns }, this.theme)
-      this.commitBlock(formatted.join('\n'))
+    // 但卡片不在此刻落历史：输入框上方的决策面板才是活动交互面，两者同时存在
+    // 会把一次提问读成两条会话线。卡片先挂起，用户作答/发言时归档（archiveAskCards）。
+    if (name === 'ask_user_question' && isError === false) {
+      const card = {
+        content: finalContent,
+        toolId: id,
+        input: meta?.input,
+      }
+      if (this.decisionPanelsAttached) this.askCards.set(id, card)
+      else this.commitAskCard(card, 'pending')
       return
     }
 

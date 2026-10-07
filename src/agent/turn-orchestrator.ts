@@ -1445,6 +1445,20 @@ export class TurnOrchestrator {
           continue
         }
 
+        const hasAnswer = this.deps.state.streamedText.trim().length > 0
+          || collectedBlocks.some(b => b.type === 'text' && b.text.trim().length > 0)
+        if (!hasAnswer) {
+          this.emitStop({ source: 'no-answer', turn, voluntary: false }, callbacks)
+          await rejectOnAbort(
+            this.deps.completeTurn({ turn, isFinal: true, callbacks, stopReason: 'no_answer' }),
+            signal!,
+            'no-answer-complete',
+          )
+          finalTurnCompleted = true
+          this.deps.resetEvidence()
+          break
+        }
+
         // ── Goal continuation check ──
         // Delegated to GoalContinuationController — it handles tracker.check,
         // judge gating, saveGoalState, flushMeridianTurn, completeTurn, and

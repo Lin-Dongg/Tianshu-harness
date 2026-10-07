@@ -16,7 +16,7 @@ import { getTheme, setTheme, getActiveThemeName, THEMES, listCustomThemes } from
 import {
   checkForUpdate,
   detectInstallRoot,
-  formatUpdateBanner,
+  formatDeclinedUpdate,
   restartProcess,
   runUpdate,
   spawnWindowsSelfUpdate,
@@ -3475,18 +3475,25 @@ const TUI_SLASH_COMMANDS: readonly TuiSlashCommandDef[] = [
   {
     name: '/skill',
     immediate: true,
-    handler(ctx) {
+    async handler(ctx) {
       const { parts, pushStatic, setIsStreaming } = ctx
       const cmd = parts[0]!.toLowerCase()
       const sub = parts[1]?.toLowerCase()
 
-      // Single source of truth: the shared skillRegistry (loaded at bootstrap
-      // from .rivet/skills only — external .claude dirs are never scanned in
-      // place; designated skills are copied in via importFromClaude). No
-      // re-scan, no truncation — same Tier-1/Tier-2 model the model uses.
+      if (sub && (['inspect', 'add', 'mode', 'update', 'remove', 'doctor', 'generate'].includes(sub) || ['drafts', 'review', 'approve', 'reject'].includes(sub) && parts.includes('--scope'))) {
+        const { runSkillsCLI } = await import('../cli/skills-cli.js')
+        const result = await runSkillsCLI(sub === 'review' ? ['drafts', ...parts.slice(2)] : parts.slice(1), { cwd: ctx.agent.cwd })
+        pushStatic(createLogEntry({ type: 'system', content: result.output }))
+        setIsStreaming(false)
+        return true
+      }
+
+      // Invocation reads the pinned session registry; management stays independent.
+      // 轻量测试替身（mock ctx.agent）没有 config.promptEngine —— 回落到进程全局
+      // registry，语义等价（PromptEngine.getSkillRegistry 的兜底就是它）。
       const sourceTag = (source?: string): string =>
         source === 'global-claude' ? '🌐' : '📁'
-      const allSkills = skillRegistry.list()
+      const allSkills = (ctx.agent.config?.promptEngine?.getSkillRegistry?.() ?? skillRegistry).list()
 
       // ── Auto-distilled draft review (human-in-loop) ──
       if (sub === 'review' || sub === 'drafts') {
@@ -3600,7 +3607,7 @@ const TUI_SLASH_COMMANDS: readonly TuiSlashCommandDef[] = [
       // invoke it as the current prompt. The slash handler just acknowledges the
       // load; the actual body is expanded by resolveAppPromptInput so the agent
       // sees the skill instructions as the user message and responds in this turn.
-      const skill = skillRegistry.get(parts[1]!) ?? allSkills.find(s => s.name.toLowerCase() === sub)
+      const skill = allSkills.find(s => s.name === parts[1]!) ?? allSkills.find(s => s.name.toLowerCase() === sub)
       if (!skill) {
         pushStatic(createLogEntry({ type: 'system', content: `Skill "${parts[1]}" not found.\nUse /skill list to see available skills.` }))
         setIsStreaming(false)
@@ -4025,15 +4032,16 @@ export function registerTuiSlashCommands(app: TuiApp, ctx: BootstrapContext): vo
         return true
       }
 
-      app.commitStatic(formatUpdateBanner(check.current, check.latest))
-      app.commitStatic(`Install source: ${check.installType}`)
+      // 启动横幅写「Run /update」。这里人已经在 /update 里，再打同一句等于没说结果。
+      // 装不上时走 formatDeclinedUpdate：第一行是「没有安装」，后面是原因。
 
       // Windows 全局安装：进程存活时 npm 无法覆盖被占用的原生模块
       // （better_sqlite3.node）→ "另一个程序正在使用此文件"。改为分离式更新器：
       // 等本进程退出释放文件锁后再装、再拉起。
       if (process.platform === 'win32' && check.installType === 'global') {
-        // issue #115 — 安装 spec 必须与上方横幅承诺的 check.latest 一致；写死 npm
-        // dist-tag 'latest' 会在 npm 尚未发布该版本时装回旧版，而横幅已承诺新版。
+        // issue #115 — 安装 spec 必须与 check.latest 一致；写死 npm dist-tag 'latest'
+        // 会在 npm 尚未发布该版本时装回旧版。
+        app.commitStatic(`发现新版本：${check.current} → ${check.latest}。`)
         const spec = updateInstallSpec(check.latest)
         const schedule = spawnWindowsSelfUpdate(root, spec, true, ctx.sessionId)
         if (!schedule.ok) {
@@ -4058,7 +4066,18 @@ export function registerTuiSlashCommands(app: TuiApp, ctx: BootstrapContext): vo
       // issue #115 — 与 Windows 分支同口径：装横幅承诺的版本，而非 npm dist-tag。
       const result = await runUpdate(root, updateInstallSpec(check.latest), (line) => app.commitStatic(line))
       if (result.skipped) {
-        app.commitStatic(`ℹ️  ${result.message}`)
+        const lines = result.decline
+          ? formatDeclinedUpdate({
+              current: check.current,
+              latest: check.latest,
+              packageName: result.packageName ?? 'tianshu-harness',
+              kind: result.decline,
+            })
+          : [
+              `❌ 没有安装 ${check.latest}，当前仍是 ${check.current}。`,
+              `   ${result.message}`,
+            ]
+        for (const line of lines) app.commitStatic(line)
         return true
       }
       if (!result.ok) {

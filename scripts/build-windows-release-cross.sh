@@ -104,6 +104,15 @@ console.log('版本校验通过: root='+r.version+' desktop='+d.version+' tauri=
 # 2. 构建 CLI（beforeBuildCommand 还会重跑桌面端与全 staging 链——
 #    fetch-node-runtime/fetch-shell-runtime/fetch-whisper-runtime/fetch-ripgrep/
 #    pack-native 均已按 TAURI_ENV_TARGET_TRIPLE 目标化，见 f5ca4c58e）
+#
+#    前置换平台包：npm 只安装**宿主**平台的可选依赖，macOS 上因此没有
+#    @esbuild/win32-x64 / @ast-grep/napi-win32-x64-msvc / @napi-rs/canvas-win32-x64-msvc。
+#    stage-runtime-deps 只从 node_modules 复制，缺了就静默跳过 → 产物在 Windows 上
+#    esbuild（语法检查）与 ast-grep 全程不可用，其安装手册还会被当成「语法检查提示」
+#    回显给用户（issue #366）。stage 也会对缺失 fail loud，这里是它的正规修法。
+echo "--- 补齐目标平台原生包（win32-x64）---"
+TAURI_ENV_TARGET_TRIPLE="x86_64-pc-windows-msvc" node scripts/ensure-target-runtime-pkgs.js
+
 echo "--- 构建 CLI ---"
 npm run build
 

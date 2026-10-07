@@ -16,7 +16,7 @@ import type Parser from 'web-tree-sitter'
 // channel makes the soft timeout real: pool unavailable/timed out → degrade
 // (skip the JS/TS parse check), never block the loop, never a false fatal.
 
-import { cpuPool } from '../workers/cpu-pool.js'
+import { cpuPool, isInfraTaskError } from '../workers/cpu-pool.js'
 
 /** esbuild 语法解析的调用通道。null = 池不可用/已熔断（降级跳过检查，绝不误回滚）。 */
 type EsbuildTransform = (content: string, options: { loader: string; target: string; jsx: string }) => Promise<unknown>
@@ -29,9 +29,14 @@ let esbuildInfraFailures = 0
 let esbuildBreakerTripped = false
 const ESBUILD_BREAKER_THRESHOLD = 2
 
+/** 未标记的错误只匹配已知工具链故障，不能匹配可能来自源码片段的关键词。 */
 function isEsbuildInfraError(err: unknown): boolean {
+  // 结构化优先：worker 在错误产生点分类（esbuild 语法失败带 errors 数组，
+  // 基础设施故障没有），跨线程只传标记——见 cpu-tasks.ts isEsbuildSyntaxFailure。
+  if (isInfraTaskError(err)) return true
   const msg = err instanceof Error ? err.message : String(err)
-  return /timed out|terminated|unavailable/i.test(msg)
+  return /^CPU (?:worker terminated|pool unavailable|task '[^']+' timed out after \d+ms)$/.test(msg)
+    || /^The package "@esbuild\/[^"\n]+" could not be found, and is needed by esbuild\./.test(msg)
 }
 
 function getEsbuildCallTimeoutMs(): number {
@@ -50,7 +55,7 @@ function getEsbuildTransform(): EsbuildTransform | null {
       if (isEsbuildInfraError(err)) {
         esbuildInfraFailures++
         if (esbuildInfraFailures >= ESBUILD_BREAKER_THRESHOLD) esbuildBreakerTripped = true
-      }
+      } else esbuildInfraFailures = 0
       throw err
     }
   }
@@ -318,10 +323,12 @@ export async function checkSyntax(filePath: string, content: string): Promise<Sy
       if (!(err instanceof Error)) return OK
       const lines = err.message.split('\n')
       const errorLines = lines.filter(l => /ERROR:|error:/i.test(l))
-      const detail = errorLines.length > 0
-        ? errorLines.join('\n')
-        : lines.slice(1).join('\n')
-      const cleaned = detail.replace(/<stdin>:/g, '')
+      // 兜底闸门（不依赖任何来源的标记是否到达）：esbuild 的真语法错误必然带
+      // "ERROR:" 行（"Transform failed with N error(s):" + "<stdin>:L:C: ERROR: …"）。
+      // 没有该行 = 我们读不懂的失败 → 静默降级。此前这里回落成 lines.slice(1)，
+      // 把 esbuild 的安装手册正文当「语法提示」返回（issue #366 的用户可见形态）。
+      if (errorLines.length === 0) return OK
+      const cleaned = errorLines.join('\n').replace(/<stdin>:/g, '')
 
       // Second opinion: TypeScript compiler (ground truth for TS/JS syntax).
       // esbuild's parser is stricter than tsc — it rejects legal TS patterns
@@ -563,4 +570,3 @@ export async function checkPythonSyntaxTreeSitter(content: string): Promise<Pyth
     tree?.delete()
   }
 }
-

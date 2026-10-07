@@ -160,9 +160,20 @@ export class FrontendSession {
     const council = name === 'council_convene' ? decodeCouncilPanel(display) : null
     const text = team ? formatTeamPanel(team, theme, width).join('\n')
       : council ? formatCouncilPanel(council, theme, width).join('\n')
-        : name === 'ask_user_question' ? formatAskUserQuestion({ content: display, columns: width }, theme).join('\n') : display
+        : name === 'ask_user_question' && !isError ? formatAskUserQuestion({ content: display, columns: width }, theme).join('\n') : display
     this.record({ kind: 'tool', toolId: id, name: name || running?.name, input: running?.input, text, isError, rawPath })
   }
+  /**
+   * ask_user_question 的卡片等决策面板结算时统一落历史（TuiApp.commitAskCard）：
+   * 这里只推进工具记账（tools/completed 与文本 flush），不把卡片以工具结果
+   * 形态写进历史——否则同一提问会在活动面板与历史里各出现一次。
+   */
+  deferAskResult(id: string): void {
+    this.flushText()
+    this.tools.delete(id)
+    this.completed.add(id)
+  }
+
   boundary(text: string, kind: NonNullable<UIRecordInput['boundary']>): void {
     this.flushText()
     this.record({ kind: 'boundary', text, boundary: kind })

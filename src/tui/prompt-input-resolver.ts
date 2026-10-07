@@ -10,13 +10,15 @@
  * `slash-commands.ts` 保留同名再导出，main.ts 与既有测试 import 面不变。
  */
 import { resolveCustomCommand } from '../commands/loader.js'
-import { skillRegistry, listSkillFiles } from '../skills/skill-loader.js'
+import { projectSurfaceAllowed } from '../config/project-trust.js'
+import { skillRegistry, listSkillFiles, type SkillRegistry } from '../skills/skill-loader.js'
 import { resolveEcosystemWorkflowInput } from '../workflows/ecosystem-workflows.js'
 import { workspaceSkillSnapshot } from '../skills/workspace-skill-snapshot.js'
 import { looksLikeFilePath } from './engine/path-like.js'
 
 export interface ResolvedPromptInput {
   prompt: string
+  skillInvoked?: string
   /** 见 WorkflowResolveResult.requiredTools。仅 ecosystem workflow 路径可能非空。 */
   requiredTools?: readonly string[]
 }
@@ -26,14 +28,15 @@ export function resolveAppPromptInput(
   cwd: string,
   isKnownCommand?: (name: string) => boolean,
   pluginCommands?: { name: string; file: string }[],
+  sessionRegistry?: SkillRegistry,
 ): ResolvedPromptInput | null {
   if (!input.startsWith('/')) return { prompt: input }
   const workflow = resolveEcosystemWorkflowInput(input)
   if (workflow) return { prompt: workflow.prompt, requiredTools: workflow.requiredTools }
   const custom = resolveCustomCommand(cwd, input, pluginCommands)
   if (custom) return { prompt: custom }
-  const skillPrompt = resolveSkillPrompt(input, cwd)
-  if (skillPrompt !== null) return { prompt: skillPrompt }
+  const skillPrompt = resolveSkillPrompt(input, cwd, sessionRegistry)
+  if (skillPrompt !== null) return { prompt: skillPrompt, skillInvoked: skillPrompt.match(/^\[Skill loaded: ([^\]]+)\]/)?.[1] }
   // /review off|on|status 是 TUI 本地会话开关——本路径（server/headless 映射层）没有
   // refs 可写。明确告知，而不是把 "off" 误当 focus 触发一次审查（白烧 worker token）。
   if (/^\/review\s+(?:off|on|status)\s*$/i.test(input)) {
@@ -61,8 +64,8 @@ export function resolveAppPromptInput(
   // 均未命中后的兜底。必须放在 looksLikeFilePath 之前：单段 /name 在
   // isKnownCommand 谓词下会被判成「路径」原样透传，技能解析永远轮不到
   // （多段路径天然不匹配技能名，/etc 类单段路径无同名技能时仍落回路径分支）。
-  const bareSkill = resolveBareSkillPrompt(input, cwd)
-  if (bareSkill !== null) return { prompt: bareSkill }
+  const bareSkill = resolveBareSkillPrompt(input, cwd, sessionRegistry)
+  if (bareSkill !== null) return { prompt: bareSkill, skillInvoked: bareSkill.match(/^\[Skill loaded: ([^\]]+)\]/)?.[1] }
   // Linux/WSL path like /etc, /mnt, /usr — not a recognized command, pass through
   // as plain text so the agent can handle it (e.g. "look at /etc/hosts").
   if (looksLikeFilePath(input, isKnownCommand)) return { prompt: input }
@@ -70,16 +73,23 @@ export function resolveAppPromptInput(
   return null
 }
 
-const SKILL_RESERVED_SUBCOMMANDS = new Set(['list', 'ls', 'install', 'import', 'review', 'drafts', 'approve', 'reject', 'off', 'complete'])
+const SKILL_RESERVED_SUBCOMMANDS = new Set(['inspect', 'add', 'mode', 'update', 'remove', 'doctor', 'generate', 'list', 'ls', 'install', 'import', 'review', 'drafts', 'approve', 'reject', 'off', 'complete'])
 
 /** 技能查找 + prompt 展开（/skill 网关与裸名直调共用）。未命中返回 null。 */
-function buildSkillPrompt(name: string, userTask: string, cwd?: string): string | null {
-  const registry = cwd ? workspaceSkillSnapshot(cwd).registry : skillRegistry
+function buildSkillPrompt(name: string, userTask: string, cwd?: string, sessionRegistry?: SkillRegistry): string | null {
+  // 未授信项目不展开技能正文（2026-10-07 审计 Finding 1 第二入口：slash 解析经
+  // sessionSkillSnapshot/workspaceSkillSnapshot 装载，独立于 loadProjectSkills 的门；
+  // 正文拼成的 prompt 会以用户消息身份进模型）。cwd 缺席时 registry 回落全局
+  // skillRegistry（已受 loadProjectSkills 门保护）；三处生产调用点（main.ts:1836、
+  // session-skills-helper.ts:10、session-manager.ts:2774）均传 cwd。
+  if (cwd && !projectSurfaceAllowed(cwd, 'skills')) return null
+  const registry = sessionRegistry ?? (cwd ? workspaceSkillSnapshot(cwd).registry : skillRegistry)
   const skill = registry.get(name) ?? registry.list().find(s => s.name.toLowerCase() === name.toLowerCase())
   if (!skill) return null
+  if (skill.mode === 'off') return `Skill「${skill.name}」已停用，请先启用。`
   let prompt = `[Skill loaded: ${skill.name}]\n<skill name="${skill.name}">\n${skill.body}\n</skill>`
   if (skill.skillDir) {
-    const files = listSkillFiles(skill.skillDir)
+    const files = skill.files ?? listSkillFiles(skill.skillDir)
     if (files.length > 0) {
       prompt += `\n<skill-files dir="${skill.skillDir}" note="Read on demand with read_file/grep/glob; page large sub-files completely with offset/limit.">\n${files.map(f => '  ' + f.path).join('\n')}\n</skill-files>`
     }
@@ -95,12 +105,12 @@ function buildSkillPrompt(name: string, userTask: string, cwd?: string): string 
  * Reserved subcommands (list/install/etc.) and unknown skills return null so
  * they fall back to the slash handler's local behavior or error message.
  */
-function resolveSkillPrompt(input: string, cwd: string): string | null {
+function resolveSkillPrompt(input: string, cwd: string, sessionRegistry?: SkillRegistry): string | null {
   const match = input.trim().match(/^\/skill\s+(\S+)(?:\s+(.*))?$/s)
   if (!match) return null
   const name = match[1]!
   if (SKILL_RESERVED_SUBCOMMANDS.has(name.toLowerCase())) return null
-  return buildSkillPrompt(name, match[2]?.trim() ?? '', cwd)
+  return buildSkillPrompt(name, match[2]?.trim() ?? '', cwd, sessionRegistry)
 }
 
 /**
@@ -110,10 +120,10 @@ function resolveSkillPrompt(input: string, cwd: string): string | null {
  * 显式唤起。多段路径天然不匹配（技能名不含 /）；单段路径（/etc）只有用户
  * 真建了同名技能才会被接管——那正是用户意图。
  */
-export function resolveBareSkillPrompt(input: string, cwd?: string): string | null {
+export function resolveBareSkillPrompt(input: string, cwd?: string, sessionRegistry?: SkillRegistry): string | null {
   const match = input.trim().match(/^\/([^\s/]+)(?:\s+(.*))?$/s)
   if (!match) return null
   const name = match[1]!
   if (SKILL_RESERVED_SUBCOMMANDS.has(name.toLowerCase())) return null
-  return buildSkillPrompt(name, match[2]?.trim() ?? '', cwd)
+  return buildSkillPrompt(name, match[2]?.trim() ?? '', cwd, sessionRegistry)
 }

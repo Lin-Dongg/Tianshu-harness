@@ -57,9 +57,10 @@ describe('bash verification scope', () => {
     for (const command of ['npm test -- src/cache.test.ts', 'pytest -k cache', 'node --test --test-name-pattern cache',
       'node --test src/cache.test.ts --test-name-pattern cache', 'pytest tests/test_cache.py -k cache',
       'npx jest src/cache.test.ts --testNamePattern=cache',
-      'npm test && echo done', 'npm test || true', 'cd nested && npm test', 'npm run custom-verify']) {
+      'npm test && echo done', 'npm test || true', 'npm run custom-verify']) {
       assert.equal(inferBashVerificationScope(command).scope, command === 'npm test -- src/cache.test.ts' ? 'targeted' : 'unknown', command)
     }
+    assert.equal(inferBashVerificationScope('cd nested && npm test').scope, 'full', 'literal cd is a supported transparent wrapper')
   })
 
   it('preserves quoted file targets and Windows executable paths', () => {

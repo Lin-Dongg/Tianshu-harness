@@ -2,8 +2,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync, chmodSync } from 'node:fs'
-import { join } from 'node:path'
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync, chmodSync, existsSync } from 'node:fs'
+import { join, delimiter } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createRouter } from '../index.js'
 import { buildSessionRoutes } from '../session-routes.js'
@@ -35,9 +35,30 @@ if (args.includes('POST')) { if(state.uncertain) {console.error('connection time
 console.log('{}');
 });
 `
-  writeFileSync(join(bin, 'gh'), script); chmodSync(join(bin, 'gh'), 0o755)
+  if (process.platform === 'win32') {
+    writeFileSync(join(bin, 'gh.cjs'), script)
+    const csCode = `using System; using System.Diagnostics;
+class Program {
+  static int Main(string[] args) {
+    var quote = ((char)34).ToString(); var slash = ((char)92).ToString();
+    var p = new Process(); p.StartInfo.FileName = ${JSON.stringify(process.execPath)};
+    p.StartInfo.Arguments = quote + AppDomain.CurrentDomain.BaseDirectory + "gh.cjs" + quote + " "
+      + string.Join(" ", Array.ConvertAll(args, a => quote + a.Replace(quote, slash + quote) + quote));
+    p.StartInfo.UseShellExecute = false; p.StartInfo.CreateNoWindow = true;
+    p.Start(); p.WaitForExit(); return p.ExitCode;
+  }
+}`
+    const csPath = join(bin, 'gh.cs')
+    writeFileSync(csPath, csCode)
+    const windows = process.env.SystemRoot ?? 'C:/Windows'
+    const csc = ['Framework64', 'Framework'].map(arch => join(windows, 'Microsoft.NET', arch, 'v4.0.30319', 'csc.exe')).find(existsSync)
+    assert.ok(csc, 'Windows gh fixture requires the .NET Framework compiler')
+    execFileSync(csc, ['/nologo', `/out:${join(bin, 'gh.exe')}`, csPath])
+  } else {
+    writeFileSync(join(bin, 'gh'), script); chmodSync(join(bin, 'gh'), 0o755)
+  }
   mkdirSync(join(dir, 'data')); writeFileSync(join(dir, 'data', 'config.json'), '{}')
-  process.env.PATH = `${bin}:${oldPath}`; process.env.RIVET_HOME = join(dir, 'data')
+  process.env.PATH = `${bin}${delimiter}${oldPath}`; process.env.RIVET_HOME = join(dir, 'data')
   const manager = { getDefaultCwd: () => dir, listSessions: () => [{ id: 's', cwd: repo }], getSession: () => undefined } as unknown as RuntimeSessionManager
   const router = createRouter(buildSessionRoutes(manager, 'test'))
   const call = (method: string, path: string, body = {}) => router(method, `/git/workbench${path}?cwd=${encodeURIComponent(repo)}&remote=upstream${path === '/pr' ? '&number=1' : ''}`, body, { authorization: 'Bearer test' })

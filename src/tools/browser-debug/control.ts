@@ -46,3 +46,5 @@ export async function takeBrowserControl(key: string, owner: 'user' | 'agent', h
   try { await transfer }
   finally { if (transitions.get(key) === transfer) transitions.delete(key) }
 }
+
+export function forgetBrowserControl(key: string) { owners.delete(key); transitions.delete(key); queues.delete(key) }

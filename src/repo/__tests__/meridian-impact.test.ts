@@ -82,6 +82,30 @@ describe('meridian impact', () => {
     assert.ok(result.direct.includes('app.ts'))
     assert.ok(result.direct.includes('ui.ts'))
   })
+
+  it('support files stay in the graph but only their real test dependents are required', () => {
+    const helper = 'src/__tests__/helpers/fixture.ts'
+    const test = 'src/__tests__/consumer.test.ts'
+    db.upsertEdge(`${helper}:fixture:1`, 'src/feature.ts:feature:1', 'imports', 1, 'extracted')
+    db.upsertEdge(`${test}:check:1`, `${helper}:fixture:1`, 'imports', 1, 'extracted')
+    db.upsertEdge(`${helper}:*:0`, 'src/feature.ts:*:0', 'tested_by', 1, 'inferred')
+    db.recordCoEdit('src/feature.ts', helper, 1)
+    const impact = analyzeImpact(db, ['src/feature.ts'])
+    assert.deepEqual(impact.requiredTests, [test])
+    assert.ok(impact.direct.includes(helper))
+    assert.ok(!impact.tests.includes(helper))
+    assert.equal(impact.reasons?.[test]?.length, 2)
+    assert.deepEqual(analyzeImpact(db, [helper]).requiredTests, [test])
+    assert.deepEqual(inferTestedByTargets(helper, ['src/fixture.ts']), [])
+  })
+
+  it('Python and Go test entry names remain obligations without test-directory hints', () => {
+    const tests = ['test_feature.py', 'feature_test.py', 'feature_test.go', 'feature.spec.ts', 'feature.test.mjs']
+    for (const file of [...tests, 'test/helper.py', '__tests__/fixture.go']) {
+      db.upsertEdge(`${file}:check:1`, 'feature.ts:feature:1', 'imports', 1, 'extracted')
+    }
+    assert.deepEqual(analyzeImpact(db, ['feature.ts']).requiredTests, tests.sort())
+  })
 })
 
 describe('inferTestedByTargets', () => {

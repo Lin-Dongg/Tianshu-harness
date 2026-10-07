@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, writeFile, symlink, rm, realpath } from 'node:fs/promis
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { buildFileOpenRoutes, startFilePreview, chromeCommand } from '../file-open-routes.js'
+import { buildFileOpenRoutes, startFilePreview, chromeCommand, disposeSessionFilePreviews } from '../file-open-routes.js'
 import { createRouter } from '../index.js'
 import type { RuntimeSessionManager } from '../session-manager.js'
 
@@ -48,4 +48,58 @@ test('HTML preview has separate capability origin, relative assets and fail-clos
     assert.equal((await fetch(new URL('/style.css', preview.url))).status, 404)
     assert.equal((await fetch(preview.url, { method: 'POST' })).status, 404)
   } finally { await new Promise<void>(done => preview.server.close(() => done())); await rm(root, { recursive: true, force: true }); await rm(outside, { recursive: true, force: true }) }
+})
+
+test('resource versions track served dependencies, renew and release even after deletion', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'preview-version-'))
+  const manager = { listSessions: () => [{ id: 's', cwd: root }] } as unknown as RuntimeSessionManager
+  const call = createRouter(buildFileOpenRoutes(manager, 'fixture'))
+  const auth = { authorization: 'Bearer fixture' }, request = { sessionId: 's', cwd: root, path: 'demo.html' }
+  try {
+    await writeFile(join(root, 'demo.html'), '<script src="app.js"></script>')
+    await writeFile(join(root, 'app.js'), 'window.version=1')
+    await writeFile(join(root, 'scene.glb'), 'glb fixture')
+    const opened = await call('POST', '/file-open', { ...request, action: 'preview' }, auth)
+    const data = opened.body as { url: string; previewId: string }
+    await fetch(data.url); await fetch(new URL('app.js', data.url))
+    assert.equal((await fetch(new URL('scene.glb', data.url))).headers.get('content-type'), 'model/gltf-binary')
+    const first = await call('POST', '/file-open', { ...request, action: 'status', previewId: data.previewId }, auth)
+    const state = first.body as { version: string; servedVersion: string }
+    assert.equal(state.version, state.servedVersion)
+    await writeFile(join(root, 'app.js'), 'window.version=2')
+    const changed = (await call('POST', '/file-open', { ...request, action: 'status', previewId: data.previewId }, auth)).body as typeof state
+    assert.notEqual(changed.version, changed.servedVersion)
+    assert.equal(changed.servedVersion, state.servedVersion)
+    assert.equal((await call('POST', '/file-open', { ...request, action: 'status', previewId: 'foreign' }, auth)).status, 410)
+    await rm(join(root, 'demo.html'))
+    assert.equal((await call('POST', '/file-open', { ...request, action: 'release', previewId: data.previewId }, auth)).status, 200)
+    await assert.rejects(fetch(data.url))
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+
+test('concurrent opens share one resource, expiry invalidates identity, and session disposal closes it', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'preview-lifecycle-'))
+  const manager = { listSessions: () => [{ id: 'life', cwd: root }] } as unknown as RuntimeSessionManager
+  const call = createRouter(buildFileOpenRoutes(manager, 'fixture')), auth = { authorization: 'Bearer fixture' }
+  const request = { sessionId: 'life', cwd: root, path: 'demo.html', action: 'preview' }
+  try {
+    await writeFile(join(root, 'demo.html'), '<h1>lifecycle</h1>')
+    const results = await Promise.all(Array.from({ length: 4 }, () => call('POST', '/file-open', request, auth)))
+    const resources = results.map(r => r.body as { url: string; previewId: string })
+    assert.equal(new Set(resources.map(r => r.previewId)).size, 1)
+    assert.equal(new Set(resources.map(r => r.url)).size, 1)
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    await call('POST', '/file-open', { ...request, action: 'status', previewId: resources[0]!.previewId }, auth)
+    t.mock.timers.tick(30 * 60 * 1000)
+    assert.equal((await call('POST', '/file-open', { ...request, action: 'status', previewId: resources[0]!.previewId }, auth)).status, 410)
+    t.mock.timers.reset()
+    await assert.rejects(fetch(resources[0]!.url))
+    const pending = call('POST', '/file-open', request, auth)
+    disposeSessionFilePreviews('life')
+    assert.equal((await pending).status, 410, 'disposal during creation cannot leave a loopback server')
+    const reopened = (await call('POST', '/file-open', request, auth)).body as { url: string }
+    disposeSessionFilePreviews('life')
+    await assert.rejects(fetch(reopened.url))
+  } finally { t.mock.timers.reset(); disposeSessionFilePreviews('life'); await rm(root, { recursive: true, force: true }) }
 })

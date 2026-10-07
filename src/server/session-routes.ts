@@ -38,7 +38,7 @@ import { validateWorkspaceRoots } from './workspace-roots.js'
  *   POST   /github/prs/:number/push-fix                push auto-fix diff to PR head (confirm-gated)
  */
 import { buildDocumentRoutes, documentVersion } from './file-document.js'
-import { buildGitWorkbenchRoutes } from './git-workbench-routes.js'
+import { buildGitWorkbenchRoutes, serveFileRoute } from './git-workbench-routes.js'
 import { buildGitPrRoutes } from './git-pr-routes.js'
 import { buildApprovalRoutes, sendApprovalSnapshot } from './approval-routes.js'
 import { buildGitReviewRoutes } from './git-review-jobs.js'
@@ -400,10 +400,11 @@ export function buildSessionRoutes(
         catch (error) { return { status: 400, body: { error: (error as Error).message } } }
         if (data.isolatedWorktree === true && workspaceRoots.length > 1) return { status: 400, body: { error: 'Isolated Worktree supports a single folder only' } }
       }
+      let skillInvoked: string | undefined
       let requiredTools: readonly string[] = []
       let rec: ReturnType<RuntimeSessionManager['createSession']>
       try { rec = manager.createSession({
-        preparePrompt: prepareSessionPrompt(data.prompt, resolved => { prompt = resolved.prompt; requiredTools = resolved.requiredTools ?? [] }),
+        preparePrompt: prepareSessionPrompt(data.prompt, resolved => { prompt = resolved.prompt; requiredTools = resolved.requiredTools ?? []; skillInvoked = resolved.skillInvoked }),
         cwd: data.cwd,
         workspaceRoots,
         workspaceMode: data.workspaceMode as SessionWorkspaceMode | undefined,
@@ -436,7 +437,7 @@ export function buildSessionRoutes(
       if (archivePersist && 'error' in archivePersist) return { status: 400, body: { error: archivePersist.error } }
       const attachmentTexts = [docTexts, archivePersist?.handleText].filter((s) => s)
       if (attachmentTexts.length > 0) prompt = `${attachmentTexts.join('\n\n---\n\n')}\n\n${prompt ?? ''}`
-      if (prompt?.trim()) manager.run(rec.id, prompt, imagesCheck.images, false, undefined, { documents: docsCheck.documents, archiveRefs: archivePersist?.eventRefs, promptText })
+      if (prompt?.trim()) manager.run(rec.id, prompt, imagesCheck.images, false, undefined, { skillInvoked, documents: docsCheck.documents, archiveRefs: archivePersist?.eventRefs, promptText })
       rec = manager.getSession(rec.id) ?? rec
       if (__dbg) console.log(`[createSession] +${Date.now() - __t0}ms id=${rec.id} cwd=${data.cwd}`)
       return { status: 201, body: rec }
@@ -886,8 +887,7 @@ export function buildSessionRoutes(
       }
     }, apiToken),
 
-    // Archive (soft-close) a session. Aborts if running, marks archived, hides
-    // from listSessions. Data survives on disk for potential recovery.
+    // Archive aborts a running session and retains its recoverable data.
     'DELETE /sessions/:id': withAuth((_body, params) => {
       if (!manager.archiveSession(params!.id!)) {
         return { status: 404, body: { error: 'Session not found or already archived' } }
@@ -895,7 +895,6 @@ export function buildSessionRoutes(
       return { status: 200, body: { archived: true } }
     }, apiToken),
 
-    // Restore a previously archived session back to the active list.
     'POST /sessions/:id/unarchive': withAuth((_body, params) => {
       if (!manager.unarchiveSession(params!.id!)) {
         return { status: 404, body: { error: 'Session not found or not archived' } }
@@ -903,7 +902,12 @@ export function buildSessionRoutes(
       return { status: 200, body: { archived: false } }
     }, apiToken),
 
-    // Rename a session (title only). Empty title clears it.
+    'POST /sessions/:id/title-generation': withAuth(async (body, params) => {
+      const explicit = (body as { explicit?: unknown } | null)?.explicit === true
+      if (!await manager.generateTitle(params!.id!, explicit)) return { status: 404, body: { error: 'Session not found' } }
+      return { status: 200, body: { ok: true } }
+    }, apiToken),
+
     'PATCH /sessions/:id': withAuth((body, params) => {
       const data = (body ?? {}) as { title?: unknown }
       if (typeof data.title !== 'string') {
@@ -1000,18 +1004,19 @@ export function buildSessionRoutes(
       // 这里负责把 /plan /team /council /review /write-plan /plan-close 等
       // ecosystem 命令翻译成结构化 prompt，自定义命令也走 .rivet/commands/。
       // 未识别 slash → 4xx 友好提示（与 TUI rejectSubmit 行为对齐，避免凭空丢失消息）。
+      let skillInvoked: string | undefined
       let prompt = data.prompt
       const trimmed = prompt.trim()
       if (trimmed.startsWith('/')) {
         const record = manager.getSession(params!.id!)
         if (record) {
           let resolved: ReturnType<typeof resolveSlashCommandPrompt>
-          try { resolved = resolveSlashCommandPrompt(trimmed, record.cwd) }
+          try { resolved = resolveSlashCommandPrompt(trimmed, record.cwd, params!.id!) }
           catch (error) {
             if (error instanceof SlashPromptError) return { status: 400, body: { error: error.message } }
             throw error
           }
-          prompt = resolved.prompt
+          prompt = resolved.prompt; skillInvoked = resolved.skillInvoked
           // 桌面端也需挂载 workflow 声明的 EXTENDED 工具（与 TUI main.ts 对齐）。
           for (const toolName of resolved.requiredTools ?? []) {
             await manager.enableTool(params!.id!, toolName)
@@ -1055,7 +1060,7 @@ export function buildSessionRoutes(
           return { status: 400, body: { error: 'Invalid requestId' } }
         }
         try {
-          const result = await manager.submitRun(params!.id!, prompt, images, data.requestId, { documents, archiveRefs, promptText })
+          const result = await manager.submitRun(params!.id!, prompt, images, data.requestId, { skillInvoked, documents, archiveRefs, promptText })
           if (!result.ok) return { status: result.code === 'not_found' ? 404 : 409, body: { error: result.code } }
           return { status: 200, body: { ...manager.getSession(params!.id!), receipt: 'receipt' in result ? result.receipt : undefined } }
         } catch (error) {
@@ -1065,7 +1070,7 @@ export function buildSessionRoutes(
           return { status: 503, body: { error: 'Could not durably accept request; retry with the same requestId', code: 'request_persistence_failed' } }
         }
       }
-      const ok = manager.run(params!.id!, prompt, images, false, undefined, { documents, archiveRefs, promptText })
+      const ok = manager.run(params!.id!, prompt, images, false, undefined, { skillInvoked, documents, archiveRefs, promptText })
       // 区分两种拒绝：session 缺失（404，前端可提示重新打开）与执行中（409 busy，
       // 前端显示"正在执行中"而非错误 toast——用户连续发消息时这是正常排队语义）。
       if (!ok) {
@@ -2365,8 +2370,7 @@ export function buildSessionRoutes(
     'GET /git/diff': withAuth(async (_body, params) => {
       const path = params?.path
       if (!path || typeof path !== 'string') return { status: 400, body: { error: 'Missing path param' } }
-      const diff = await manager.getFileDiff(path)
-      return { status: 200, body: { diff } }
+      return serveFileRoute(() => manager.getFileDiff(path), diff => ({ diff }))
     }, apiToken),
 
     // Session-scoped working-tree changes — resolves the session's worktree cwd
@@ -2383,9 +2387,7 @@ export function buildSessionRoutes(
     'GET /sessions/:id/git/diff': withAuth(async (_body, params) => {
       const path = params?.path
       if (!path || typeof path !== 'string') return { status: 400, body: { error: 'Missing path param' } }
-      const diff = await manager.getSessionFileDiff(String(params?.id ?? ''), path)
-      if (diff === null) return { status: 404, body: { error: 'Session not found' } }
-      return { status: 200, body: { diff } }
+      return serveFileRoute(() => manager.getSessionFileDiff(String(params?.id ?? ''), path), diff => ({ diff }))
     }, apiToken),
 
     // Full file content at the session's task baseline — lets editor clients
@@ -2394,9 +2396,7 @@ export function buildSessionRoutes(
     'GET /sessions/:id/git/file-base': withAuth(async (_body, params) => {
       const path = params?.path
       if (!path || typeof path !== 'string') return { status: 400, body: { error: 'Missing path param' } }
-      const result = await manager.getSessionFileAtBase(String(params?.id ?? ''), path)
-      if (result === null) return { status: 404, body: { error: 'Session not found' } }
-      return { status: 200, body: result }
+      return serveFileRoute(() => manager.getSessionFileAtBase(String(params?.id ?? ''), path))
     }, apiToken),
 
     // Change landing — commit everything in the session cwd (server-direct).

@@ -22,6 +22,11 @@ import {
   type MemoryEntry,
 } from '../unified-memory.js'
 
+// 信任门族（2026-10-07 审计修复）：renderMemoryBlock 现带信任门——本文件验「授信
+// 项目的记忆渲染」正常语义（含字节稳定性回归锚）；未授信拒绝语义在
+// src/config/__tests__/project-trust-surface-gates.test.ts 覆盖。node:test 文件级进程隔离。
+process.env.RIVET_TRUST_PROJECT = '1'
+
 const TEST_DIR = join(tmpdir(), 'rivet-um-test')
 
 function projectHash(cwd: string): string {

@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { mkdirSync } from 'node:fs'
 import { writeFileAtomicSync } from '../fs-atomic.js'
+import { projectSurfaceAllowed } from '../config/project-trust.js'
 
 export interface CompanionPresenceEntry {
   sessionId: string
@@ -26,6 +27,9 @@ function isAlive(entry: CompanionPresenceEntry, now: number): boolean {
 }
 
 export function loadPresence(cwd: string, excludeSessionId?: string): CompanionPresenceEntry[] {
+  // 未授信项目的在线状态不进 appendix（2026-10-07 审计 Finding 1e）。读侧此前
+  // 不过 sanitize——伪造 presence.json 的 objective 可直通 appendix，纵深由本门关闭。
+  if (!projectSurfaceAllowed(cwd, 'presence')) return []
   const filePath = presencePath(cwd)
   if (!existsSync(filePath)) return []
   try {

@@ -1,5 +1,6 @@
 import { prepareCompletionCapture } from './test-completion.js'
 import { inferBashVerificationScope } from '../agent/bash-verification.js'
+import { prepareBackgroundVerification } from './background-verification.js'
 import { execFileSync } from 'child_process'
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
@@ -485,12 +486,9 @@ async function executeBashOnce(params: ToolCallParams): Promise<BashExecResult> 
   const timeout = resolveCallerTimeoutBudget(rawCommand, Number(params.input.timeout), 120_000) // 非正数/NaN → 默认（#187）；typecheck 形态按闸门预算只抬不压
   const startTime = Date.now()
 
-  // Background path: explicit run_in_background=true, or auto-detected long-runner
-  // (unless explicitly disabled). Requires a session job registry (server / TUI
-  // with sessionId); otherwise falls through to normal foreground execution.
+  // Background execution requires a session registry; otherwise run in foreground.
   const explicitBg = params.input.run_in_background
   const wantBackground = explicitBg === true || (explicitBg !== false && isLongRunner(rawCommand))
-  // E4 — foreground only: visible-terminal landing. Background jobs stay local.
   if (!wantBackground && params.onClientDelegate) {
     const delegated = await tryClientTerminalExec(params, command, params.cwd)
     if (delegated) {
@@ -501,17 +499,17 @@ async function executeBashOnce(params: ToolCallParams): Promise<BashExecResult> 
     }
   }
   if (wantBackground && params.jobs) {
+    const verificationRun = prepareBackgroundVerification(rewrittenWithMirrors, params)
     const mirrorEnv = buildMirrorEnv(mirrorConfig)
     const earlyFailEnv = gitCloneEarlyFailEnv(rawCommand, mirrorConfig)
-    const env = { ...sanitizeEnv(getResolvedEnv(params.cwd)), ...mirrorEnv, ...earlyFailEnv }
-    // 后台 tsc 的尽力串行（2026-09-12 收口②）：拿得到锁就持有到 job 退出
-    // （await 的 10min 是兜底——正常路径 job 退出即清 waiter 放锁，对齐陈旧锁
-    // 上限）；拿不到 fail-open 直接跑。job 生命周期脱离调用点，前台 run/finally
-    // 不适用，这是已知最严的挂钩点。
+    const env = { ...sanitizeEnv(getResolvedEnv(params.cwd)), ...mirrorEnv, ...earlyFailEnv, ...verificationRun.env }
+    // 后台 tsc 尽力串行，退出时放锁，await 的 10min 兜底。
     const tcLock = process.env.RIVET_TYPECHECK_SHARE !== '0' && isTypecheckCommand(rawCommand)
       ? tryAcquireAdhocLock(params.cwd ?? process.cwd())
       : undefined
-    const snap = params.jobs.spawn({ command, rawCommand, cwd: params.cwd, env })
+    let snap
+    try { snap = params.jobs.spawn({ command: wrapSandboxCommand(verificationRun.command, params.cwd).command, rawCommand, cwd: params.cwd, env, onCompleted: verificationRun.onCompleted }) }
+    catch (error) { verificationRun.dispose(); tcLock?.release(); throw error }
     if (tcLock) {
       void params.jobs.await(snap.id, { timeoutMs: 10 * 60_000 }).then(
         () => tcLock.release(),
@@ -523,13 +521,14 @@ async function executeBashOnce(params: ToolCallParams): Promise<BashExecResult> 
     const content =
       `[job:${snap.id}] ${auto ? '已自动转入后台' : '已在后台启动'}: ${rawCommand}\n` +
       `不阻塞当前轮次。用 job(action="await", id="${snap.id}", pattern="Ready|listening|compiled") 等待就绪/退出，` +
-      `job(action="logs", id="${snap.id}") 看输出，job(action="kill", id="${snap.id}") 终止。${sandboxNote}`
+      `job(action="logs", id="${snap.id}") 看输出，job(action="kill", id="${snap.id}") 终止。${sandboxNote}${verificationRun.note}`
     const shortCmd = rawCommand.length > 80 ? rawCommand.slice(0, 80) + '…' : rawCommand
     return Promise.resolve({
       content,
       uiContent: `▶ 后台任务 ${snap.id}: ${shortCmd}`,
       isError: false,
       command: rawCommand,
+      backgroundJobId: snap.id,
     })
   }
 
@@ -711,7 +710,7 @@ async function executeBashOnce(params: ToolCallParams): Promise<BashExecResult> 
       const meta = { command: headerCommand, exitCode, durationMs }
       const coverage = completion?.read(exitCode)
       completion?.dispose()
-      const verification = coverage ? { command: rawCommand, kind: 'test' as const, status: exitCode === 0 ? 'passed' as const : 'failed' as const, scope: inferBashVerificationScope(rawCommand).scope === 'targeted' ? 'targeted' as const : 'full' as const, exitCode, coverage } : undefined
+      const verification = coverage ? { command: rawCommand, kind: 'test' as const, status: exitCode === 0 ? 'passed' as const : 'failed' as const, scope: inferBashVerificationScope(rawCommand)?.scope === 'targeted' ? 'targeted' as const : 'full' as const, exitCode, coverage } : undefined
       const { isError, errorClass } = classifyBashOutcome(exitCode, stderr, process.platform === 'win32')
       // Sandbox attribution: a bare "Operation not permitted" sends the model
       // into a sudo/chmod retry loop. Name the path and route it to

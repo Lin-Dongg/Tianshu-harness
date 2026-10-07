@@ -21,6 +21,20 @@ export interface ClaimEntry {
   filePath: string
 }
 
+/**
+ * v2（认领即租约）：文件级租约的判定输入。`checkClaim` 只返回三列，拿不到
+ * owner 的 pid 与该文件最后被触碰的时刻——`claimLiveness` 用 join 一次取齐。
+ * `ownerPid === null` 即「claims 行在、sessions 行无」的幽灵认领（L0）。
+ */
+export interface ClaimLiveness {
+  ownerSessionId: string
+  ownerPid: number | null
+  ownerAlive: boolean
+  claimType: 'exclusive' | 'shared_read'
+  acquiredAt: string
+  lastTouchedAt: string
+}
+
 export interface EventInput {
   eventType: string
   filePath?: string
@@ -63,6 +77,7 @@ CREATE TABLE IF NOT EXISTS claims (
   file_path TEXT NOT NULL,
   claim_type TEXT NOT NULL CHECK(claim_type IN ('exclusive','shared_read')),
   acquired_at TEXT NOT NULL,
+  last_touched_at TEXT,
   confidence_trend TEXT,
   detail TEXT,
   priority INTEGER DEFAULT 0,
@@ -144,6 +159,13 @@ export class SessionRegistry {
       // databases created before the project_hash column was added.
       try { db.exec('ALTER TABLE retrospect_fingerprints ADD COLUMN project_hash TEXT') } catch { /* already exists */ }
       db.exec(SCHEMA)
+      // v2 迁移：claims.last_touched_at（文件级租约凭据）。放在 exec(SCHEMA) 之后
+      // ——老库的 claims 表已存在、CREATE TABLE IF NOT EXISTS 不会补列，而新库已
+      // 由 SCHEMA 带上该列。回填语义：历史行的「取得时刻」是**已知的活动下界**，
+      // 比「无证据」更强，不该退化成永远「问」（修正 v1 §5 反例③在迁移行上的
+      // 过度保守）。幂等；两条都吞异常，降级/异常库不得阻断 create()。
+      try { db.exec('ALTER TABLE claims ADD COLUMN last_touched_at TEXT') } catch { /* already exists */ }
+      try { db.exec('UPDATE claims SET last_touched_at = acquired_at WHERE last_touched_at IS NULL') } catch { /* no claims table yet */ }
     } catch (err) {
       // Packaged sidecar with a broken native bundle: fail loud, never degrade.
       if ((err as { code?: string })?.code === 'ESQLITE_BUNDLE_BROKEN') throw err
@@ -281,20 +303,29 @@ export class SessionRegistry {
   }
 
   acquireClaim(sessionId: string, filePath: string, claimType: 'exclusive' | 'shared_read'): boolean {
+    const now = new Date().toISOString()
     // Check existing claims
     const existing = this.safeAll<{ session_id: string; claim_type: string }>(
       'SELECT session_id, claim_type FROM claims WHERE file_path = ?', filePath
     )
 
     for (const c of existing) {
-      if (c.session_id === sessionId) return true // same session re-acquires
+      if (c.session_id === sessionId) {
+        // v2：同会话重复认领 = 该持有方刚又触碰了这个文件 → 刷新文件级租约凭据。
+        // 这一处刷新覆盖全部写路径（tool-pipeline 三处 acquireClaim 调用点），
+        // 调用方零改动。必须落盘后再返 true，否则凭据永远停在首次取得时刻。
+        this.safeRun(
+          'UPDATE claims SET last_touched_at = ? WHERE session_id = ? AND file_path = ?',
+          now, sessionId, filePath
+        )
+        return true // same session re-acquires
+      }
       if (c.claim_type === 'exclusive') return false // file exclusively locked by another
       if (claimType === 'exclusive') return false // want exclusive but shared_read exists
     }
-    const now = new Date().toISOString()
     const changes = this.safeRun(
-      'INSERT OR REPLACE INTO claims (session_id, file_path, claim_type, acquired_at) VALUES (?, ?, ?, ?)',
-      sessionId, filePath, claimType, now
+      'INSERT OR REPLACE INTO claims (session_id, file_path, claim_type, acquired_at, last_touched_at) VALUES (?, ?, ?, ?, ?)',
+      sessionId, filePath, claimType, now, now
     )
     return changes > 0
   }
@@ -313,6 +344,38 @@ export class SessionRegistry {
       filePath
     )
     return row ?? null
+  }
+
+  /**
+   * v2（认领即租约）：文件级租约的活性快照。join claims×sessions 一次取齐判定
+   * 所需字段（checkClaim 只有三列）。ownerPid===null = 幽灵认领（L0）；ownerAlive
+   * 由 pid 存活推出；lastTouchedAt 在历史行回填前退化为 acquiredAt（非 null）。
+   * 无 claim（或降级 nullDb）→ null，调用方按「无冲突」处理。
+   */
+  claimLiveness(filePath: string): ClaimLiveness | null {
+    const row = this.safeGet<{
+      ownerSessionId: string
+      ownerPid: number | null
+      claimType: 'exclusive' | 'shared_read'
+      acquiredAt: string
+      lastTouchedAt: string | null
+    }>(
+      `SELECT c.session_id AS ownerSessionId, c.claim_type AS claimType,
+              c.acquired_at AS acquiredAt, c.last_touched_at AS lastTouchedAt,
+              s.pid AS ownerPid
+       FROM claims c LEFT JOIN sessions s ON s.id = c.session_id
+       WHERE c.file_path = ? LIMIT 1`,
+      filePath,
+    )
+    if (!row) return null
+    return {
+      ownerSessionId: row.ownerSessionId,
+      ownerPid: row.ownerPid ?? null,
+      ownerAlive: row.ownerPid != null ? this.isProcessRunning(row.ownerPid) : false,
+      claimType: row.claimType,
+      acquiredAt: row.acquiredAt,
+      lastTouchedAt: row.lastTouchedAt ?? row.acquiredAt,
+    }
   }
 
   reapStaleClaims(): string[] {

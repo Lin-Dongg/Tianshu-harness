@@ -8,7 +8,7 @@
  * 丢弃假标记之后的**全部真实输出**——即『假续跑』。会话库必须单写者：
  * 拿不到锁的进程不碰会话库（后续波次在 serve.ts 接线时拒绝启动并显示横幅）。
  *
- * 与 CronLock 的关系：同一套 PID 租约锁机制（O_EXCL 原子创建 + hard-link 发布、
+ * 与 CronLock 的关系：同一套 PID 租约锁机制（O_EXCL 原子创建 + hard-link / 非空目录原子发布、
  * 存活探测、串行 reclaim），底层原语直接复用 src/server/cron-lock.ts 的导出，
  * 不复制实现。差异（本模块扩展的部分）：
  *   1. 有界重试 acquire（默认 5s 窗口）——覆盖监管器『杀旧进程 → 拉起新进程』的交接；
@@ -27,7 +27,7 @@
  *   - 心跳 > 10 分钟才判死（实测最长卡顿 19s，监管器强杀上限 180s，余量充足）。
  */
 
-import { existsSync, readFileSync, statSync, unlinkSync, utimesSync } from 'node:fs'
+import { existsSync, readFileSync, statSync, utimesSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { hostname as osHostname } from 'node:os'
@@ -39,6 +39,7 @@ import {
   createLockFileExclusive,
   isPidAlive,
   readLockFile,
+  removeLockFile,
   type LockInfo,
 } from './cron-lock.js'
 
@@ -271,7 +272,7 @@ export class StoreLock {
     this.stopHeartbeat()
     try {
       const owner = readLockFile(this.lockPath)
-      if (owner && this.isOwnLockInfo(owner)) unlinkSync(this.lockPath)
+      if (owner && this.isOwnLockInfo(owner)) removeLockFile(this.lockPath)
     } catch {
       // 清理尽力而为
     }
@@ -425,7 +426,7 @@ export class StoreLock {
       }
 
       try {
-        unlinkSync(this.lockPath)
+        removeLockFile(this.lockPath)
       } catch {
         // 其他进程可能已经删掉旧锁；继续走 O_EXCL 竞争
       }
@@ -458,7 +459,7 @@ export class StoreLock {
     if (owner && this.isOwnLockInfo(owner)) return { ok: true }
     if (owner && !isPidAlive(owner.pid)) {
       try {
-        unlinkSync(path)
+        removeLockFile(path)
       } catch {
         // 其他进程可能已经接管 reclaim 锁
       }
@@ -473,7 +474,7 @@ export class StoreLock {
     const path = this.reclaimLockPath()
     try {
       const owner = readLockFile(path)
-      if (owner && this.isOwnLockInfo(owner)) unlinkSync(path)
+      if (owner && this.isOwnLockInfo(owner)) removeLockFile(path)
     } catch {
       // 清理尽力而为
     }

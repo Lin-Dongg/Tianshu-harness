@@ -166,6 +166,29 @@ describe('loopback default bind (127.0.0.1)', () => {
   })
 })
 
+describe('/health 鉴权旁路边界（2026-10-07 审计加固）', () => {
+  test('/health stays auth-free without bearer', async () => {
+    await withServer({}, async ({ port }) => {
+      const r = await rawRequest(port, { path: '/health', hostHeader: `127.0.0.1:${port}` })
+      assert.equal(r.status, 200)
+    })
+  })
+
+  test('/health?probe=1 still bypasses auth (冷启动探测兼容)', async () => {
+    await withServer({}, async ({ port }) => {
+      const r = await rawRequest(port, { path: '/health?probe=1', hostHeader: `127.0.0.1:${port}` })
+      assert.notEqual(r.status, 401, 'query 变体不得回落到 Bearer 校验（原 startsWith 行为保留）')
+    })
+  })
+
+  test('/healthfoo no longer bypasses auth（精确匹配修复：无 bearer → 401）', async () => {
+    await withServer({}, async ({ port }) => {
+      const r = await rawRequest(port, { path: '/healthfoo', hostHeader: `127.0.0.1:${port}` })
+      assert.equal(r.status, 401)
+    })
+  })
+})
+
 describe('LAN bind (0.0.0.0) — bearer-gated host passthrough', () => {
   test('foreign host with bearer is accepted', async () => {
     await withServer({ host: '0.0.0.0' }, async ({ port }) => {

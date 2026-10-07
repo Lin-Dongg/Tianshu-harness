@@ -64,7 +64,7 @@ describe('runThetaCheck — 共享闸门结论的只读消费者', () => {
   it('无缓存条目时诚实返回 no-fresh-verdict，且不 spawn tsc', async () => {
     const dir = makeRepo()
     const start = Date.now()
-    const result = await runThetaCheck(dir, 15_000)
+    const result = await runThetaCheck(dir)
     const elapsed = Date.now() - start
 
     assert.equal(result.outcome, 'no-fresh-verdict')
@@ -83,7 +83,7 @@ describe('runThetaCheck — 共享闸门结论的只读消费者', () => {
     const dir = makeRepo()
     seedVerdict(dir, { status: 0, stdout: '' })
 
-    const result = await runThetaCheck(dir, 15_000)
+    const result = await runThetaCheck(dir)
 
     assert.equal(result.outcome, 'ok')
     assert.deepEqual(result.errors, [])
@@ -101,7 +101,7 @@ describe('runThetaCheck — 共享闸门结论的只读消费者', () => {
       ].join('\n'),
     })
 
-    const result = await runThetaCheck(dir, 15_000)
+    const result = await runThetaCheck(dir)
 
     assert.equal(result.outcome, 'type_errors')
     assert.deepEqual(result.errors, ['broken.ts'])
@@ -112,7 +112,7 @@ describe('runThetaCheck — 共享闸门结论的只读消费者', () => {
     const dir = makeRepo()
     mkdirSync(join(defaultCacheDir(dir), 'run.lock'), { recursive: true })
 
-    const result = await runThetaCheck(dir, 15_000)
+    const result = await runThetaCheck(dir)
 
     assert.equal(result.outcome, 'busy')
     assert.deepEqual(result.errors, [])
@@ -123,7 +123,7 @@ describe('runThetaCheck — 共享闸门结论的只读消费者', () => {
     // 用 theta 自己那套旧参数（--skipLibCheck）写条目——它不是门禁的 variant
     seedVerdict(dir, { status: 0, stdout: '' }, '--noEmit --pretty false --skipLibCheck')
 
-    const result = await runThetaCheck(dir, 15_000)
+    const result = await runThetaCheck(dir)
 
     assert.equal(result.outcome, 'no-fresh-verdict', 'variant 是缓存桶的一部分，不得跨桶命中')
   })
@@ -132,7 +132,7 @@ describe('runThetaCheck — 共享闸门结论的只读消费者', () => {
     const dir = mkdtempSync(join(tmpdir(), 'theta-nogit-'))
     tempDirs.push(dir)
 
-    const result = await runThetaCheck(dir, 15_000)
+    const result = await runThetaCheck(dir)
 
     assert.equal(result.outcome, 'no-fresh-verdict')
     assert.deepEqual(result.errors, [])
@@ -142,7 +142,7 @@ describe('runThetaCheck — 共享闸门结论的只读消费者', () => {
     const dir = makeRepo()
     seedVerdict(dir, { status: 0, stdout: '' })
 
-    const result = await runThetaCheck(dir, 15_000)
+    const result = await runThetaCheck(dir)
 
     assert.equal(result.durationMs, 0, '回放路径不得把它人跑出的耗时记成自己的')
   })

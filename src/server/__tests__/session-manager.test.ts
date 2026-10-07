@@ -1665,15 +1665,15 @@ test('PlusMenu: setSkillEnabled toggles disabled set + applies to live agent', a
   const { manager, agents } = makePlusManager()
   const s = manager.createSession({})
   manager.run(s.id, 'go') // build agent so live-apply path runs
-  assert.equal(manager.setSkillEnabled(s.id, 'leave-ritual', false), true)
-  assert.ok(agents[0]!.disabled.has('leave-ritual'))
+  assert.equal(manager.setSkillEnabled(s.id, 'skill-management', false), true)
+  assert.ok(agents[0]!.disabled.has('skill-management'))
   const ev = manager.getEvents(s.id, 0)!.events.find((e) => e.type === 'skills_changed')!
-  assert.equal(ev.data.name, 'leave-ritual')
+  assert.equal(ev.data.name, 'skill-management')
   assert.equal(ev.data.enabled, false)
 
   // Re-enabling removes it from the disabled set.
-  manager.setSkillEnabled(s.id, 'leave-ritual', true)
-  assert.equal(agents[0]!.disabled.has('leave-ritual'), false)
+  manager.setSkillEnabled(s.id, 'skill-management', true)
+  assert.equal(agents[0]!.disabled.has('skill-management'), false)
 })
 
 test('PlusMenu: missing session yields undefined/false from menu methods', async () => {

@@ -1,3 +1,6 @@
+import { buildUpdateRestartRoutes } from './update-restart-routes.js'
+import { disposeAllBrowserContexts } from './browser-contexts.js'
+import { disposeSessionFilePreviews } from './file-open-routes.js'
 /**
  * `rivet serve` — HTTP+SSE Runtime API entry, extracted from the legacy Ink
  * entry so it ships from the release build (`dist/main.js`). Used directly as a
@@ -51,7 +54,7 @@ import { existsSync } from 'node:fs'
 import { CronScheduler, setActiveScheduler, setScheduleWriteGuard, setUnattendedAutomationGate } from './cron-scheduler.js'
 export { installParentWatchdog, probeParentAlive, maxMissesFromGraceEnv, type ParentWatchdogOptions } from './parent-watchdog.js'
 import { writeServerInfo, clearServerInfo, enableJsonModeStdoutPurity, attachOrExit, printSpawnedHandshake, type ServerInfo } from './server-info.js'
-import { parseHostsAllow } from './host-policy.js'
+import { isLoopbackBind, parseHostsAllow } from './host-policy.js'
 import { setShutdownHandler } from './shutdown-registry.js'
 import { CronWiring } from './cron-wiring.js'
 import { buildMcpRoutes } from './mcp-api.js'
@@ -677,6 +680,12 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
   // RIVET_SERVE_HOST 可达，零 Rust 改动）> 默认 127.0.0.1（行为不变）。
   const host = (opts.host ?? process.env.RIVET_SERVE_HOST)?.trim() || '127.0.0.1'
   const allowedHosts = opts.allowedHosts ?? parseHostsAllow(process.env.RIVET_SERVE_HOSTS_ALLOW)
+  // LAN 模式提醒（2026-10-07 审计 Finding 3 的文档侧缓解）：非回环绑定 = 明文 HTTP
+  // 无 TLS，Bearer 是唯一凭证。刻意不改默认行为（强制 allowlist 会破坏「手机远程」
+  // 既有流），只做如实提醒；配了 allowlist 的不重复唠叨。
+  if (!isLoopbackBind(host) && !(allowedHosts && allowedHosts.length > 0)) {
+    console.warn('[serve] LAN 模式（非回环绑定）为明文 HTTP，Bearer 是唯一凭证；且未配置 RIVET_SERVE_HOSTS_ALLOW（任意 Host 放行）。请仅在可信网络使用。')
+  }
   // /mobile 静态目录：显式 opts（--mobile-dir / 测试注入）> env（桌面壳注入）> 未配置。
   const mobileDir = (opts.mobileDir ?? process.env.RIVET_MOBILE_DIR)?.trim() || undefined
   const ctx = opts.context ?? resolveServeContext()
@@ -723,10 +732,10 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
     storeLockDegraded = !ownsSessionStore
     if (!ownsSessionStore) {
       // 降级运行：createAgent 见 initializationError 即拒绝建会话（下文 gateway 工厂）。
-      initializationError = 'data-dir-locked'
+      initializationError = lockState.status === 'error' ? 'data-dir-lock-error' : 'data-dir-locked'
       const holder = lockState.status === 'contended' ? lockState.holder : undefined
       serverLogger.error(
-        `[serve] 会话库已被别的进程独占（${lockState.status}`
+        `[serve] ${lockState.status === 'error' ? '会话库锁创建失败' : '会话库已被别的进程独占'}（${lockState.status}`
         + `${lockState.status === 'contended' ? `: ${lockState.reason}` : ''}）——降级运行，不触碰会话库`,
         { holder, reason: lockState.status === 'error' ? lockState.reason : undefined },
       )
@@ -965,7 +974,7 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
     },
   }
 
-  const routes = createRoutes(state, {
+  const routes = new Proxy(createRoutes(state, {
     startPrompt: (prompt) => {
       const rec = sessions.createSession({
         title: prompt.trim().slice(0, 80),
@@ -995,6 +1004,15 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
       }
     },
     sseRegistry,
+  }), {
+    get(target, key: string) {
+      const handler = target[key]
+      if (typeof handler !== 'function') return handler
+      return (...args: Parameters<typeof handler>) => {
+        if (sessions.isUpdateRestartPreparing() && !key.startsWith('GET ') && !['POST /shutdown', 'POST /runtime/update-cancel', 'POST /runtime/update-prepare'].includes(key)) return { status: 409, body: { error: 'UPDATE_PREPARING' } }
+        return handler(...args)
+      }
+    },
   })
 
   // Multi-session routes (M0.5 → M3): /sessions/*. R3 rollback routes consult
@@ -1005,6 +1023,8 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
     reloadConfig: () => resolveServeContext().config,
     sseRegistry,
   }))
+
+  Object.assign(routes, buildUpdateRestartRoutes(sessions, apiToken))
 
   // Mission routes (P1 任务身份化): /missions/* — 与 session-manager 共享同一 store。
   Object.assign(routes, buildMissionRoutes(missionStore, apiToken))
@@ -1308,6 +1328,8 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
       // 共享资源要等 claims/worker finally 完成后再拆，避免 handoff 紧接着
       // 进入同一工作区时撞上上一会话的文件归属。
       const finish = async () => {
+        await disposeAllBrowserContexts()
+        disposeSessionFilePreviews()
         // 先收执行后端：隔离模式下这是 kill 每个会话执行进程的第一道口。
         await executionBackend.close().catch(() => {})
         void wiring?.stop()

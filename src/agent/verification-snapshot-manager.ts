@@ -29,11 +29,55 @@ import { decideSnapshotPolicy, type SnapshotDecision } from './snapshot-policy.j
 import { snapshotRefFor } from './snapshot-ref.js'
 import { isPidAlive } from './repo-lock.js'
 import { removeWorktree } from './worktree.js'
+import { spawnGitSync } from '../tools/spawn-git.js'
 
 export interface VerificationSnapshotPlan {
   path: string
   snapshotRef: string
   decision: SnapshotDecision
+  /** 工作树里 dirty、但不在 owned（本会话**工具写入**）内的文件——快照不会重放
+   *  它们。典型来源：经 bash 脚本改的文件（`npx tsx codegen`、`npm run gen`）。
+   *  隔离结果可能不反映这些改动，run_tests 据此在阶段 A 输出里显式点名，
+   *  避免「快照红但原因不可见」的静默误导。 */
+  omittedDirtyFiles?: string[]
+}
+
+/** 从 `git status --porcelain` 输出里挑出「dirty 但不在 owned 内」的路径。
+ *
+ *  快照只重放 owned（本会话**工具写入**）的文件；经 bash 脚本改的文件（例如
+ *  `npx tsx scripts/gen-env-registry.ts`）不在其中，隔离跑测试时看不到它们的
+ *  改动——2026-10-06 实测：快照内 env-registry 仍是 HEAD 版、工作树已改。
+ *  这里把差集挑出来交给 run_tests 点名，让缺口可见而不是静默。 */
+export function parseOmittedDirtyPaths(statusPorcelain: string, ownedFiles: string[]): string[] {
+  const normalize = (p: string) => p.replaceAll('\\', '/').replace(/^\.\//, '').replace(/^\/+/, '')
+  const owned = ownedFiles.map(normalize)
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const line of statusPorcelain.split('\n')) {
+    if (line.length < 4) continue
+    let rel = normalize(line.slice(3).trim().replace(/^"(.*)"$/, '$1'))
+    if (rel.includes(' -> ')) rel = normalize(rel.split(' -> ').pop() ?? rel) // rename: 取新路径
+    if (!rel || seen.has(rel)) continue
+    seen.add(rel)
+    // owned 可能是绝对路径或带前缀：后缀匹配兜住形态差异。
+    if (owned.some(o => o === rel || o.endsWith(`/${rel}`) || rel.endsWith(`/${o}`))) continue
+    out.push(rel)
+    if (out.length >= 20) break
+  }
+  return out
+}
+
+/** git 侧薄封装：拿不到状态时返回空（可见性增强不得影响主流程）。 */
+function listOmittedDirtyFiles(baseCwd: string, ownedFiles: string[]): string[] {
+  try {
+    const r = spawnGitSync(['status', '--porcelain'], {
+      cwd: baseCwd, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10_000,
+    })
+    if (r.status !== 0 || typeof r.stdout !== 'string') return []
+    return parseOmittedDirtyPaths(r.stdout, ownedFiles)
+  } catch {
+    return []
+  }
 }
 
 export interface VerificationSnapshotManagerInit {
@@ -123,7 +167,10 @@ export function createVerificationSnapshotManager(
     }
     activeRef = ref
 
-    return { path: snapshot.path, snapshotRef: ref, decision }
+    // 快照只重放 owned（工具写入）的文件；把工作树里其余 dirty 文件挑出来交给
+    // run_tests 点名，避免「隔离红但原因不可见」（bash 脚本改的文件不在快照里）。
+    const omittedDirtyFiles = listOmittedDirtyFiles(init.baseCwd, ownedFiles)
+    return { path: snapshot.path, snapshotRef: ref, decision, ...(omittedDirtyFiles.length > 0 ? { omittedDirtyFiles } : {}) }
   }
 
   return {

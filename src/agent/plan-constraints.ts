@@ -25,6 +25,7 @@
 import { readFileSync, statSync } from 'node:fs'
 import { isAbsolute, join, relative, sep } from 'node:path'
 import { validatePathSafe } from '../tools/path-validate.js'
+import { projectSurfaceAllowed } from '../config/project-trust.js'
 import { listPlansSync } from '../plan/plan-store.js'
 import { MAX_TASK_CONSTRAINT_CHARS } from './work-order.js'
 
@@ -290,6 +291,8 @@ export function resolvePlanConstraints(cwd: string, src: PlanConstraintSource): 
 export function resolvePlanContract(cwd: string, src: PlanConstraintSource): ResolvedPlanContract {
   const noRef: ResolvedPlanContract = { constraints: [] }
   if (process.env.RIVET_PLAN_CONSTRAINTS === '0') return noRef
+  // 未授信项目不把 .rivet/plans/*.md 解析成 worker 约束（2026-10-07 审计 Finding 1e）。
+  if (!projectSurfaceAllowed(cwd, 'plans')) return noRef
   const explicitRef = src.planRef ? planRefFor(cwd, src.planRef) : undefined
   const withRef = (c: ResolvedPlanContract): ResolvedPlanContract => (explicitRef ? { ...c, planRef: explicitRef } : c)
   try {
@@ -353,6 +356,8 @@ export function resetApprovedPlanCache(): void {
 /** 从最近的 APPROVED 计划提取计划约束（executed/rejected 不算——已交付或已弃）。
  *  零接线回退：无显式源时用它。任何异常返回 undefined（advisory，绝不阻断派发）。 */
 export function findApprovedPlanConstraints(cwd: string): string[] | undefined {
+  // 未授信项目不解析计划（同 resolvePlanContract 契约，2026-10-07 审计 Finding 1e）。
+  if (!projectSurfaceAllowed(cwd, 'plans')) return undefined
   try {
     let dirMtimeMs = -1
     try {

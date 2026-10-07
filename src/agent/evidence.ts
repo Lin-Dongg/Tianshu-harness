@@ -151,7 +151,7 @@ export class EvidenceTracker implements EvidenceTrackerPublic {
     }
     // TDD gate: any test run (pass, fail, or blocked) resets the consecutive-edit counter.
     // The gate targets zero-verification editing, not test-pass enforcement.
-    this.#editsSinceLastTest = 0
+    if (!result.stale) this.#editsSinceLastTest = 0
     this.applyVerificationLevels(result)
     this.refreshDeliveryStatus()
     try {
@@ -211,7 +211,7 @@ export class EvidenceTracker implements EvidenceTrackerPublic {
   }
 
   private applyVerificationLevels(result: VerificationMetadata): void {
-    if (result.status !== 'passed') return
+    if (result.status !== 'passed' || result.stale) return
     const level = this.inferVerificationLevel(result.command)
     const targets = this.inferVerifiedFiles(result, level)
     for (const file of targets) {
@@ -230,7 +230,7 @@ export class EvidenceTracker implements EvidenceTrackerPublic {
   private inferVerifiedFiles(result: VerificationMetadata, level: VerificationLevel): string[] {
     const modified = [...this.state.filesModified]
     if (result.scope === 'full') return level === 'typed' ? modified.filter(f => /\.tsx?$/.test(f)) : modified
-    const targets = result.targetFiles ?? inferBashVerificationScope(result.command).targetFiles ?? []
+    const targets = result.targetFiles ?? inferBashVerificationScope(result.command)?.targetFiles ?? []
     const normalize = (path: string) => path.replaceAll('\\', '/').replace(/^\.\//, '')
     const normalizedTargets = targets.flatMap(target => {
       const normalized = normalize(target)

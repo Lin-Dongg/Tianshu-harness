@@ -1,6 +1,6 @@
 import { describe, it, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, existsSync } from 'node:fs'
+import { mkdtempSync, rmSync, existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { SessionJobs, type JobEvent } from '../job-store.js'
@@ -26,8 +26,8 @@ describe('SessionJobs', () => {
     dir = m.dir
   })
 
-  after(() => {
-    store.killAll()
+  after(async () => {
+    await store.killAllAsync()
     rmSync(dir, { recursive: true, force: true })
   })
 
@@ -133,6 +133,29 @@ describe('SessionJobs', () => {
     assert.equal(store.hasRunning(), false)
   })
 
+  it('killAllAsync waits for killed jobs to close and flush their logs', async () => {
+    const local = makeStore()
+    const exits: string[] = []
+    local.store.on('event', (event: JobEvent) => {
+      if (event.kind === 'exit') exits.push(event.job.id)
+    })
+    try {
+      const a = local.store.spawn({ command: "sh -c 'echo BEFORE-KILL; sleep 30'", rawCommand: 'long job', cwd: local.dir, env })
+      await local.store.await(a.id, { pattern: 'BEFORE-KILL', timeoutMs: 5000 })
+      local.store.kill(a.id) // Already killed does not mean its handles are closed.
+      const b = local.store.spawn({ command: "sh -c 'sleep 30'", rawCommand: 'immediate kill', cwd: local.dir, env })
+      await local.store.killAllAsync()
+      assert.ok(exits.includes(a.id) && exits.includes(b.id), 'both child close events must precede async cleanup return')
+      assert.ok(local.store.list().every(job => job.status === 'killed' && job.endedAt !== undefined))
+      assert.match(readFileSync(join(local.dir, 'jobs', `${a.id}.log`), 'utf8'), /BEFORE-KILL/)
+      rmSync(local.dir, { recursive: true }) // Windows must have no open log handles.
+      await local.store.killAllAsync() // Idempotent after successful cleanup.
+    } finally {
+      await local.store.killAllAsync()
+      rmSync(local.dir, { recursive: true, force: true })
+    }
+  })
+
   it('kill on an already-exited job returns false and preserves the real exit code', async () => {
     const snap = store.spawn({ command: "sh -c 'exit 3'", rawCommand: 'exit 3', cwd: dir, env })
     const res = await store.await(snap.id, { timeoutMs: 5000 })
@@ -173,7 +196,7 @@ describe('SessionJobs', () => {
       await new Promise((r) => setTimeout(r, 150))
       assert.equal(beats.length, n, 'await resolve 后心跳必须停止')
     } finally {
-      hbStore.killAll()
+      await hbStore.killAllAsync()
       rmSync(hbDir, { recursive: true, force: true })
     }
   })

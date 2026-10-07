@@ -247,7 +247,7 @@ interface SessionStores {
  * overwrites it. Call forgetSessionStores when a session is permanently
  * destroyed to bound memory.
  */
-const sessionStoresById = new Map<string, { stores: SessionStores; cwd: string }>()
+const sessionStoresById = new Map<string, { stores: SessionStores; cwd: string; currentModelRef?: () => string }>()
 
 /** Late-bound goal handles for the session-manager's goal methods. Returns
  *  undefined when no stores have been built for this session yet (idle /
@@ -268,6 +268,7 @@ export function resolveGoalHandles(
   if (!entry) return undefined
   return {
     goalTrackerRef: entry.stores.refs.goalTrackerRef,
+    currentModelRef: entry.currentModelRef?.(),
     sessionDir: getSessionDir(entry.cwd),
     ...(config?.workers?.profiles?.cheap ? { cheapProfile: config.workers.profiles.cheap } : {}),
     ...(config?.provider?.providers ? { allProviders: config.provider.providers } : {}),
@@ -376,8 +377,7 @@ function buildSessionStores(
   applyConfiguredPathGrants(ctx.config.agent.permissions)
   applyDefaultDependencyReadGrants()
   applyRivetRuntimeReadGrants()
-  // Load skills into the shared registry (same as CLI bootstrap). Without this,
-  // skillRegistry.list() returns empty and the desktop PlusMenu shows no skills.
+  // Seed legacy skills; AgentLoop pins its independent catalog before running.
   const skillLoad = loadProjectSkills(cwd, { importFromClaude: ctx.config.skills?.importFromClaude })
   recordSkillLoadErrors(sessionId, skillLoad.errors) // 此前丢弃；见 skill-load-errors.ts
   // Undo/rewind must follow the write tools' exclusive-claim discipline too;
@@ -842,10 +842,9 @@ export function buildManagedAgent(
   expectedTranscriptWatermark?: number,
 ): import('./session-manager.js').ManagedAgent {
   const stores = buildSessionStores(ctx, cwd, sessionId, registry, shared, prepared, expectedTranscriptWatermark)
-  // Register stores so the session-manager's goal methods can reach
-  // refs.goalTrackerRef + sessionDir via resolveGoalHandles. Overwrites any
-  // stale entry from a prior build of the same session (switchModel rebuild).
-  sessionStoresById.set(sessionId, { stores, cwd })
+  // Expose stores and the live model to session-manager; replace stale rebuild entries.
+  sessionStoresById.set(sessionId, { stores, cwd, currentModelRef: () => spec.keyId
+    ? `${spec.provider.name}:${spec.keyId}:${spec.model.id}` : `${spec.provider.name}:${spec.model.id}` })
   // Model affinity: a rehydrated session carries the model its prefix cache
   // was built on (record.model → preferredModelId). Build directly on it so a
   // resumed conversation never silently lands on the default model. Falls back
@@ -917,7 +916,8 @@ export function buildManagedAgent(
     resetSessionDomain: () => agent.resetSessionDomain(),
     restoreAutoResolvedDomain: (domain) => agent.restoreAutoResolvedDomain(domain),
     getSessionDomain: () => agent.getSessionDomain(),
-    // PlusMenu — skills (per-session discovery filter on the live agent).
+    markSkillInvoked: (name) => agent.markSkillInvoked(name),
+    getSkillSnapshot: () => agent.config.promptEngine.getSkillRegistry().list(),
     setDisabledSkills: (names) => agent.setDisabledSkills(names),
     // PlusMenu — model hot-switch (rebuild on the same SessionContext).
     // Wave C-followup P0: createAgentRuntime 在 refs 上原地装新 coordinator/

@@ -359,9 +359,9 @@ function deriveVisionBridgeStatus(
   input: AgentConfigInput,
 ): AgentConfig['visionBridge'] {
   if (primarySupportsVision) {
-    // source 必须与「桥接生效」可区分：桌面端只把 'native' 渲染成「原生支持」，
-    // 其余 active 状态一律显示「识图桥已生效」——沿用 'none' 会让用户看到一句
-    // 不实的状态（配了视觉主模型却被告知桥在工作）。2026-09-12 核实。
+    // source 必须与「桥接生效」可区分：桌面端按 native / same-provider / auto /
+    // configured 各写一句。沿用 'none' 会让配了视觉主模型的人看到「桥在工作」。
+    // 2026-09-12 核实；2026-10-07 起 configured 不再和 auto 共用「另一家」。
     return { active: true, source: 'native', detail: '主模型原生支持识图，无需桥接' }
   }
   if (bridge) {

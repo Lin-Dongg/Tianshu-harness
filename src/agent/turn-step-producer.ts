@@ -1,3 +1,4 @@
+import { applySessionSkillModes } from '../skills/session-skill-policy.js'
 import { getTodos } from '../tools/todo.js'
 import type { AgentLoop } from './loop.js'
 import type { AgentCallbacks } from './loop-types.js'
@@ -18,7 +19,6 @@ import { getGitInjectedContext } from '../prompt/volatile-git.js'
 import { detectWorktreeReality, type InjectedWorktreeContext, type WorktreeReality } from './worktree-reality.js'
 import { advanceContractStatus, classifyPlanMethodology, classifyTaskDepth, classifyTurnMode, contractStatusFromPhaseClass, extractTaskContract, mergeFollowUpIntoContract, type TurnMode } from '../context/task-contract.js'
 import { shouldSuggestPlanMode, buildPlanModeSuggestAdvisory, buildPlanModeAutoEnterAdvisory, buildStructureFlowPlanAdvisory, planModeSuggestMode } from './plan-mode-advisor.js'
-import { skillRegistry } from '../skills/skill-loader.js'
 import { detectQuizLike } from './intent-retrieval-route.js'
 import { renderMemoryBlock } from '../memory/unified-memory.js'
 import { reviewAdaptiveMemory } from '../memory/adaptive-stm.js'
@@ -461,9 +461,9 @@ export class TurnStepProducer {
       // U6: no active task — drop any prior trace + clear its prompt surfaces.
       this.self.planTraceCoordinator.closeTrace()
     }
-
+    applySessionSkillModes(this.self.cwd, this.self.config.sessionId, this.self.config.promptEngine.getSkillRegistry(), this.self.getDisabledSkills())
     this.self.config.promptEngine.setSkillAdvisoryBlock(
-      skillRegistry.renderDiscoveryBlock(userInput, { exclude: this.self.getDisabledSkills() }),
+      this.self.config.promptEngine.getSkillRegistry().renderDiscoveryBlock(userInput, { exclude: this.self.getDisabledSkills() }),
     )
     // 三路都走 appendixDelta，永不改 frozen prefix：精选常驻、意图门控 STM、
     // 显式 A/B 全量注入。adaptive-memory 默认 shadow，RIVET_ADAPTIVE_MEMORY=on 开启。

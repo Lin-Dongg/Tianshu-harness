@@ -784,13 +784,20 @@ export const workerRoutingSchema = z.record(z.string(), z.string()).default({
   planning: 'cheap-flash',
 })
 
+/** patcher 工蜂的模型能力地板（config.workers.patcherTier）。三值封闭枚举——
+ *  导出给加载期修复复用（manager.ts 的 migrateInvalidWorkerTiers 判合法值）。 */
+export const WORKER_PATCHER_TIERS = ['cheap', 'balanced', 'strong'] as const
+
+/** 失败升档天花板（config.workers.escalationCap）。同上，导出复用。 */
+export const WORKER_ESCALATION_CAPS = ['off', 'balanced', 'strong'] as const
+
 export const workersSchema = z.object({
   profiles: z.record(z.string(), workerProfileSchema).default({}),
   routing: workerRoutingSchema,
   /** 天梁 patcher 子代理的默认 tier（config.workers.patcherTier）。
    *  flash 能力足以承担各级风险的执行任务，默认 'cheap'（不因 riskTier 预判降级
    *  ——浪费生产力）；可设 'balanced' 或 'strong' 让执行者用更强模型（如 DeepSeek Pro）。 */
-  patcherTier: z.enum(['cheap', 'balanced', 'strong']).default('cheap'),
+  patcherTier: z.enum(WORKER_PATCHER_TIERS).default('cheap'),
   /** 失败升档天花板。只约束**失败驱动**的档位升级——规则升档
    *  （consecutiveFailures≥2 → strong）与 Flash→Pro 升档重试；
    *  不影响前置路由（workers.routing 如 planning→capable、planner hardFloor、
@@ -799,7 +806,7 @@ export const workersSchema = z.object({
    *  的数十倍；而规划类 worker 从小上下文起步，前置用强模型成本可控。
    *  'off'（默认）= 失败不升档，重试留在原档模型；
    *  'balanced' = 最多升到 balanced 卡重试；'strong' = 旧的自动升 Pro 行为。 */
-  escalationCap: z.enum(['off', 'balanced', 'strong']).default('off'),
+  escalationCap: z.enum(WORKER_ESCALATION_CAPS).default('off'),
 }).default({})
 
 export const skillsSchema = z.object({

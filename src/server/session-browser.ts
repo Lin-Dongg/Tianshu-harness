@@ -1,3 +1,4 @@
+import { createBrowserContext, contextFor, renewBrowserContext, disposeBrowserContext } from './browser-contexts.js'
 import { withWorkspaceRoots } from '../tools/workspace-context.js'
 import type { BrowserDebugDriver } from '../tools/browser-debug/driver.js'
 import { copyFileSync, constants } from 'node:fs'
@@ -32,9 +33,13 @@ export function buildSessionBrowserRoutes(
 ): Record<string, RouteHandler> {
   const routes: Record<string, RouteHandler> = {
     'GET /sessions/:id/browser': withAuth(async (_body, params) => {
-      const id = params!.id!
-      if (!manager.getSession(id))
+      const sessionId = params!.id!
+      let context
+      try { context = params?.contextId !== undefined ? contextFor(sessionId, params.contextId) : undefined } catch (e) { return browserErrorResponse(e) }
+      const id = context?.browserKey ?? sessionId
+      if (!manager.getSession(sessionId))
         return { status: 404, body: { error: 'Session not found' } }
+      if (context) renewBrowserContext(context)
       const session = getSession(id)
       if (!session)
         return {
@@ -60,16 +65,17 @@ export function buildSessionBrowserRoutes(
               ready: Boolean(d.path),
             })),
             ready: true,
+            ...(context ? { errors: session.log.getConsole('error').filter(e => !/^Failed to load resource:/i.test(e.text)).slice(-5).map(e => e.text) } : {}),
           },
         }
       } catch (error) { return browserErrorResponse(error) }
     }, apiToken),
     'POST /sessions/:id/browser': withAuth(async (body, params) => {
-      const id = params!.id!,
-        record = manager.getSession(id)
+      const sessionId = params!.id!, record = manager.getSession(sessionId)
       if (!record) return { status: 404, body: { error: 'Session not found' } }
       const data = (body ?? {}) as {
         action?: string
+        contextId?: string
         url?: unknown
         pageId?: string
         text?: string
@@ -86,8 +92,11 @@ export function buildSessionBrowserRoutes(
         expectedInteractionId?: unknown
       }
       try {
+        const context = data.contextId !== undefined ? contextFor(sessionId, data.contextId) : undefined
+        const id = context?.browserKey ?? sessionId
+        if (context) renewBrowserContext(context)
         if (data.action === 'control') {
-          if (data.owner !== 'user' && data.owner !== 'agent')
+          if ((context && data.owner !== 'user') || (data.owner !== 'user' && data.owner !== 'agent'))
             throw new BrowserOperationError('invalid_input', 'Invalid owner')
           await takeBrowserControl(id, data.owner, {
             beforeChange: async () => { await getSession(id)?.frames.releaseInput() },
@@ -110,6 +119,7 @@ export function buildSessionBrowserRoutes(
           'upload',
           'download',
           'release',
+          'screenshot',
         ]
         if (!allowed.includes(data.action ?? ''))
           throw new BrowserOperationError('invalid_input', 'Invalid browser action')
@@ -118,7 +128,9 @@ export function buildSessionBrowserRoutes(
             ? browserUrl(data.url)
             : undefined
         const result = await browserOperation(id, 'user', async () => {
+          if (context) contextFor(sessionId, context.id)
           const existing = getSession(id)
+          if (context && existing && data.expectedInteractionId === undefined) throw new BrowserOperationError('stale_context', 'Context operations require an interaction identity')
           if (data.expectedInteractionId !== undefined) {
             if (!existing) throw new BrowserOperationError('stale_context', 'Browser instance changed')
             existing.frames.assertInteraction(data.expectedInteractionId)
@@ -126,9 +138,11 @@ export function buildSessionBrowserRoutes(
           const session = await getOrCreateSession({
             sessionKey: id,
             headless: true,
-            userDataDir: defaultUserDataDir(id),
+            userDataDir: context?.profile ?? defaultUserDataDir(id),
           })
+          if (context) contextFor(sessionId, context.id)
           const driver = session.driver
+          if (context && ['new', 'open'].includes(data.action!) && ((await driver.listPages?.()) ?? []).filter(p => p.url !== 'about:blank').length >= 8 && !((await driver.listPages?.()) ?? []).some(p => p.url === url)) throw new BrowserOperationError('resource_limit', 'Close an older file preview')
           if (data.action === 'viewport') {
             if (!Number.isInteger(data.width) || !Number.isInteger(data.height) || data.width! < 240 || data.width! > 4096 || data.height! < 120 || data.height! > 4096)
               throw new BrowserOperationError('invalid_input', 'Invalid viewport size')
@@ -173,6 +187,7 @@ export function buildSessionBrowserRoutes(
                   data.height! > 4096
                 )
                   throw new BrowserOperationError('invalid_input', 'Invalid viewport size')
+                if (context) session.frames.setOptions({ quality: 90, maxWidth: data.width!, maxHeight: data.height! })
                 await driver.setViewport(data.width!, data.height!)
                 break
               }
@@ -299,6 +314,12 @@ export function buildSessionBrowserRoutes(
                   selection: string
                 }
               }
+              case 'screenshot': {
+                session.frames.assertInteraction(data.expectedInteractionId)
+                const image = await driver.screenshot({ raw: true })
+                session.frames.assertInteraction(data.expectedInteractionId)
+                return { data: image.toString('base64'), mime: 'image/png' }
+              }
               case 'release':
                 await session.frames.releaseInput()
                 break
@@ -312,6 +333,21 @@ export function buildSessionBrowserRoutes(
       } catch (err) { return browserErrorResponse(err) }
     }, apiToken),
   }
+  routes['POST /sessions/:id/browser/contexts'] = withAuth(async (_body, params) => {
+    const sessionId = params!.id!
+    if (!manager.getSession(sessionId)) return { status: 404, body: { error: 'Session not found' } }
+    try {
+      const c = await createBrowserContext(sessionId)
+      if (!manager.getSession(sessionId)) { await disposeBrowserContext(sessionId, c.id); throw new BrowserOperationError('stale_context', 'Session was removed') }
+      const session = getSession(c.browserKey)
+      const pages = session ? await browserOperation(c.browserKey, 'user', async () => (await session.driver.listPages?.()) ?? []) : []
+      return { status: 200, body: { contextId: c.id, browserKey: c.browserKey, owner: 'user', ready: !!session, pages, interactionId: session?.frames.interactionId } }
+    } catch (e) { return browserErrorResponse(e) }
+  }, apiToken)
+  routes['DELETE /sessions/:id/browser/contexts/:contextId'] = withAuth(async (_body, params) => {
+    await disposeBrowserContext(params!.id!, params!.contextId!)
+    return { status: 200, body: { ok: true } }
+  }, apiToken)
   for (const [key,handler] of Object.entries(routes)) routes[key]=(body,params,headers,res)=>{
     const rec=params?.id?manager.getSession(params.id):undefined
     return rec?withWorkspaceRoots(rec.workspaceRoots??[rec.cwd],()=>handler(body,params,headers,res),rec.id):handler(body,params,headers,res)

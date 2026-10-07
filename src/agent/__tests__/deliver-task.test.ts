@@ -50,6 +50,7 @@ function makeContext(opts: {
   obligationStore?: import('../evidence-obligation.js').ObligationStore
   claimTracker?: import('../hooks/external-claim-tracking-hook.js').ClaimTracker
   scoutFirewall?: boolean
+  completeBaseline?: boolean
 }) {
   const baseline = createWorktreeBaseline({
     branch: 'feat/b1',
@@ -57,6 +58,7 @@ function makeContext(opts: {
     preExistingDirty: opts.externalFiles ?? [],
     preExistingUntracked: opts.preExistingUntracked ?? [],
     capturedAt: Date.now(),
+    complete: opts.completeBaseline,
   })
   const ledger = createTaskLedger({ taskId: opts.taskId })
   for (const f of opts.ownedFiles) ledger.record({ type: 'file_write', path: f })
@@ -3259,5 +3261,41 @@ describe('issue #356 — 门禁拒绝必须带结构化 errorKind（防文本正
     assert.equal(result.isError, true)
     assert.ok(result.content.includes('Scoped commit failed'))
     assert.equal(result.errorKind, 'delivery_gate', 'issue #356：commit 失败不得缺 errorKind（否则重试会重复进入 commit）')
+  })
+})
+
+
+describe('PR #371 — incomplete baseline commit boundary', () => {
+  for (const force of [false, true]) {
+    it(`blocks commit before invoking the executor (force=${force})`, async () => {
+      let commitCalls = 0
+      const { tool, params } = makeContext({
+        taskId: 'incomplete-commit',
+        ownedFiles: ['src/app.ts'],
+        dirtyFiles: ['src/app.ts'],
+        verifications: [{ command: 'npx vitest run', status: 'passed' }],
+        completeBaseline: false,
+        disableReviewDeps: true,
+        commitOwnedFiles: () => { commitCalls++; return { ok: true, output: 'unexpected commit' } },
+      })
+      const result = await tool.execute({ ...params, input: { commit: true, force, message: 'fix: app' } })
+      assert.equal(result.isError, true)
+      assert.equal(result.errorKind, 'delivery_gate')
+      assert.match(result.content, /归属基线未完整建立/)
+      assert.equal(commitCalls, 0)
+    })
+  }
+
+  it('still reports written files and verification for delivery without committing', async () => {
+    const { tool, params } = makeContext({
+      taskId: 'incomplete-report', ownedFiles: ['src/app.ts'], dirtyFiles: ['src/app.ts'],
+      verifications: [{ command: 'npx vitest run', status: 'passed' }],
+      completeBaseline: false, disableReviewDeps: true,
+    })
+    const result = await tool.execute({ ...params, input: {} })
+    assert.equal(result.isError ?? false, false)
+    assert.match(result.content, /Delivery Gate: YELLOW/)
+    assert.match(result.content, /Owned files \(1\):/)
+    assert.match(result.content, /src\/app\.ts/)
   })
 })

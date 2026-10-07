@@ -4,6 +4,11 @@ import { join } from 'node:path'
 import { mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { resolveAppPromptInput, handleSlashCommand, formatVerificationStatus, mcpStatusText, resolveBareSkillPrompt, type SlashHandlerContext } from '../slash-commands.js'
+
+// 信任门族（2026-10-07 审计修复）：技能解析现带信任门——本文件验「授信项目的
+// TUI slash 行为」正常语义（裸技能名用例走真实工作区技能目录）；未授信拒绝语义在
+// src/config/__tests__/project-trust-surface-gates.test.ts 覆盖。node:test 文件级进程隔离。
+process.env.RIVET_TRUST_PROJECT = '1'
 import { skillRegistry } from '../../skills/skill-loader.js'
 import { handleYoloToggle } from '../yolo-toggle.js'
 import { loadConstellation } from '../../constellation/store.js'

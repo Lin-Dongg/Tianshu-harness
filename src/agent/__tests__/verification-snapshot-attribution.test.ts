@@ -82,14 +82,15 @@ describe('attribution — integration_conflict (Phase B advisory)', () => {
       failed: 1,
       skipped: 0,
       durationMs: 100,
-      verificationPhase: 'integration', isolatedPassed: true, snapshotRef: 'current-ref', targetFiles: ['src/x.test.ts'],
+      kind: 'test', comparisonId: 'pair', verificationPhase: 'integration', isolatedPassed: true, snapshotRef: 'current-ref', targetFiles: ['src/x.test.ts'],
+      coverage: { version: 1, runId: 'b', runner: 'node-test', cwd: '/repo', repositoryRoot: '/repo', complete: false, executionComplete: true, filtered: false, files: [{ path: 'src/x.test.ts', outcome: 'failed', tests: 4, skipped: 0, cancelled: 0 }] },
     }
   }
 
-  it('classifies an integration-phase failure as non-blocking integration_conflict', () => {
+  it('integration flag without a matching isolated proof still blocks', () => {
     const result = attr.attribute(integrationFailure())
-    assert.equal(result.attribution, 'integration_conflict')
-    assert.equal(result.isBlocking, false)
+    assert.equal(result.attribution, 'owned_failure')
+    assert.equal(result.isBlocking, true)
   })
 
   it('a targeted failure WITHOUT integration phase still blocks (owned_failure)', () => {
@@ -103,6 +104,8 @@ describe('attribution — integration_conflict (Phase B advisory)', () => {
     const phaseA: VerificationMetadata = {
       command: 'run_tests src/x.test.ts', status: 'passed', scope: 'targeted',
       exitCode: 0, passed: 4, failed: 0, skipped: 0, durationMs: 100, verificationPhase: 'isolated',
+      kind: 'test', comparisonId: 'pair', snapshotRef: 'current-ref',
+      coverage: { ...integrationFailure().coverage!, runId: 'a', complete: true, files: [{ path: 'src/x.test.ts', outcome: 'passed', tests: 4, skipped: 0, cancelled: 0 }] },
     }
     const result = attr.getAggregateAttribution([phaseA, integrationFailure()])
     assert.equal(result.attribution, 'integration_conflict')

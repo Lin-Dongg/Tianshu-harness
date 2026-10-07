@@ -1,3 +1,9 @@
+import { SessionTitleCoordinator, titleInput, loadTitleInput, canGenerateTitle, type buildTitleCompletion } from './session-title.js'
+import { legacyReadSkill, legacyWriteSkill, legacyRemoveSkill } from '../skills/skill-management-compat.js'
+import { queueSessionSkillMode } from '../skills/session-skill-policy.js'
+import { sessionSkillSnapshot } from '../skills/session-skill-snapshot.js'
+import { disposeSessionFilePreviews } from './file-open-routes.js'
+import { disposeSessionBrowserContexts } from './browser-contexts.js'
 import { hasLiveDelegation } from './session-delegation-state.js'
 import { DelegationStateIndex } from '../workers/delegation-state.js'
 import { withWorkspaceRoots } from '../tools/workspace-context.js'
@@ -80,7 +86,7 @@ import { buildDomainPickerEntries, type DomainPickerEntry } from '../agent/domai
 import { starDomainRegistry } from '../agent/star-domain-registry.js'
 import type { ActiveStarDomain } from '../agent/star-domain.js'
 import type { StarDomainId } from '../agent/star-domain.js'
-import { skillRegistry, loadProjectSkills, listInstallableSkills, importSkillsIntoRivet, countInstalledSkills, readSkillContent, writeSkill, uninstallSkill, type InstallableSkill } from '../skills/skill-loader.js'
+import { skillRegistry, loadProjectSkills, listInstallableSkills, importSkillsIntoRivet, countInstalledSkills, type InstallableSkill } from '../skills/skill-loader.js'
 import { resolveBareSkillPrompt } from '../tui/prompt-input-resolver.js'
 import { getSkillLoadErrorsForSession } from './skill-load-errors.js'
 import type { MissionStore } from './mission-store.js'
@@ -458,6 +464,8 @@ export interface ManagedAgent {
    * discovery block so disabled skills are hidden from the model. Optional for
    * lightweight test doubles.
    */
+  markSkillInvoked?(name: string): void
+  getSkillSnapshot?(): import('../skills/skill-loader.js').SkillDefinition[]
   setDisabledSkills?(names: Set<string>): void
   /** Estimated token count for the current conversation (including prefix overhead). */
   getEstimatedTokens?(): number
@@ -545,6 +553,7 @@ export type AgentFactory = (
  * and the sessionDir (for save/restore/delete of goal state) to wire goal mode.
  */
 export interface GoalHandles {
+  currentModelRef?: string
   /** The RuntimeRefs.goalTrackerRef — same object the update_goal and
    *  deliver_task tool closures close over. Mutating .current here keeps the
    *  tools in sync with the agent's own tracker field. */
@@ -712,6 +721,7 @@ export interface SessionPersistenceAdapter {
   appendEvent(sessionId: string, event: SessionEvent): void
   /** Flush buffered writes to disk (batched adapters). Optional — no-op if absent. */
   flushSync?(): void
+  flushAllAsync?(timeoutMs?: number): Promise<void>
   loadAll(): PersistedSession[]
   /**
    * Lazy-boot support (optional). `loadRecords` reads ONLY the lightweight
@@ -869,6 +879,7 @@ export interface RuntimeSessionManagerOptions {
    * initial record.model and the picker's `current` flag.
    */
   defaultModelId?: string
+  titleCompletion?: typeof buildTitleCompletion
   /** PlusMenu (domain) — the default domain key new sessions start on. */
   defaultDomain?: string
   /**
@@ -1403,6 +1414,7 @@ export class RuntimeSessionManager {
   private globalApprovalMode?: ApprovalMode
   private readonly persistence?: SessionPersistenceAdapter
   private readonly getRegistry?: () => SessionRegistry | undefined
+  private readonly titles: SessionTitleCoordinator
   private readonly listModelsFn?: () => ModelOption[]
   private readonly defaultModelId?: string
   private readonly defaultDomain?: string
@@ -1463,6 +1475,20 @@ export class RuntimeSessionManager {
     this.globalApprovalMode = opts.globalApprovalMode
     this.persistence = opts.persistence
     this.getRegistry = opts.getSessionRegistry
+    this.titles = new SessionTitleCoordinator({
+      get: id => this.sessions.get(id)?.record,
+      save: record => { const s = this.sessions.get(record.id); if (s) { this.touch(s); this.persistRecord(s) } },
+      models: id => {
+        const handles = this.resolveGoalHandles?.(id)
+        return handles?.allProviders ? {
+          providers: handles.allProviders as import('./session-title.js').TitleModels['providers'],
+          current: handles.currentModelRef ?? this.sessions.get(id)?.record.model ?? opts.defaultModelId,
+          cheap: handles.cheapProfile,
+        } : undefined
+      },
+      generated: (id, title) => { const s = this.sessions.get(id); if (s) this.attachImplicitMission(s, title) },
+      complete: opts.titleCompletion,
+    })
     this.listModelsFn = opts.listModels
     this.defaultModelId = opts.defaultModelId
     this.resumeFallbackModel = opts.resumeFallbackModel
@@ -1501,6 +1527,10 @@ export class RuntimeSessionManager {
       this.idleSweepTimer.unref?.()
     }
     if (this.persistence) this.rehydrate()
+    for (const s of this.sessions.values()) if (s.record.titleGenerationState === 'pending') {
+      s.record.titleGenerationState = 'failed'
+      this.persistRecord(s)
+    }
     if (this.persistence && this.externalScanMs > 0) {
       // 同上：unref——发现定时器不该把进程钉住（sidecar 退出时它必须能退）。
       // 首扫刻意不在此刻做：rehydrate 刚装填完，紧接着扫一次只会空转。
@@ -1684,7 +1714,12 @@ export class RuntimeSessionManager {
     let changed = false
     if (newer) {
       if (disk.status !== rec.status) { rec.status = disk.status; changed = true }
-      if (typeof disk.title === 'string' && disk.title !== rec.title) { rec.title = disk.title; changed = true }
+      if (typeof disk.title === 'string' && disk.title !== rec.title) {
+        rec.title = disk.title; rec.titleSource = disk.titleSource ?? 'manual'; changed = true
+      }
+      rec.titleGenerationState = disk.titleGenerationState
+      rec.titleGenerationAttempts = disk.titleGenerationAttempts
+      rec.titleInput = disk.titleInput
       rec.updatedAt = disk.updatedAt
       changed = true
     }
@@ -2400,6 +2435,8 @@ export class RuntimeSessionManager {
   private hardDelete(id: string): boolean {
     const s = this.sessions.get(id)
     if (!s) return false
+    disposeSessionFilePreviews(id)
+    void disposeSessionBrowserContexts(id)
     s.tombstoned = true
     s.lifecycleGeneration++
     s.toolResultClosed = true
@@ -2727,25 +2764,20 @@ export class RuntimeSessionManager {
     this.sessions.set(id, session)
     this.touchLoaded(session)
     this.persistRecord(session)
-    // 立即加载技能到共享 registry：技能列表查询（/skills）发生在用户发首条消息之前，
-    // 而 agent 是懒创建的（ensureAgent 在 run() 时才建）——若把 loadProjectSkills 只留
-    // 在 agent 创建路径（buildSessionStores），新会话的技能面板会显示空（0/0）直到首次
-    // 对话。这里在创建会话时即加载，幂等（registry 用 Map.set 覆盖）。
-    // importFromClaude 的文件复制由后续 agent 创建时的 buildSessionStores 补全（幂等）。
-    // 捕获 loadErrors：坏 frontmatter 的技能不再静默消失，UI 会显示原因。
-    try { session.skillLoadErrors = loadProjectSkills(cwd).errors } catch { /* non-fatal: 技能加载失败不阻断会话 */ }
+    // Legacy seeding happens once; the independent snapshot pins new-session defaults.
+    try { session.skillLoadErrors = loadProjectSkills(cwd).errors; sessionSkillSnapshot(cwd, id) } catch { /* non-fatal: 技能加载失败不阻断会话 */ }
     // R1 — announce the session to the shared registry so its file claims are
     // attributed and reaped on crash. Best-effort: registry may be disabled.
     try { this.getRegistry?.()?.register(id, cwd, 'standalone') } catch { /* non-fatal */ }
     if (input.prompt && input.prompt.trim()) {
       // 创建首轮不经过 /prompt 路由，技能加载后展开直调词。
-      const prompt = resolveBareSkillPrompt(input.prompt.trim()) ?? input.prompt
+      const prompt = resolveBareSkillPrompt(input.prompt.trim(), cwd, sessionSkillSnapshot(cwd, session.record.id)) ?? input.prompt
       this.run(id, prompt, input.images, false, undefined, { documents: input.documents, promptText: input.promptText ?? (prompt !== input.prompt ? input.prompt : undefined) })
     }
     return { ...session.record }
   }
 
-  async submitRun(id: string, prompt: string, images: string[] | undefined, requestId: string, opts?: { documents?: SessionDocumentInput[]; archiveRefs?: SessionArchiveEventRef[]; promptText?: string }) {
+  async submitRun(id: string, prompt: string, images: string[] | undefined, requestId: string, opts?: { skillInvoked?: string; documents?: SessionDocumentInput[]; archiveRefs?: SessionArchiveEventRef[]; promptText?: string }) {
     if (!this.sessions.has(id)) return { ok: false as const, code: 'not_found' }
     if (!this.runLedger) return { ok: this.run(id, prompt, images, false, undefined, opts), code: 'busy' }
     const receipt = await this.runLedger.accept(id, requestId, { prompt, images, documents: opts?.documents?.map((d) => d.name), archives: opts?.archiveRefs?.map((a) => a.name), promptText: opts?.promptText }, receipt => this.run(id, prompt, images, false, receipt, opts))
@@ -2803,10 +2835,10 @@ export class RuntimeSessionManager {
     images?: string[],
     recovery = false,
     receipt?: import('./run-ledger.js').RunReceipt,
-    opts?: { documents?: SessionDocumentInput[]; documentRefs?: SessionDocumentRef[]; archiveRefs?: SessionArchiveEventRef[]; promptText?: string; origin?: import('../agent/input-origin.js').InputOrigin },
+    opts?: { skillInvoked?: string; documents?: SessionDocumentInput[]; documentRefs?: SessionDocumentRef[]; archiveRefs?: SessionArchiveEventRef[]; promptText?: string; origin?: import('../agent/input-origin.js').InputOrigin },
   ): boolean {
     const session = this.sessions.get(id)
-    if (!session || session.running) return false
+    if (this.updateRestartPreparing || !session || session.running) return false
     // 阶段 2 — 逻辑 runId：恢复台账用它把多次尝试归到同一逻辑运行。
     let runId = receipt?.runId ?? randomUUID()
     const attemptId = receipt?.attemptId ?? randomUUID()
@@ -2966,12 +2998,15 @@ export class RuntimeSessionManager {
         this.append(session, 'goal_state', baselineGoalSnapshot() as unknown as Record<string, unknown>)
       }
       this.persistRecord(session)
-      // Auto-generate a session title from the first user message when none is
-      // set. Fire-and-forget — extraction never blocks the main run, and the
-      // hook double-checks `!record.title` after the await so a user who sets a
-      // title manually during the ~1s extraction window is never overwritten.
-      if (wasFirstUser && !session.record.title) {
-        void this.maybeAutoTitle(id, prompt)
+      // Only human submissions trigger a bounded title attempt.
+      if (!recovery && !wasAutoResubmit && opts?.origin !== 'runtime_command' && !id.startsWith('worker-')) {
+        const first = session.events.find(e => e.type === 'user')?.data
+        const input = session.record.titleInput ?? titleInput(
+          wasFirstUser ? opts?.promptText ?? (documentRefs.length || archiveRefs.length ? '' : prompt)
+            : typeof first?.promptText === 'string' ? first.promptText : typeof first?.text === 'string' ? first.text : '',
+          [...documentRefs, ...archiveRefs].map(d => d.name).concat(images?.length ? ['Image'] : []),
+        )
+        void this.titles.generate(id, input)
       }
       this.bindPlanModeChange(session, agent, runGeneration)
       const callbacks = this.buildCallbacks(session, journalWrite)
@@ -2993,6 +3028,7 @@ export class RuntimeSessionManager {
           if (!ownsDurability() || storageFailed || session.record.status !== 'running') throw new Error('Execution cancelled')
         } catch (error) { storageFailure(); throw error }
       }
+      if (opts?.skillInvoked) agent.markSkillInvoked?.(opts.skillInvoked)
       void withActivityRun(id, attemptId, () => withWorkspaceRoots(session.record.workspaceRoots ?? [session.record.cwd], () => agent.run(prompt, callbacks, images, { origin: opts?.origin ?? (recovery || wasAutoResubmit ? 'runtime_command' : 'human') }), id))
         .catch((err: unknown) => {
           if (!ownsDurability()) return
@@ -3314,11 +3350,13 @@ export class RuntimeSessionManager {
    * 'delegation' SSE channel (origin:'user') the viewer panel already consumes.
    */
   async delegate(id: string, input: DelegateWorkerInput): Promise<DelegateResult> {
+    if (this.updateRestartPreparing) return { ok: false, reason: 'limit' }
     const session = this.sessions.get(id)
     if (!session) return { ok: false, reason: 'not_found' }
     const objective = input.objective?.trim()
     if (!objective) return { ok: false, reason: 'invalid' }
     const agent = await this.ensureAgentAsync(session)
+    if (this.updateRestartPreparing) return { ok: false, reason: 'limit' }
     if (typeof agent.delegateWorker !== 'function') return { ok: false, reason: 'unsupported' }
     const aborts = session.backgroundAborts ?? (session.backgroundAborts = new Map())
     if (aborts.size >= MAX_USER_BACKGROUND_WORKERS) return { ok: false, reason: 'limit' }
@@ -3720,22 +3758,20 @@ export class RuntimeSessionManager {
 
   // ── PlusMenu: skills ──────────────────────────────────────────
 
-  /**
-   * PlusMenu — list every loaded skill with its per-session enablement status.
-   * Returns undefined when the session is missing.
-   */
+  /** Return this session's pinned skill versions, independent of other workspaces. */
   listSkills(id: string): SkillStatus[] | undefined {
     const session = this.sessions.get(id)
     if (!session) return undefined
-    return skillRegistry.list().map((s) => ({
+    return (session.agent?.getSkillSnapshot?.() ?? sessionSkillSnapshot(session.record.cwd, id).list()).map((s) => ({
       name: s.name,
+      version: s.version, mode: s.mode, skillId: s.skillId,
       description: s.description,
       source: s.source ?? (s.builtIn ? 'builtin' : 'rivet'),
-      enabled: !session.disabledSkills.has(s.name),
+      enabled: s.mode !== 'off' && !session.disabledSkills.has(s.name),
       // Editable when there's a backing file on disk (built-ins have none;
       // plugin skills point at the plugin dir, which the editor could open
       // but we keep read-only for safety — users edit via the plugin's own flow).
-      editable: !!s.bodyPath && s.source !== 'builtin' && s.source !== 'plugin',
+      editable: !!s.bodyPath && (s.source === 'rivet' || s.source === 'global-rivet'),
     }))
   }
 
@@ -3760,6 +3796,9 @@ export class RuntimeSessionManager {
   setSkillEnabled(id: string, name: string, enabled: boolean): boolean {
     const session = this.sessions.get(id)
     if (!session) return false
+    const registry = sessionSkillSnapshot(session.record.cwd, id)
+    if (!registry.get(name)) return false
+    queueSessionSkillMode(session.record.cwd, id, registry, name, enabled ? 'auto' : 'off')
     if (enabled) session.disabledSkills.delete(name)
     else session.disabledSkills.add(name)
     try { session.agent?.setDisabledSkills?.(new Set(session.disabledSkills)) } catch { /* non-fatal */ }
@@ -3802,28 +3841,17 @@ export class RuntimeSessionManager {
     return importSkillsIntoRivet(session.record.cwd, names)
   }
 
-  /**
-   * Skills CRUD — read the full SKILL.md text for the editor. Returns null for
-   * built-in / plugin skills (no editable backing file) so the UI can show a
-   * read-only notice. Returns undefined when the session is missing.
-   */
+  /** Compatibility editor routes delegate to the scope-aware management service. */
   readSkillContent(id: string, name: string): string | null | undefined {
     const session = this.sessions.get(id)
     if (!session) return undefined
-    return readSkillContent(name, session.record.cwd)
+    return legacyReadSkill(session.record.cwd, name)
   }
 
-  /**
-   * Skills CRUD — write (create or overwrite) a skill. `scope: 'global'`
-   * writes to ~/.rivet/skills (reusable across projects); 'project' writes to
-   * <cwd>/.rivet/skills. Throws on malformed frontmatter (route layer → 400).
-   * Same no-hot-load contract as install: the change takes effect next session.
-   * Returns undefined when the session is missing.
-   */
   writeSkill(id: string, name: string, content: string, scope: 'project' | 'global'): { path: string } | undefined {
     const session = this.sessions.get(id)
     if (!session) return undefined
-    return writeSkill(name, content, session.record.cwd, scope)
+    return legacyWriteSkill(session.record.cwd, name, content, scope)
   }
 
   /**
@@ -3836,7 +3864,7 @@ export class RuntimeSessionManager {
   uninstallSkill(id: string, name: string): { removed: boolean; wasDir: boolean } | undefined {
     const session = this.sessions.get(id)
     if (!session) return undefined
-    return uninstallSkill(name, session.record.cwd)
+    return legacyRemoveSkill(session.record.cwd, name)
   }
 
   /**
@@ -4052,56 +4080,21 @@ export class RuntimeSessionManager {
     }
   }
 
-  /**
-   * Auto-generate a session title from the first user message via the cheap
-   * model profile (mirrors extractCriteria's side-path pattern). Fail-open:
-   * any error or missing config leaves the title unset, the UI falls back to
-   * sessionId.slice(0, 8). Double-checks `!record.title` after the await so a
-   * user who set a title manually during extraction is never overwritten.
-   */
-  private async maybeAutoTitle(id: string, firstMessage: string): Promise<void> {
-    const handles = this.resolveGoalHandles?.(id)
-    if (!handles) return
-    try {
-      const { extractSessionTitle } = await import('../agent/title-extract.js')
-      const { completionFromClient, buildCheapClient } = await import('../agent/goal-criteria.js')
-      if (!handles.allProviders) return
-      const providers = handles.allProviders as Parameters<typeof buildCheapClient>[1]
-      // 先试 cheap profile（默认 minimax）；没配 key 时回退到任一已配 key 的主 provider。
-      // 大多数用户只配了主模型（DeepSeek/GLM 等），不会专门配 minimax——此前 cheap 失败
-      // 就静默 return，标题永远空，侧边栏显示 ID 截断。标题生成 token 消耗极小（<=256），
-      // 用主 provider 做这个 cheap 任务完全可接受。
-      let cheap = handles.cheapProfile
-        ? buildCheapClient(handles.cheapProfile, providers, id)
-        : null
-      if (!cheap) {
-        // 回退：遍历所有已配 provider，找第一个能构建 client 的。标题生成对模型能力
-        // 要求极低，任意已配 provider + 它的第一个 model 即可。
-        for (const [providerName, prov] of Object.entries(providers)) {
-          const models = (prov as { models?: Array<{ id?: string; alias?: string }> })?.models
-          const firstModel = models?.[0]?.id ?? models?.[0]?.alias
-          if (!firstModel) continue
-          cheap = buildCheapClient({ provider: providerName, model: firstModel }, providers, id)
-          if (cheap) break
-        }
-      }
-      if (!cheap) return // 确实一个 key 都没配——leave title unset
-      const title = await extractSessionTitle(
-        firstMessage,
-        completionFromClient(cheap.client, cheap.model, 256),
-      )
-      const s = this.sessions.get(id)
-      if (s && title && !s.record.title) {
-        this.setTitle(id, title)
-        this.attachImplicitMission(s, title)
-      }
-    } catch {
-      // non-fatal — title stays unset, UI keeps sessionId-slice fallback
-    }
+  /** Opening a legacy untitled session is a bounded, on-demand title attempt. */
+  async generateTitle(id: string, explicit = false): Promise<boolean> {
+    const s = this.sessions.get(id)
+    if (!s) return false
+    if (!canGenerateTitle(s.record) || (!explicit && (s.record.titleGenerationAttempts ?? 0) >= 2)) return true
+    await this.ensureEventsAsync(s)
+    const input = await loadTitleInput(s.record, s.events, this.persistence)
+    if (!input) return true
+    await this.ensureAgentAsync(s)
+    await this.titles.generate(id, input, explicit)
+    return true
   }
 
   /**
-   * rev2 — 隐式 Mission：主流路径（sendPrompt 无标题）在 maybeAutoTitle
+   * rev2 — 隐式 Mission：主流路径（sendPrompt 无标题）在标题协调器
    * 起标题成功时获得 Mission。恒新建不去重（自动标题撞名 ≠ 同一任务）。
    * 双检 !record.missionId：显式路径已关联的不重复创建。
    * 注：worktree 会话的 record.cwd 是 worktree 路径，projectId 会偏离项目
@@ -5015,6 +5008,61 @@ export class RuntimeSessionManager {
     return !s.running
   }
 
+  private updateRestartPreparing = false
+
+  isUpdateRestartPreparing(): boolean { return this.updateRestartPreparing }
+  cancelUpdateRestart(): void { this.updateRestartPreparing = false }
+  updateRestartActivity(): { sessions: number; tasks: number } {
+    let sessions = 0, tasks = 0
+    for (const s of this.sessions.values()) {
+      if (s.running) sessions++
+      tasks += s.backgroundAborts?.size ?? 0
+      tasks += s.pendingDelegations.size
+      tasks += s.jobs?.list().filter(j => j.status === 'running').length ?? 0
+    }
+    return { sessions, tasks }
+  }
+  async prepareUpdateRestart(force: boolean, signal: AbortSignal): Promise<void> {
+    if (this.updateRestartPreparing) throw new Error('UPDATE_PREPARING')
+    this.updateRestartPreparing = true
+    try {
+      const activity = this.updateRestartActivity()
+      if (!force && activity.sessions + activity.tasks > 0) throw new Error('UPDATE_BUSY')
+      if (force) {
+        this.abortAll()
+        for (const s of this.sessions.values()) {
+          for (const controller of s.backgroundAborts?.values() ?? []) controller.abort()
+          for (const workerId of s.pendingDelegations.keys()) this.killWorker(s.record.id, workerId)
+          s.jobs?.killAll()
+        }
+      }
+      while (true) {
+        signal.throwIfAborted()
+        const a = this.updateRestartActivity()
+        if (a.sessions + a.tasks === 0) break
+        await new Promise(resolve => setTimeout(resolve, 50))
+      }
+      for (const s of this.sessions.values()) {
+        signal.throwIfAborted()
+        this.flushDeltaBuf(s)
+        this.flushToolResultBuf(s)
+        if (s.agent) {
+          if (typeof s.agent.flushPersistence !== 'function') throw new Error('UPDATE_PERSISTENCE_UNAVAILABLE')
+          await s.agent.flushPersistence()
+        }
+        this.persistRecord(s)
+        if (!this.persistence?.flushThrough) throw new Error('UPDATE_PERSISTENCE_UNAVAILABLE')
+        const watermark = await this.persistence.flushThrough(s.record.id, s.seq, signal)
+        if (watermark < s.seq) throw new Error('UPDATE_PERSISTENCE_FAILED')
+      }
+      signal.throwIfAborted()
+      if (!this.persistence?.flushAllAsync) throw new Error('UPDATE_PERSISTENCE_UNAVAILABLE')
+      await this.persistence.flushAllAsync(5000)
+      signal.throwIfAborted()
+      if (this.persistence.healthSnapshot?.().failedSessions) throw new Error('UPDATE_PERSISTENCE_FAILED')
+    } catch (error) { this.updateRestartPreparing = false; throw error }
+  }
+
   abortAll(): void {
     for (const id of this.sessions.keys()) this.abort(id)
   }
@@ -5144,6 +5192,8 @@ export class RuntimeSessionManager {
     const s = this.sessions.get(id)
     if (!s) return false
     s.record.title = stripTerminalEscapes(title).trim()
+    s.record.titleSource = 'manual'
+    s.record.titleGenerationState = undefined
     this.touch(s)
     this.persistRecord(s)
     return true
@@ -6298,6 +6348,9 @@ export class RuntimeSessionManager {
       },
       onTurnComplete: (usage, turnNumber, isFinal, evidenceSummary, continuationReason, stopReason) => {
         if (!isActive()) return
+        if (isFinal && stopReason === 'no_answer' && session.record.status === 'running') {
+          session.record.status = 'interrupted'
+        }
         session.watchdogPolicy?.recordTurnComplete()
         // 上下文占用随事件下发的理由：`enrichRecord().contextTokens` 只在会话记录被
         // 拉取（push 触发或 30s 兜底轮询）时才现算，长 run 中途环形图的百分比最多
@@ -6311,10 +6364,9 @@ export class RuntimeSessionManager {
           turnNumber,
           isFinal: !!isFinal,
           ...(contextTokens !== undefined && contextTokens > 0 ? { contextTokens } : {}),
-          ...(isFinal && evidenceSummary ? { evidence: evidenceSummary } : {}),
+          ...(isFinal && stopReason !== 'no_answer' && evidenceSummary ? { evidence: evidenceSummary } : {}),
           ...(typeof continuationReason === 'string' && continuationReason ? { continuationReason } : {}),
-          // 'max_tokens'（输出被 token 上限截断）才携带——桌面据此渲染截断提醒
-          // （additive，对齐 contextTokens 先例）；正常 end_turn 不上 wire。
+          // 截断或无有效答案的原因只走事件；正常 end_turn 不上 wire。
           ...(typeof stopReason === 'string' && stopReason ? { stopReason } : {}),
         })
         const watermark = session.seq

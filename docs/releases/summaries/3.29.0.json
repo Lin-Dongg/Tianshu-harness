@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "version": "3.29.0",
+  "date": "2026-10-07",
+  "fullNotesUrl": "https://github.com/huiliyi37/Tianshu-harness/releases/tag/v3.29.0",
+  "locales": {
+    "zh": {
+      "title": "协作不互挡，交付按本会话算",
+      "highlights": [
+        "闲置会话不再长期占住文件。对方进程已退出，或超过 10 分钟没再改且工作区干净时自动接管；对方还在写会先问你。",
+        "交付按本会话的改动判断。项目外写入、别人的测试失败和非 git 目录不再造成假红或假绿；自己的回归仍然拦住。",
+        "更新先检查再下载，重启前先收好进行中的工作。技能在桌面和命令行共用，改动从新会话生效。"
+      ],
+      "notice": "项目配置里的审批、沙箱豁免和权限规则不再生效，授信也一样。请改到用户全局配置或运行时开关。Linux 渲染修复在本版 AppImage 里，3.28 的包没有这个开关。"
+    },
+    "en": {
+      "title": "Sessions stop blocking each other",
+      "highlights": [
+        "An idle session no longer holds a file indefinitely. A dead owner, or an exclusive claim untouched for 10 minutes on a clean path, is taken over automatically. A live edit still asks you first.",
+        "Delivery follows this session's changes. Writes outside the project, someone else's test failures, and non-git folders no longer fake a red or a green result. Your own regressions still block delivery.",
+        "Updates check first, then download, and confirm running work before restart. Skills are shared by the desktop app and the CLI, and changes apply to new sessions."
+      ],
+      "notice": "Approval, sandbox bypass, and permission rules in a project config no longer apply, even after you trust the project. Set them in your user config or at runtime. The Linux rendering fix is in this version's AppImage; the 3.28 package does not include it."
+    }
+  }
+}

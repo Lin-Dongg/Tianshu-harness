@@ -79,6 +79,12 @@ jobs:
         # （swebench-run 的 LOCAL_TMP）与 src 侧（promotion 的 existsSync 判据）各一处。
         run: npx tsx scripts/run-node-tests.ts scripts/ src/context/__tests__/promotion.test.ts
 
+      - name: Windows write_file esbuild fallback
+        run: node --import tsx --test src/tools/__tests__/write-file-esbuild-platform.test.ts
+
+      - name: Windows job cleanup and workspace routes
+        run: node --import tsx --test src/tools/__tests__/job-store.test.ts src/server/__tests__/multi-root-workspace.test.ts src/server/__tests__/git-pr-workbench.test.ts src/server/__tests__/serve-store-lock.test.ts
+
   cli-frontend:
     name: CLI frontend (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

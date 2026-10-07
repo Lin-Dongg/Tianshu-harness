@@ -44,16 +44,24 @@ const FORBIDDEN_HEAVY = [
  *
  * 再次触顶时的处置顺序：先确认 FORBIDDEN_HEAVY 仍全绿且新增边不是通往 agent/tui
  * 的大块子树（用 why(parent) 看父链），再决定调上限或把该边改动态 `await import()`。
+ *
+ * 2026-10-07 复测 489（**代为登记**，非本会话改动）：10-05→10-07 的技能管理统一
+ * （skill-management-routes / skill-management-compat 静态链，4940f9c94 等）与其余
+ * server 面增长把图推到 489；jszip/yaml 随之静态进图。父链核对（why）确认增长来自
+ * server 路由/兼容层，FORBIDDEN_HEAVY 8 模块仍全绿、无 agent/tui 内核回流。
+ * 上限 → 500（489 + ~2% 余量）。若技能管理后续把静态边改动态 import，应回调本值。
  */
-const REACHABLE_LIMIT = 480
+const REACHABLE_LIMIT = 500
 
 /**
  * 启动图允许静态出现的 bare 包（tsup 会按入口可达性把它们打进 chunk）。
  * 与图做**集合相等**检查，不是子集：包退出图时也要从清单删掉，否则旧条目会给
  * 它日后的回归留后门。新增/退出都必须同步本清单并写明理由。
- * 当前清单：chalk（theme/ansi）、diff（cpu-tasks）、undici（api/mcp/http）、zod（config 族）。
+ * 当前清单：chalk（theme/ansi）、diff（cpu-tasks）、undici（api/mcp/http）、zod（config 族）、
+ * jszip / yaml（2026-10-07 代为登记：技能管理路由 skill-management-routes 静态链引入，
+ * 供 zip 技能导入导出与 SKILL.md 元数据解析）。
  */
-const ALLOWED_STARTUP_PACKAGES = ['chalk', 'diff', 'undici', 'zod'] as const
+const ALLOWED_STARTUP_PACKAGES = ['chalk', 'diff', 'undici', 'zod', 'jszip', 'yaml'] as const
 
 let cached: StaticImportGraph | null = null
 function serveGraph(): StaticImportGraph {

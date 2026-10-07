@@ -21,6 +21,10 @@ export interface ThetaTelemetryState {
   suppressedCount: number
   /** 各 outcome 累计（每次真实尝试记一次；含 busy/backoff）。 */
   outcomes: Record<ThetaOutcome, number>
+  /** 连续 no-fresh-verdict 次数——用于智能触发判断 */
+  consecutiveNoFreshVerdict: number
+  /** 触发真跑的累计次数——用于遥测 */
+  triggeredRuns: number
 }
 
 /** controller 的最小 host 接口——测试注入 mock host，生产传 AgentLoop。 */
@@ -35,7 +39,36 @@ export interface ThetaControllerHost {
   onThetaResult?: (result: ThetaCheckResult, budgetMs: number) => void
 }
 
-export type ThetaRunner = (cwd: string, timeoutMs?: number) => Promise<ThetaCheckResult>
+export type ThetaRunner = (options: string | { cwd: string; timeoutMs?: number; triggerOnMiss?: boolean; triggerReason?: string }) => Promise<ThetaCheckResult>
+
+/**
+ * 智能判断是否触发真跑（阶段 3）。
+ *
+ * 触发条件：
+ * 1. 连续多次 no-fresh-verdict（阈值：3 次）
+ * 2. 会话即将达到上限（剩余 < 10 次机会）
+ *
+ * 不触发的情况：
+ * - 刚刚触发过（避免过于频繁）
+ * - 已经在超时退避中
+ */
+function shouldTriggerOnMiss(host: ThetaControllerHost): boolean {
+  const telemetry = host.thetaTelemetry
+
+  // 条件 1：连续多次 no-fresh-verdict，尝试触发一次
+  if (telemetry.consecutiveNoFreshVerdict >= 3) {
+    return true
+  }
+
+  // 条件 2：会话接近上限，尝试获取最后的结论
+  const remaining = THETA_MAX_SESSION - telemetry.requestedCount
+  if (remaining <= 10 && telemetry.consecutiveNoFreshVerdict > 0) {
+    return true
+  }
+
+  // 默认不触发（保持只读消费者行为）
+  return false
+}
 
 /**
  * Theta 检查控制器（主控可靠性闭环 Wave 1）——gating + backoff + outcome 累计。
@@ -73,7 +106,15 @@ export function createThetaController(
       requestedCount: host.thetaTelemetry.requestedCount + 1,
     }
 
-    runner(host.cwd, THETA_BUDGET_MS).then(result => {
+    // 智能判断是否触发真跑
+    const triggerOnMiss = shouldTriggerOnMiss(host)
+
+    runner({
+      cwd: host.cwd,
+      timeoutMs: THETA_BUDGET_MS,
+      triggerOnMiss,
+      triggerReason: triggerOnMiss ? reason : undefined,
+    }).then(result => {
       for (const errFile of result.errors) {
         host.repairHintTracker.recordFailure(errFile, 'type_error')
       }
@@ -88,6 +129,14 @@ export function createThetaController(
         : (result.outcome === 'ok' || result.outcome === 'type_errors')
           ? 0
           : host.thetaTelemetry.consecutiveTimeouts
+
+      // 跟踪连续 no-fresh-verdict 次数
+      const consecutiveNoFreshVerdict = result.outcome === 'no-fresh-verdict'
+        ? host.thetaTelemetry.consecutiveNoFreshVerdict + 1
+        : (result.outcome === 'ok' || result.outcome === 'type_errors')
+          ? 0  // 成功结果清零
+          : host.thetaTelemetry.consecutiveNoFreshVerdict  // 其他情况保持
+
       const cooldownTurns = consecutiveTimeouts === 0 ? 0
         : Math.min(4, consecutiveTimeouts)
       const outcomes = { ...host.thetaTelemetry.outcomes }
@@ -101,6 +150,7 @@ export function createThetaController(
         lastErrorCount: result.errors.length,
         lastTimedOut: timedOut,
         consecutiveTimeouts,
+        consecutiveNoFreshVerdict,
         cooldownUntilTurn: cooldownTurns > 0
           ? host.session.getTurnCount() + cooldownTurns
           : 0,
@@ -116,6 +166,7 @@ export function createThetaController(
         lastErrorCount: 0,
         lastTimedOut: false,
         consecutiveTimeouts: 0,
+        consecutiveNoFreshVerdict: 0,  // 清零
         cooldownUntilTurn: 0,
       }
     }).finally(() => {

@@ -99,7 +99,7 @@ Bad: 用 create_image 画复杂照片级场景（它只能写 SVG 矢量图）`,
         const slot = getConfig()
         if (!slot) {
           return {
-            content: '未配置生图模型。请先在 设置 → 生图模型 中注册一个生图端点'
+            content: '未配置画图服务。请先在 设置 → 画图 里接上一个画图端点'
               + '（如 SiliconFlow 的 /v1/images/generations），或用 `rivet config image-gen` 配置。'
               + '当前 agent.defaultModel 不受影响，会话其余功能照常。',
             isError: true,

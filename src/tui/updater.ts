@@ -7,7 +7,8 @@
  * - `/update` 根据安装来源执行对应命令：
  *   - 源码（含 .git）：git pull && npm install && npm run build
  *   - npm 全局安装：npm install -g <pkg>@<channel>
- *   - npm 本地项目依赖：提示用户到项目根目录手动执行
+ *   - npm 本地项目依赖 / 无法判断来源：不安装，并说明原因与手动命令
+ *     （不要复读启动横幅那句 "Run /update"）
  * - 更新成功后自动拉起新进程并退出当前进程。
  *
  * 可用环境变量关闭启动检查：RIVET_NO_UPDATE_CHECK=1
@@ -464,10 +465,58 @@ export function formatUpdateBanner(current: string, latest: string): string {
   return `⬆️  Update available: ${current} → ${latest}. Run /update to upgrade.`
 }
 
+/** `/update` 拒绝自动安装的原因。文案由 formatDeclinedUpdate 统一生成。 */
+export type UpdateDecline = 'local' | 'unknown' | 'unpublished' | 'no-name'
+
+/**
+ * `/update` 没装上时给用户看的几行。
+ *
+ * 启动横幅只负责「有新版本，请运行 /update」。人已经在命令里时再打那句，
+ * 看起来像命令没生效。这里第一行是结果（没安装、版本没变），后面是原因和手动命令。
+ */
+export function formatDeclinedUpdate(args: {
+  current: string
+  latest: string
+  packageName: string
+  kind: UpdateDecline
+}): string[] {
+  const spec = `${args.packageName}@${updateInstallSpec(args.latest)}`
+  const head = `❌ 没有安装 ${args.latest}，当前仍是 ${args.current}。`
+  switch (args.kind) {
+    case 'local':
+      return [
+        head,
+        '   原因：安装位置在 node_modules 里，被当成项目依赖，/update 不会改项目的 package.json。',
+        `   若这是全局安装，执行：npm install -g ${spec}`,
+        `   若这是项目依赖，到项目根目录执行：npm install ${spec}`,
+      ]
+    case 'unknown':
+      return [
+        head,
+        '   原因：无法判断是怎么安装的，所以没有自动安装。',
+        `   请手动执行：npm install -g ${spec}`,
+      ]
+    case 'unpublished':
+      return [
+        head,
+        `   原因：npm 上还没有 ${args.packageName}，装不了。`,
+        '   请等这个版本发布，或在源码目录里更新。',
+      ]
+    case 'no-name':
+      return [
+        head,
+        '   原因：读不到包名，无法决定安装命令。',
+      ]
+  }
+}
+
 export interface UpdateResult {
   ok: boolean
   skipped: boolean
   message: string
+  /** 跳过自动安装时的原因。有此字段时界面用 formatDeclinedUpdate，不展示 message。 */
+  decline?: UpdateDecline
+  packageName?: string
 }
 
 export function emitLines(text: string, onLine: (line: string) => void): void {
@@ -486,7 +535,7 @@ export async function runUpdate(
 ): Promise<UpdateResult> {
   const name = readPackageName(root)
   if (!name) {
-    return { ok: false, skipped: true, message: 'Could not read package name.' }
+    return { ok: false, skipped: true, decline: 'no-name', message: 'Could not read package name.' }
   }
 
   const type = detectInstallType(root)
@@ -500,6 +549,8 @@ export async function runUpdate(
       return {
         ok: false,
         skipped: true,
+        decline: 'unpublished',
+        packageName: name,
         message: `Package "${name}" is not yet published to npm. Update from source or wait for the first npm release.`,
       }
     }
@@ -508,15 +559,21 @@ export async function runUpdate(
     return {
       ok: false,
       skipped: true,
+      decline: 'local',
+      packageName: name,
       message: `Local project install: run "npm install ${name}@${channel}" in your project root.`,
     }
   } else {
     return {
       ok: false,
       skipped: true,
+      decline: 'unknown',
+      packageName: name,
       message: `Unknown install type. Run "npm install -g ${name}@${channel}" manually.`,
     }
   }
+
+  onLine(`正在安装 ${name}@${channel}…`)
 
   return new Promise((resolve) => {
     const child = spawn(command, {

@@ -17,42 +17,15 @@
 
 import { color } from '../engine/ansi.js'
 import type { RivetTheme } from '../theme.js'
-import { displayWidth, truncateToDisplayWidth } from '../width.js'
+import { displayWidth, hardWrapToDisplayWidth, truncateToDisplayWidth } from '../width.js'
 
-const MIN_BOX_WIDTH = 40
+const MIN_BOX_WIDTH = 8
 const DEFAULT_BOX_WIDTH = 80
 const ANSI_RE = /\x1B\[[0-9;]*[a-zA-Z]/g
 
-/** 去掉 ANSI 转义后的纯文本长度。 */
-function plainLength(text: string): number {
-  return text.replace(ANSI_RE, '').length
-}
-
 /** 把一段文本按目标显示宽度折成多行，保留已有换行。 */
 function wrapLines(text: string, width: number): string[] {
-  const out: string[] = []
-  for (const rawLine of text.split('\n')) {
-    if (displayWidth(rawLine) <= width) {
-      out.push(rawLine)
-      continue
-    }
-    let current = ''
-    let currentWidth = 0
-    for (const ch of rawLine) {
-      const cp = ch.codePointAt(0) ?? 0
-      const chWidth = displayWidth(String.fromCodePoint(cp))
-      if (currentWidth + chWidth > width && current.length > 0) {
-        out.push(current)
-        current = ch
-        currentWidth = chWidth
-      } else {
-        current += ch
-        currentWidth += chWidth
-      }
-    }
-    if (current.length > 0) out.push(current)
-  }
-  return out
+  return text.split('\n').flatMap(line => hardWrapToDisplayWidth(line, width))
 }
 
 /** 左对齐填充或截断到目标宽度（ANSI 安全）。 */
@@ -67,6 +40,7 @@ function fitLine(text: string, width: number): string {
 export interface FormatAskUserQuestionInput {
   content: string
   columns?: number
+  state?: 'pending' | 'answered' | 'discussion' | 'unanswered'
 }
 
 export function formatAskUserQuestion(input: FormatAskUserQuestionInput, theme: RivetTheme): string[] {
@@ -74,8 +48,11 @@ export function formatAskUserQuestion(input: FormatAskUserQuestionInput, theme: 
   const boxWidth = Math.max(MIN_BOX_WIDTH, Math.min(DEFAULT_BOX_WIDTH, cols))
   const innerWidth = boxWidth - 4
 
-  const borderCol = (text: string) => color(text, theme.warning)
-  const title = color('? 需要你的回答', theme.warning, { bold: true })
+  const state = input.state ?? 'pending'
+  const tone = state === 'pending' ? theme.warning : theme.muted
+  const borderCol = (text: string) => color(text, tone)
+  const label = { pending: '? 需要你的回答', answered: '✓ 已提交回答', discussion: '◇ 提问 · 转入讨论', unanswered: '◇ 提问 · 未作答' }[state]
+  const title = color(label, state === 'answered' ? theme.success : tone, { bold: true })
 
   const lines: string[] = []
   lines.push(borderCol('┌' + '─'.repeat(boxWidth - 2) + '┐'))

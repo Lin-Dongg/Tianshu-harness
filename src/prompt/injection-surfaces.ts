@@ -38,6 +38,7 @@
  * - `ephemeral`：每轮一次性认知提示，**不进** delta context-update（否则会被
  *   「缺席=沿用上轮」协议永久固化）。
  * - `reminder`：`session.appendSystemReminder` 追加进消息流（细断点、只追加尾部）。
+ * - `tool-result`：工具返回正文里的执行反馈，随新工具消息追加，不改历史。
  * - `ui-only`：**明确不进 prompt** 的通道。登记它们是为了让「不要把它塞进上下文」
  *   这个决定可被检索——历史上 companion presence 就曾被误注入。
  *
@@ -61,6 +62,7 @@ export type InjectionChannel =
   | 'appendix'
   | 'ephemeral'
   | 'reminder'
+  | 'tool-result'
   | 'ui-only'
 
 /** 该注入点变化时的缓存代价。 */
@@ -130,7 +132,7 @@ export const APPENDIX_PROTECTED_SURFACES: readonly InjectionSurface[] = [
     producer: 'ctx.invokedSkillsBlock',
     anchor: { file: 'src/prompt/volatile.ts', symbol: 'ctx.invokedSkillsBlock' },
     order: 0,
-    note: '显式召回的 skill 正文。按用户意图为高显著性，只应随 skill 完成消失，不被 Top-K 挤出。',
+    note: '显式召回的会话固定版本 skill 正文及资源清单（session-skill-snapshot）。按用户意图为高显著性，只应随 skill 完成消失，不被 Top-K 挤出。',
   },
   {
     id: 'appendix.permission-note',
@@ -282,7 +284,7 @@ export const APPENDIX_SURFACES: readonly InjectionSurface[] = [
     producer: 'ctx.skillAdvisoryBlock',
     anchor: { file: 'src/prompt/volatile.ts', symbol: 'push(ctx.skillAdvisoryBlock)' },
     order: 12,
-    note: 'skill 建议块（与 protected 的 invokedSkillsBlock 不同者：这块参与预算裁剪）。',
+    note: '会话快照中 auto 模式的 skill 名称和简介，正文不在发现层；临时模式只在用户边界生效（与 protected 的 invokedSkillsBlock 不同者：这块参与预算裁剪）。',
   },
   {
     id: 'appendix.cross-session-memory',
@@ -435,6 +437,24 @@ export const APPENDIX_SURFACES: readonly InjectionSurface[] = [
  * 非 appendix 通道的注入点。这些不是「块」，而是整条通道的写入约定。
  */
 export const CHANNEL_SURFACES: readonly InjectionSurface[] = [
+  {
+    id: 'tool-result.verification-guidance', channel: 'tool-result', cost: 'append-tail', volatility: 'per-turn',
+    producer: 'bashVerification.userGuidance',
+    anchor: { file: 'src/agent/tool-pipeline.ts', symbol: '[验证反馈]' },
+    note: 'bash 验证无法归因或缺覆盖证明时，建议命令追加在截断/artifact 处理之后；后台启动反馈也给建议命令。不改变退出码、验证状态或已缓存历史。',
+  },
+  {
+    id: 'tool-result.snapshot-omissions', channel: 'tool-result', cost: 'append-tail', volatility: 'per-turn',
+    producer: 'snapshotOmissionNote()',
+    anchor: { file: 'src/tools/run-tests-snapshot-result.ts', symbol: 'export function snapshotOmissionNote' },
+    note: '隔离快照未包含的 dirty 文件随验证结果点名；隔离失败及归因重试也显示，管线在输出截断/artifact 化后补回提示。诊断不补覆盖或放行失败。',
+  },
+  {
+    id: 'tool-result.delivery-verification-plan', channel: 'tool-result', cost: 'append-tail', volatility: 'per-turn',
+    producer: 'formatDeliveryVerificationPlan()',
+    anchor: { file: 'src/agent/deliver-task.ts', symbol: 'lines.push(...formatDeliveryVerificationPlan' },
+    note: '提交因 required 覆盖缺口受阻时，返回累计进度与按项目分批的独立命令；未适配 runner 保留义务，不以名单截断或 advisory 豁免验证。',
+  },
   {
     id: 'reminder.goal-rollover-kickoff', channel: 'reminder', cost: 'boundary-rebuild', volatility: 'transition',
     producer: 'buildRolloverKickoff()',

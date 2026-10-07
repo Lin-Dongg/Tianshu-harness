@@ -32,6 +32,7 @@ import {
   type DevicePollResult,
   type StellarIdentity,
 } from '../../auth/account.js'
+import type { ActivateAccountLicenseCode } from '../../auth/account-license.js'
 
 const TOKEN = 'tok'
 const AUTH = { authorization: `Bearer ${TOKEN}` }
@@ -93,6 +94,8 @@ function stubApi(over: Partial<AccountApi> = {}): AccountApi {
     cachedAccountProfile,
     accountIdentityUrl,
     accountManageUrl,
+    // 默认不可用：需要它的用例必须显式覆写，免得「忘了给桩却看起来跑通了」
+    activateAccountLicense: async () => { throw new Error('activateAccountLicense: this case must stub it') },
     ...over,
   }
 }
@@ -111,6 +114,7 @@ test('所有账号路由都要 Bearer token——缺 token 一律 401', async ()
       ['POST', '/account/poll'],
       ['GET', '/account/status'],
       ['POST', '/account/identity/refresh'],
+      ['POST', '/account/activate-device'],
       ['POST', '/account/logout'],
     ] as const) {
       const res = await router(method, path, {}, {})
@@ -875,6 +879,7 @@ test('real account API wiring accepts website device grants and projects verifie
       const url=String(input)
       let body:unknown
       if(url.includes('tui-auth-refresh')) {rotations++;body={accessToken:credential,refreshToken:'fake-next',expiresIn:3600}}
+      else if(url.includes('tui-account-snapshot')) body={version:1,userId:'me',profile:{status:'ok',fetchedAt:Date.now(),data:{avatarUrl:'https://example.com/avatar.png',founding:{badgeCode:'FOUNDER_TIER_2',rank:420,tier:2,total:1300,limit:300},account:{userId:'me',email:null,displayName:'\u5b98\u7f51\u672c\u4eba',username:'real-handle',joinedAt:'2026-09-03T00:00:00Z'}}},identity:{status:'ok',fetchedAt:Date.now(),data:{stellarId:'TS-QS-REAL42',primaryDomain:'QS',title:'observer'}},entitlements:{status:'ok',fetchedAt:Date.now(),data:[]}}
       else if(url.includes('/auth/v1/user')) return new Response('{}',{status:403})
       else if(url.includes('/profiles')) body=[{id:'me',display_name:'官网本人',username:'real-handle',avatar_url:'https://example.com/avatar.png',created_at:'2026-09-03T00:00:00Z'}]
       else if(url.includes('/stellar_identities')) body=[{user_id:'me',stellar_id:'TS-QS-REAL42',primary_domain:'QS',title:'observer'}]
@@ -954,4 +959,142 @@ test('late consumed approval after cancellation revokes the returned remote sess
   assert.deepEqual(revoked,['late-session-fixture'])
   assert.equal(new TokenStore(home,'account').load(),null)
  } finally {cleanup()}
+})
+
+
+test('real routes expose snapshot errors without clearing identity or mistaking an expired session for offline', async()=> {
+  const {home,cleanup}=makeHome()
+  try {
+    const store=new TokenStore(home,'account')
+    const credential=`fixture.${Buffer.from(JSON.stringify({sub:'sync-owner'})).toString('base64url')}.fixture`
+    store.save({accessToken:credential,expiresAt:Date.now()+3600000})
+    saveAccountIdentity(store,store.load()!,{stellarId:'TS-QS-CACHED',primaryDomain:'QS',title:'observer'})
+    for (const code of ['auth_required','forbidden','network_error','timeout','service_error','endpoint_unavailable','protocol_error'] as const) {
+      const router=routerFor(home,{fetchAccountSnapshot:async()=>({code,elapsedMs:1})})
+      const refreshed=await router('POST','/account/identity/refresh',{},AUTH)
+      assert.equal((refreshed.body as {code:string}).code,code)
+      const state=(await router('GET','/account/status',undefined,AUTH)).body as Record<string,unknown>
+      assert.equal(state.stellarId,'TS-QS-CACHED')
+      assert.equal(state.authStatus,code==='auth_required'?'reauth_required':'unverified')
+      assert.equal(state.syncCode,code);assert.ok(!JSON.stringify(state).includes(credential))
+    }
+  } finally {cleanup()}
+})
+test('a confirmed empty snapshot clears only the identity and is a successful synchronized Basic account',async()=> {
+ const {home,cleanup}=makeHome()
+ try {
+  const store=new TokenStore(home,'account'); store.save({accessToken:'fixture',expiresAt:Date.now()+3600000})
+  saveAccountIdentity(store,store.load()!,{stellarId:'old',primaryDomain:'QS',title:'observer'})
+  const at=Date.now()
+  const router=routerFor(home,{fetchAccountSnapshot:async()=>({code:'ok',elapsedMs:0,snapshot:{version:1,userId:'owner',profile:{status:'ok',fetchedAt:at,data:{avatarUrl:null,founding:null,fetchedAt:at,account:{userId:'owner',email:null,displayName:'Basic member'}}},identity:{status:'empty',fetchedAt:at,data:null},entitlements:{status:'ok',fetchedAt:at,data:[]}}})})
+  const res=await router('POST','/account/identity/refresh',{},AUTH); assert.equal((res.body as {complete:boolean}).complete,true)
+  const state=(await router('GET','/account/status',undefined,AUTH)).body as Record<string,unknown>
+  assert.equal(state.stellarId,null);assert.equal(state.avatarUrl,null);assert.equal(state.founding,null);assert.equal(state.authStatus,'authenticated');assert.deepEqual(state.entitlements,[])
+ } finally {cleanup()}
+})
+
+// ── 设备许可恢复：凭据消费收回 sidecar（2026-10-06 P0）─────────────────────
+//
+// `account.json` 自 v3.21.1 起是 AES-256-GCM 密文信封（`secure-store.ts`
+// encodeSecret）。桌面壳曾按明文 JSON 取顶层 `accessToken`，于是「恢复 Pro
+// 激活」在默认安装下恒返回 auth_required（记于
+// `.rivet/plans/账户激活-p0-修复-把凭据消费收回-sidecar.md`）。凭据消费因此
+// 收到这里：sidecar 解密取凭据 → 调官网 EF → 只把签名后的 grant 交出去。
+
+test('POST /account/activate-device 从密文信封取凭据代跑恢复，响应体不含凭据', async () => {
+  const { home, cleanup } = makeHome()
+  try {
+    const credential = `fixture.${Buffer.from(JSON.stringify({ sub: 'owner-1' })).toString('base64url')}.fixture`
+    // 真实 TokenStore：写的是密文信封，走的是真解密路径——「拿得到凭据」这件事
+    // 只有真实落盘 + 真解密能证，桩掉就恰好漏掉本次 P0 的格式契约。
+    new TokenStore(home, 'account').save({ accessToken: credential, expiresAt: Date.now() + 3600000 })
+    let seen: { accessToken: string; licenseId: string; deviceId: string } | undefined
+    const router = routerFor(home, {
+      activateAccountLicense: async (accessToken, licenseId, deviceId) => {
+        seen = { accessToken, licenseId, deviceId }
+        return { code: 'ok', grant: 'signed-grant' }
+      },
+    })
+    const res = await router('POST', '/account/activate-device', { licenseId: 'lic-1', deviceId: 'machine-uid-1' }, AUTH)
+    assert.equal(res.status, 200)
+    assert.equal((res.body as { grant: string }).grant, 'signed-grant')
+    // 信封确实被解开：解出来的凭据到了调用点，设备指纹与许可号也透传了
+    assert.equal(seen?.accessToken, credential)
+    assert.equal(seen?.licenseId, 'lic-1')
+    assert.equal(seen?.deviceId, 'machine-uid-1')
+    assert.equal(JSON.stringify(res.body).includes(credential), false, '凭据不许回传')
+  } finally { cleanup() }
+})
+
+test('POST /account/activate-device 未登录是 401 auth_required，不打官网', async () => {
+  const { home, cleanup } = makeHome()
+  try {
+    let called = 0
+    const router = routerFor(home, {
+      activateAccountLicense: async () => { called++; return { code: 'ok', grant: 'signed-grant' } },
+    })
+    const res = await router('POST', '/account/activate-device', { licenseId: 'lic-1', deviceId: 'machine-uid-1' }, AUTH)
+    assert.equal(res.status, 401)
+    assert.equal((res.body as { error: string }).error, 'auth_required')
+    assert.equal(called, 0, '没有凭据就不该发请求')
+  } finally { cleanup() }
+})
+
+test('POST /account/activate-device 请求期间账号被替换：迟到的 grant 不返回', async () => {
+  const { home, cleanup } = makeHome()
+  try {
+    const store = new TokenStore(home, 'account')
+    store.save({ accessToken: 'fixture-original', expiresAt: Date.now() + 3600000 })
+    const router = routerFor(home, {
+      activateAccountLicense: async () => {
+        // 请求在途时换号（或登出）——旧壳侧守卫是这条不变量的家，现在它在 sidecar
+        store.save({ accessToken: 'fixture-replacement', expiresAt: Date.now() + 3600000 })
+        return { code: 'ok', grant: 'late-grant' }
+      },
+    })
+    const res = await router('POST', '/account/activate-device', { licenseId: 'lic-1', deviceId: 'machine-uid-1' }, AUTH)
+    assert.equal(res.status, 409)
+    assert.equal((res.body as { error: string }).error, 'account_changed')
+    assert.equal(JSON.stringify(res.body).includes('late-grant'), false)
+  } finally { cleanup() }
+})
+
+test('POST /account/activate-device 官网失败码原样透出，不混成服务不可用', async () => {
+  const { home, cleanup } = makeHome()
+  try {
+    new TokenStore(home, 'account').save({ accessToken: 'fixture', expiresAt: Date.now() + 3600000 })
+    const cases: [ActivateAccountLicenseCode, number][] = [
+      ['auth_required', 401],
+      ['endpoint_unavailable', 404],
+      ['activation_limit_reached', 403],
+      ['device_mismatch', 403],
+      ['license_not_owned', 403],
+      ['network_error', 502],
+      ['timeout', 502],
+      ['protocol_error', 502],
+      ['service_error', 502],
+    ]
+    for (const [code, status] of cases) {
+      const router = routerFor(home, { activateAccountLicense: async () => ({ code }) })
+      const res = await router('POST', '/account/activate-device', { licenseId: 'lic-1', deviceId: 'machine-uid-1' }, AUTH)
+      assert.equal(res.status, status, `${code} 的状态码`)
+      assert.equal((res.body as { error: string }).error, code)
+    }
+  } finally { cleanup() }
+})
+
+test('POST /account/activate-device 许可号或设备指纹非法是 400，不打官网', async () => {
+  const { home, cleanup } = makeHome()
+  try {
+    new TokenStore(home, 'account').save({ accessToken: 'fixture', expiresAt: Date.now() + 3600000 })
+    let called = 0
+    const router = routerFor(home, {
+      activateAccountLicense: async () => { called++; return { code: 'ok', grant: 'signed-grant' } },
+    })
+    for (const body of [{}, { licenseId: '' , deviceId: 'machine-uid-1' }, { licenseId: 'x'.repeat(129), deviceId: 'machine-uid-1' }, { licenseId: 'lic-1', deviceId: 'bad id' }, { licenseId: 'lic-1' }]) {
+      const res = await router('POST', '/account/activate-device', body, AUTH)
+      assert.equal(res.status, 400, JSON.stringify(body))
+    }
+    assert.equal(called, 0)
+  } finally { cleanup() }
 })

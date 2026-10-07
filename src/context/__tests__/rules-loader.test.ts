@@ -5,6 +5,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { loadProjectRules } from '../rules-loader.js'
 
+// 信任门族（2026-10-07 审计修复）：本文件验「授信项目的规则装载」正常语义；
+// 未授信拒绝语义在 src/config/__tests__/project-trust-surface-gates.test.ts 覆盖。
+// node:test 文件级进程隔离，此 env 不外泄。
+process.env.RIVET_TRUST_PROJECT = '1'
+
 describe('loadProjectRules', () => {
   it('loads .md files from rules directory as project_rule proposals', () => {
     const dir = mkdtempSync(join(tmpdir(), 'rivet-rules-'))

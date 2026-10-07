@@ -82,6 +82,16 @@ describe('isPrivateIP', () => {
     assert.equal(isPrivateIP('::ffff:0:8.8.8.8'), false)
     assert.equal(isPrivateIP('::ffff:0:5db8:d822'), false)
   })
+
+  // 2026-10-07 审计 Finding 6：全项目唯一 fail-open 的收口——不可解析输入没有
+  // 「公网可达」证据，按不可信拒绝。消费点全部是「true=拦截」语义，无放行侧。
+  it('fail-closed：不可解析的输入按不可信拒绝', () => {
+    assert.equal(isPrivateIP('not-an-ip'), true, '非 IP 字面量必须拒绝')
+    assert.equal(isPrivateIP(''), true, '空串必须拒绝')
+    assert.equal(isPrivateIP('2130706433'), true, '十进制 127.0.0.1 形态必须拒绝（防新调用点直接吃用户输入）')
+    assert.equal(isPrivateIP('127.1'), true, '缩写形态必须拒绝')
+    assert.equal(isPrivateIP('0x7f000001'), true, '十六进制形态必须拒绝')
+  })
 })
 
 describe('resolveAndAssertPublic', () => {

@@ -54,6 +54,7 @@ export interface JobEvent {
 }
 
 export interface JobSpawnOptions {
+  onCompleted?: (result: { job: JobSnapshot; output: string; error?: string; timedOut: boolean }) => void
   /** The command actually executed (post rtk/mirror/sandbox rewrite). */
   command: string
   /** Original command for display (pre-rewrite). */
@@ -99,9 +100,15 @@ class BackgroundJob {
   private child: ChildProcess | null = null
   private pid?: number
   private logStream: WriteStream | null = null
+  private logClosed: Promise<void> = Promise.resolve()
+  private resolveFinished!: () => void
+  private readonly finished = new Promise<void>(resolve => { this.resolveFinished = resolve })
   private killTimer: ReturnType<typeof setTimeout> | null = null
   private lifetimeTimer: ReturnType<typeof setTimeout> | null = null
   private waiters: Waiter[] = []
+  private completed = false
+  private spawnError?: string
+  private timedOut = false
   private readonly decoderOut = new WinStreamDecoder()
   private readonly decoderErr = new WinStreamDecoder()
 
@@ -120,6 +127,7 @@ class BackgroundJob {
   start(logPath: string): void {
     try {
       this.logStream = createWriteStream(logPath, { flags: 'a' })
+      this.logClosed = new Promise(resolve => { this.logStream!.once('close', resolve) })
       // Disk logging is best-effort — a write/open failure (e.g. dir removed)
       // must never throw asynchronously and crash the process.
       this.logStream.on('error', () => { this.logStream = null })
@@ -164,6 +172,7 @@ class BackgroundJob {
     child.stderr?.on('data', (d: Buffer) => this.onData(this.decoderErr.write(d)))
     child.on('close', (code) => this.onExit(code ?? 1))
     child.on('error', (err) => {
+      this.spawnError = err.message
       this.onData(`\n[job error] ${err.message}\n`)
       this.onExit(1)
     })
@@ -210,12 +219,15 @@ class BackgroundJob {
   private onLifetimeExceeded(maxMs: number): void {
     this.lifetimeTimer = null
     if (this.status !== 'running') return
+    this.timedOut = true
     const secs = Math.round(maxMs / 1000)
     this.onData(`\n[job killed] exceeded max lifetime (${secs}s) — auto-terminated\n`)
     this.kill()
   }
 
   private onExit(code: number): void {
+    if (this.completed) return
+    this.completed = true
     if (this.killTimer) { clearTimeout(this.killTimer); this.killTimer = null }
     if (this.lifetimeTimer) { clearTimeout(this.lifetimeTimer); this.lifetimeTimer = null }
     if (this.status !== 'running') {
@@ -238,7 +250,10 @@ class BackgroundJob {
       w.resolve({ job: this.snapshot(), matched: false, timedOut: false, tail: this.tail() })
     }
     this.waiters = []
+    try { this.opts.onCompleted?.({ job: this.snapshot(), output: this.ring, error: this.spawnError, timedOut: this.timedOut }) }
+    catch (error) { debugLog(`[job-completion-error] ${error instanceof Error ? error.message : String(error)}`) }
     this.emit({ kind: 'exit', job: this.snapshot() })
+    void this.logClosed.then(() => this.resolveFinished())
   }
 
   await(opts: JobAwaitOptions): Promise<JobAwaitResult> {
@@ -281,6 +296,21 @@ class BackgroundJob {
 
   logs(): string {
     return this.ring
+  }
+
+  /** Wait for child close and log close, including jobs already marked killed. */
+  async killAsync(): Promise<boolean> {
+    const signalled = this.kill()
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        this.finished,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`Job ${this.id} cleanup timed out`)), 5000)
+        }),
+      ])
+      return signalled
+    } finally { clearTimeout(timer) }
   }
 
   private tail(limit = 4000): string {
@@ -382,6 +412,10 @@ export class SessionJobs extends EventEmitter implements JobRegistry {
   /** Terminate every running job — call on session close to avoid orphans. */
   killAll(): void {
     for (const job of this.jobs.values()) job.kill()
+  }
+
+  async killAllAsync(): Promise<void> {
+    await Promise.all([...this.jobs.values()].map(job => job.killAsync()))
   }
 
   /** 淘汰最旧的终态条目，把终态保有量压回上限（见 MAX_TERMINAL_JOBS）。 */

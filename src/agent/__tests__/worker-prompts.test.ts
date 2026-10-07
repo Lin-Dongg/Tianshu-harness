@@ -793,3 +793,26 @@ describe('worker prompts', () => {
 
   })
 })
+
+describe('收敛纪律覆盖所有 profile（2026-10-06 verifier 空转事故）', () => {
+  // 事故形态：verifier profile 没有收敛纪律（当时只有 code_scout/doc_scout 的
+  // expertisePrompt 里有），于是它在"找 ledger"死胡同里空转到预算耗尽、被中断、
+  // 未产出报告。纪律靠 per-profile 手写必然漏（20 个 profile 漏了 18 个）——
+  // 所以必须落在所有 worker 共享的通用段（buildWorkerPrompt 的 parts）。
+  it('每个 profile 的 worker prompt 都含收敛纪律，不依赖 per-profile 手写', () => {
+    const profiles = ['code_scout', 'verifier', 'adversarial_verifier', 'patcher', 'architect', 'lint_fixer']
+    for (const profile of profiles) {
+      const order = createReadOnlyWorkOrder({
+        id: 'wo_conv',
+        parentTurnId: 'turn_1',
+        kind: 'code_search',
+        profile: profile as never,
+        objective: '核验某个论断是否存在。',
+        scope: {},
+      })
+      const prompt = buildWorkerPrompt(order)
+      assert.ok(/收敛纪律/.test(prompt), `${profile} 的 prompt 缺收敛纪律`)
+      assert.ok(/已证无/.test(prompt), `${profile} 的纪律未点明「已证无即结论」`)
+    }
+  })
+})

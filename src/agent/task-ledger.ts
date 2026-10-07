@@ -75,6 +75,7 @@ export interface TaskLedgerSummary {
 }
 
 export interface TaskLedger {
+  captureVerificationFingerprint?: (isolated?: boolean, executionRoot?: string) => string | null
   record(event: Omit<TaskLedgerEvent, 'timestamp'>): void
   getEvents(): ReadonlyArray<TaskLedgerEvent>
   /** Remove all events associated with a specific path (e.g. a discarded plan draft). */

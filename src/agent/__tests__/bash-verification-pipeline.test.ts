@@ -4,6 +4,28 @@ import { assessImpactedTestCoverage } from '../verification-attribution.js'
 import { runVerification } from './helpers/verification-pipeline-fixture.js'
 
 describe('real bash verification pipeline', () => {
+  it('returns compound-shell guidance to the model and UI without claiming failure or coverage', async () => {
+    const result = await runVerification('node --test good.test.mjs | tail -5', false)
+    assert.equal(result.verification.status, 'blocked')
+    assert.equal(result.ledgerEvent.status, 'blocked')
+    assert.equal(result.verification.coverage?.complete ?? false, false)
+    assert.equal(result.pipelineResult.toolResult.type, 'tool_result')
+    if (result.pipelineResult.toolResult.type !== 'tool_result') assert.fail('expected tool result')
+    const content = result.pipelineResult.toolResult.content
+    assert.match(content, /可复制的单条命令：node --test good\.test\.mjs/)
+    assert.match(content, /不能据此认定测试失败/)
+    assert.match(result.emittedContent, /可复制的单条命令：node --test good\.test\.mjs/)
+  })
+
+  it('keeps package and node queries out of the foreground verification ledger', async () => {
+    for (const command of ['npm --version', 'node -e "console.log(1)"']) {
+      const result = await runVerification(command, false)
+      assert.equal(result.actual.exitCode, 0)
+      assert.equal(result.ledger.getVerifications().length, 0, command)
+      assert.doesNotMatch(result.emittedContent, /\[验证反馈\]/)
+    }
+  })
+
   it('blocks delivery after actual targeted assertion failure with isError=false', async () => {
     const result = await runVerification('node --test bad.test.mjs', true, true)
     assert.equal(result.actual.isError, false, 'normal execution is distinct from assertion success')

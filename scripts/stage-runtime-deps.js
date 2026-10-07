@@ -33,7 +33,7 @@ import { existsSync, mkdirSync, cpSync, readFileSync, writeFileSync, rmSync, sta
 import { dirname, join, relative, isAbsolute } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
-import { isForeignPlatformPackage } from './runtime-platform-filter.js'
+import { isForeignPlatformPackage, parsePlatformPackage, resolveTargetPlatform } from './runtime-platform-filter.js'
 import { pruneTreeSitterWasms } from './tree-sitter-wasm-keep.js'
 import { pruneTypescriptStaging } from './typescript-stage-trim.js'
 import { writeStagingMarker, clearStagingMarker } from './staged-runtime-verify.js'
@@ -63,20 +63,14 @@ function pkgDir(name, from = repoRoot) {
 }
 
 // ── 跨架构支持（与 pack-native.js 同口径）─────────────────────────────────
+// 目标平台（OS + 架构）来自 TAURI_ENV_TARGET_TRIPLE，无则回退宿主。解析与过滤
+// 判据统一在 runtime-platform-filter.js——issue #366 之前这里只解析架构，OS
+// 维度整体缺失（macOS 交叉打 Windows 包因此把目标平台的包全当成了「不存在」）。
+const TARGET = resolveTargetPlatform()
+
 // 目标架构 ≠ 宿主时，dist/native/better_sqlite3.node 是目标架构的，无法在宿主
 // 进程 require 探测（会抛 arch mismatch）。此时跳过 round-trip 断言，改为读
 // Mach-O 头校验架构（fail-closed），ABI 正确性由 pack-native 的 --target 保证。
-/** 从 Tauri 目标三元组解析目标架构；无则退回宿主 process.arch。 */
-function resolveTargetArch() {
-  const triple = (process.env.TAURI_ENV_TARGET_TRIPLE || '').trim()
-  if (triple) {
-    const tok = triple.split('-')[0]
-    if (tok === 'aarch64' || tok === 'arm64') return 'arm64'
-    if (tok === 'x86_64') return 'x64'
-    if (tok === 'i686') return 'x86'
-  }
-  return process.arch
-}
 
 const CPU_TYPE_X86_64 = 0x01000007
 const CPU_TYPE_ARM64 = 0x0100000c
@@ -103,10 +97,9 @@ function machoArch(path) {
 function readDeps(dir) {
   try {
     const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'))
-    return [
-      ...Object.keys(pkg.dependencies || {}),
-      ...Object.keys(pkg.optionalDependencies || {}),
-    ]
+    // 依赖 + 可选依赖；可选依赖带上版本范围（交叉构建补目标平台包时按它取）。
+    return Object.entries({ ...(pkg.dependencies || {}), ...(pkg.optionalDependencies || {}) })
+      .map(([name, range]) => ({ name, range }))
   } catch {
     return []
   }
@@ -126,19 +119,19 @@ writeFileSync(join(repoRoot, 'dist', 'package.json'), JSON.stringify({ name, ver
 writeStagingMarker(join(repoRoot, 'dist'), 'copying root package closure')
 
 const visited = new Set()
-const queue = ROOTS.map(name => ({ name, from: repoRoot }))
+const queue = ROOTS.map(name => ({ name, range: undefined, from: repoRoot }))
 const missing = []
+/** 目标平台需要、但本机 node_modules 里没有的平台包（issue #366 的静态形态）。 */
+const missingTargetPlatform = []
 let copied = 0
 let skippedForeign = 0
 let skippedTypes = 0
-const keepArchRaw = resolveTargetArch()
-/** @type {'arm64'|'x64'} */
-const keepArch = keepArchRaw === 'arm64' ? 'arm64' : 'x64'
+const keepArch = TARGET.arch
 
 while (queue.length > 0) {
-  const { name, from } = queue.shift()
+  const { name, range, from } = queue.shift()
 
-  if (isForeignPlatformPackage(name, keepArch)) {
+  if (isForeignPlatformPackage(name, TARGET)) {
     skippedForeign++
     continue
   }
@@ -154,6 +147,11 @@ while (queue.length > 0) {
     // Optional/platform packages for other hosts are not installed — skip quietly
     // unless it's a declared root (then surface it).
     if (from === repoRoot) missing.push(name)
+    // 目标平台的平台包缺席 = 产物会在目标机上静默失去该能力（issue #366：
+    // Windows 包的 @esbuild/win32-x64）。绝不静默跳过——收集起来统一 fail loud。
+    else if (parsePlatformPackage(name)) {
+      missingTargetPlatform.push({ name, range, from: relative(repoRoot, from) })
+    }
     continue
   }
   if (visited.has(src)) continue
@@ -166,7 +164,7 @@ while (queue.length > 0) {
   cpSync(src, dest, { recursive: true, dereference: true })
   copied++
 
-  for (const dep of readDeps(src)) queue.push({ name: dep, from: src })
+  for (const dep of readDeps(src)) queue.push({ ...dep, from: src })
 }
 
 // sourcemap 是调试产物，运行时闭包不需要——exceljs 单包就带 14MB .map。
@@ -199,6 +197,31 @@ function dirSizeMb(dir) {
   }
   if (existsSync(dir)) walk(dir)
   return Math.round(bytes / 1024 / 1024)
+}
+
+// 目标平台的平台包缺席：产物「打得出来、装得上、跑起来静默缺能力」，是最贵的
+// 一类缺陷（issue #366 的 Windows 包就是这样发的）。宁可在这里红。
+if (missingTargetPlatform.length > 0) {
+  if (process.env.RIVET_ALLOW_MISSING_TARGET_PKGS === '1') {
+    console.warn(
+      '⚠ RIVET_ALLOW_MISSING_TARGET_PKGS=1 — 放行 %d 个缺失的目标平台包（产物在 %s-%s 上会静默降级）：%s',
+      missingTargetPlatform.length, TARGET.os, TARGET.arch,
+      missingTargetPlatform.map(m => m.name).join(', '),
+    )
+  } else {
+    console.error(
+      '✗ stage-runtime-deps: 目标平台 %s-%s 的平台包在本机 node_modules 里缺失，拒绝 stage 一个残缺的运行时：',
+      TARGET.os, TARGET.arch,
+    )
+    for (const m of missingTargetPlatform) {
+      console.error('    %s%s  （声明于 %s）', m.name, m.range ? `@${m.range}` : '', m.from)
+    }
+    console.error('')
+    console.error('  修法：node scripts/ensure-target-runtime-pkgs.js   # 按目标平台补齐（幂等，只拉平台包）')
+    console.error('  交叉构建（macOS → Windows）请在该脚本里保证此步先于 `npm run build` 执行。')
+    console.error('  确认该包在目标平台运行时确实用不到时，才用 RIVET_ALLOW_MISSING_TARGET_PKGS=1 放行（会写出降级包）。')
+    process.exit(1)
+  }
 }
 
 if (missing.length > 0) {
@@ -251,18 +274,8 @@ const AST_GREP_PREBUILD_KEEP = {
   'win32:x64': 'prebuild-Windows-X64',
 }
 
-function resolveTargetOS() {
-  const triple = (process.env.TAURI_ENV_TARGET_TRIPLE || '').trim()
-  if (triple) {
-    if (triple.includes('linux')) return 'linux'
-    if (triple.includes('darwin')) return 'darwin'
-    if (triple.includes('windows')) return 'win32'
-  }
-  return process.platform
-}
-
 function pruneAstGrepLangPrebuilds() {
-  const keep = AST_GREP_PREBUILD_KEEP[`${resolveTargetOS()}:${keepArch}`]
+  const keep = AST_GREP_PREBUILD_KEEP[`${TARGET.os}:${keepArch}`]
   const removed = []
   const langRoot = join(destModules, '@ast-grep')
   if (!existsSync(langRoot)) return { removed }
@@ -283,7 +296,7 @@ const prebuildPrune = pruneAstGrepLangPrebuilds()
 if (prebuildPrune.removed.length > 0) {
   console.log(
     '✅ Pruned ast-grep lang prebuilds (keep=%s): removed %d variant(s) → %dMB',
-    AST_GREP_PREBUILD_KEEP[`${resolveTargetOS()}:${keepArch}`],
+    AST_GREP_PREBUILD_KEEP[`${TARGET.os}:${keepArch}`],
     prebuildPrune.removed.length,
     dirSizeMb(join(destModules, '@ast-grep')),
   )
@@ -323,7 +336,7 @@ function stageBetterSqlite3Wrapper() {
   }
   // 跨架构构建：宿主进程无法 require 目标架构 .node。改为 Mach-O 架构校验
   // （fail-closed），round-trip 断言留给同架构宿主。
-  const targetArch = resolveTargetArch()
+  const targetArch = TARGET.arch
   if (targetArch !== process.arch) {
     const a = machoArch(nodeBin)
     if (a && a !== targetArch) {

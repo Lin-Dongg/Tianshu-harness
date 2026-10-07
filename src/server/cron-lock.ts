@@ -22,8 +22,11 @@ import {
   existsSync,
   mkdirSync,
   linkSync,
+  lstatSync,
+  renameSync,
+  rmdirSync,
 } from 'node:fs'
-import { dirname } from 'node:path'
+import { dirname, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { hostname as osHostname } from 'node:os'
 import { isMainThread } from 'node:worker_threads'
@@ -121,20 +124,25 @@ export function isProcStatZombie(statLine: string): boolean {
 export function readLockFile(path: string): LockInfo | null {
   if (!existsSync(path)) return null
   try {
-    const raw = readFileSync(path, 'utf-8')
+    const raw = readFileSync(lstatSync(path).isDirectory() ? join(path, 'owner.json') : path, 'utf-8')
     return JSON.parse(raw) as LockInfo
   } catch {
     return null
   }
 }
 
-/** O_EXCL 创建锁文件；写入完成后用 hard-link 发布，避免读到半写内容。导出理由同 readLockFile。 */
+/** 完整发布锁：优先 hard-link，不支持时原子 rename 非空目录（不能覆盖已有锁目录）。 */
 export function createLockFileExclusive(path: string, info: LockInfo): CreateLockResult {
-  mkdirSync(dirname(path), { recursive: true })
   const tmpPath = `${path}.${process.pid}.${randomUUID()}.tmp`
   try {
+    mkdirSync(dirname(path), { recursive: true })
     writeFileSync(tmpPath, JSON.stringify(info, null, 2), { encoding: 'utf-8', flag: 'wx' })
-    linkSync(tmpPath, path)
+    try {
+      linkSync(tmpPath, path)
+    } catch (error) {
+      if (!['EPERM', 'ENOTSUP', 'EOPNOTSUPP', 'EXDEV', 'ENOSYS'].includes(errorCode(error) ?? '')) throw error
+      return publishDirectoryLock(path, tmpPath, info)
+    }
     unlinkSync(tmpPath)
     return { ok: true }
   } catch (error) {
@@ -145,6 +153,39 @@ export function createLockFileExclusive(path: string, info: LockInfo): CreateLoc
     }
     if (errorCode(error) === 'EEXIST') return { ok: false, reason: 'exists' }
     return { ok: false, reason: 'error', message: errorMessage(error) }
+  }
+}
+
+function publishDirectoryLock(path: string, tmpPath: string, info: LockInfo): CreateLockResult {
+  const directory = `${tmpPath}.d`
+  try {
+    mkdirSync(directory)
+    writeFileSync(join(directory, 'owner.json'), JSON.stringify(info, null, 2), { flag: 'wx' })
+    // POSIX rename refuses to replace a nonempty directory or a regular file.
+    // Prepare everything before publication: readers never see a partial owner.
+    renameSync(directory, path)
+    return { ok: true }
+  } catch (error) {
+    if (['EEXIST', 'ENOTEMPTY', 'ENOTDIR', 'EISDIR', 'EPERM', 'EACCES'].includes(errorCode(error) ?? '') && existsSync(path)) {
+      return { ok: false, reason: 'exists' }
+    }
+    return { ok: false, reason: 'error', message: errorMessage(error) }
+  } finally {
+    try { unlinkSync(tmpPath) } catch { /* best effort */ }
+    try { unlinkSync(join(directory, 'owner.json')) } catch { /* best effort */ }
+    try { rmdirSync(directory) } catch { /* published or failed cleanup */ }
+  }
+}
+
+/** Remove only our lock representation; never recursively delete unknown contents. */
+export function removeLockFile(path: string): void {
+  if (lstatSync(path).isDirectory()) {
+    try { unlinkSync(join(path, 'owner.json')) } catch (error) {
+      if (errorCode(error) !== 'ENOENT') throw error
+    }
+    rmdirSync(path)
+  } else {
+    unlinkSync(path)
   }
 }
 
@@ -231,7 +272,7 @@ export class CronLock {
       if (existsSync(this.lockPath)) {
         const owner = readLockFile(this.lockPath)
         if (owner && this.isOwnLockInfo(owner)) {
-          unlinkSync(this.lockPath)
+          removeLockFile(this.lockPath)
         }
       }
     } catch {
@@ -245,7 +286,7 @@ export class CronLock {
     this.stopHealthCheck()
     try {
       if (existsSync(this.lockPath)) {
-        unlinkSync(this.lockPath)
+        removeLockFile(this.lockPath)
       }
     } catch {
       // 清理尽力而为
@@ -338,7 +379,7 @@ export class CronLock {
       }
 
       try {
-        unlinkSync(this.lockPath)
+        removeLockFile(this.lockPath)
       } catch {
         // 其他进程可能已经删除旧锁；继续走 O_EXCL 竞争
       }
@@ -383,7 +424,7 @@ export class CronLock {
     if (owner && this.isOwnLockInfo(owner)) return { ok: true }
     if (owner && !isPidAlive(owner.pid)) {
       try {
-        unlinkSync(path)
+        removeLockFile(path)
       } catch {
         // 其他进程可能已经接管 reclaim lock
       }
@@ -397,7 +438,7 @@ export class CronLock {
     try {
       const owner = readLockFile(path)
       if (owner && this.isOwnLockInfo(owner)) {
-        unlinkSync(path)
+        removeLockFile(path)
       }
     } catch {
       // 清理尽力而为

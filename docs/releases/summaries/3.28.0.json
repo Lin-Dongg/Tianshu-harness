@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "version": "3.28.0",
+  "date": "2026-10-05",
+  "fullNotesUrl": "https://github.com/huiliyi37/Tianshu-harness/releases/tag/v3.28.0",
+  "locales": {
+    "zh": {
+      "title": "会话更稳定，工作更顺畅",
+      "highlights": ["改进会话恢复与长会话处理，减少任务被意外中断。", "完善项目安全边界，未经信任的仓库内容不会自动进入指令。", "改进 Git 工作台、文件打开与模型异常提示。"]
+    },
+    "en": {
+      "title": "More reliable sessions and smoother work",
+      "highlights": ["Improved session recovery and long conversations to reduce unexpected interruptions.", "Stronger project trust boundaries prevent untrusted repository content from becoming instructions.", "Improved the Git workbench, file opening and model error feedback."]
+    }
+  }
+}

@@ -99,8 +99,14 @@ test('distill 路由 Pro 门禁：computerUse 未启用时 403 pro_required', as
     ...DEFAULT_CONFIG,
     pro: { ...DEFAULT_CONFIG.pro, enabled: false },
   }
+  // 必须隔离 RIVET_HOME：开发机激活过 Pro 时 ~/.rivet/license.json 存在，不隔离
+  // 就变成「本机已激活」→ 门禁放行、用例假红（2026-10-06 实测：未隔离 201 !== 403，
+  // 指向空 HOME 后 5/5 绿）。与本文件 Pro 放行用例同一范式。
+  const home = mkdtempSync(join(tmpdir(), 'distill-nopro-'))
+  const prevHome = process.env.RIVET_HOME
   const { router } = setup(disabled)
   const prevEnv = process.env.RIVET_PRO
+  process.env.RIVET_HOME = home
   delete process.env.RIVET_PRO
   try {
     const res = await router('POST', '/recordings/distill', { recordingId: 'r', jsonl: JSONL }, AUTH)
@@ -108,6 +114,8 @@ test('distill 路由 Pro 门禁：computerUse 未启用时 403 pro_required', as
     assert.equal((res.body as { error: string }).error, 'pro_required')
   } finally {
     if (prevEnv !== undefined) process.env.RIVET_PRO = prevEnv
+    if (prevHome === undefined) delete process.env.RIVET_HOME
+    else process.env.RIVET_HOME = prevHome
   }
 })
 

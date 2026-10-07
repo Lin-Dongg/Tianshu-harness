@@ -6,10 +6,11 @@ import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import type { TestCompletionCoverage } from './types.js'
 import { classifyVerificationCommand, shellWord, verificationArgv } from './verification-command.js'
+import { unwrapVerification } from './verification-invocation.js'
 
 const ENV = 'RIVET_TEST_COMPLETION_RUN'
 interface Binding { runId: string; dir: string; root: string }
-interface Receipt { runId: string; batchId: string; cwd: string; complete: boolean; success: boolean; files: TestCompletionCoverage['files'] }
+interface Receipt { runId: string; batchId: string; cwd: string; complete: boolean; success: boolean; totals?: TestCompletionCoverage['totals']; files: TestCompletionCoverage['files'] }
 
 /** Bind the invocation to the workspace before execution; concurrent edits lose evidence. */
 function workspaceIdentity(cwd: string): string | undefined {
@@ -30,19 +31,19 @@ function reporter(binding: Binding, batchId: string, cwd: string): string {
 import {relative,resolve} from 'node:path';
 const binding=${JSON.stringify({ ...binding, batchId, cwd })};
 export default async function*(events){
- const files=[]; let complete=false,success=false;
+ const files=[]; let complete=false,success=false,totals;
  for await(const event of events){
   if(event.type==='test:summary'){
    const d=event.data,c=d.counts;
    if(d.file){
     const path=relative(binding.root,resolve(binding.cwd,d.file)).replaceAll('\\\\','/');
     files.push({path,outcome:d.success&&c.failed===0&&c.cancelled===0?(c.passed>0?'passed':'incomplete'):'failed',tests:c.tests,skipped:c.skipped,cancelled:c.cancelled});
-   }else{ complete=true; success=d.success&&c.failed===0&&c.cancelled===0; }
+   }else{ complete=true; success=d.success&&c.failed===0&&c.cancelled===0; totals={tests:c.tests,passed:c.passed,failed:c.failed,skipped:c.skipped,cancelled:c.cancelled,todo:c.todo}; }
   }
   yield '';
  }
  const path=binding.dir+'/'+binding.batchId+'.json';
- writeFileSync(path+'.partial',JSON.stringify({...binding,complete,success,files}));renameSync(path+'.partial',path);
+ writeFileSync(path+'.partial',JSON.stringify({...binding,complete,success,totals,files}));renameSync(path+'.partial',path);
 }`
   writeFileSync(filename, source, { mode: 0o600 })
   return pathToFileURL(filename).href
@@ -84,17 +85,22 @@ export interface CompletionCapture {
   dispose(): void
 }
 
-export function prepareCompletionCapture(command: string, cwd: string, shellKind: 'bash' | 'sh' | 'powershell' | 'cmd' = 'bash'): CompletionCapture | undefined {
-  const invocation = classifyVerificationCommand(command, cwd)
+export function prepareCompletionCapture(command: string, cwd: string, shellKind: 'bash' | 'sh' | 'powershell' | 'cmd' = 'bash', repositoryRoot?: string): CompletionCapture | undefined {
+  const unwrapped = unwrapVerification(command, cwd, shellKind === 'bash' || shellKind === 'sh')
+  if (!unwrapped) return undefined
+  cwd = unwrapped.cwd
+  const invocation = classifyVerificationCommand(unwrapped.command, cwd)
   if ((!invocation.nodeTest && !invocation.batchRunner) || invocation.filtered) return undefined
+  if (invocation.fixedPackageTargets) return undefined // npm appends flags after fixed files; Node silently ignores those reporter flags.
   if (invocation.argv.some(a => a.startsWith('--test-reporter') || a === '--test-force-exit')) return undefined
   try {
     const root = execFileSync('git', ['rev-parse', '--show-toplevel'], { cwd, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8' }).trim()
+    if (repositoryRoot) repositoryRoot = realpathSync(repositoryRoot)
     const before = workspaceIdentity(root)
     if (!before) return undefined
     const binding: Binding = { runId: randomUUID(), dir: mkdtempSync(join(tmpdir(), 'rivet-completion-')), root: resolve(root) }
     const env: NodeJS.ProcessEnv = { [ENV]: JSON.stringify(binding), NODE_TEST_CONTEXT: undefined }
-    let actualCommand = command
+    let actualCommand = unwrapped.command
     let directFinish: ((success: boolean) => void) | undefined
     if (invocation.nodeTest) {
       const index = invocation.runnerIndex
@@ -111,6 +117,7 @@ export function prepareCompletionCapture(command: string, cwd: string, shellKind
     }
     if (shellKind === 'powershell' && directFinish) actualCommand = '& ' + actualCommand
     if (shellKind === 'cmd' && directFinish) actualCommand = (verificationArgv(actualCommand) ?? []).map(word => '"' + word.replaceAll('"', '\\"') + '"').join(' ')
+    actualCommand = unwrapped.wrap(actualCommand)
     return {
       command: actualCommand,
       env,
@@ -118,33 +125,43 @@ export function prepareCompletionCapture(command: string, cwd: string, shellKind
         try {
           directFinish?.(exitCode === 0)
           const names = readdirSync(binding.dir).filter(n => n.endsWith('.start'))
-          let complete = names.length > 0 && before === workspaceIdentity(root)
+          let executionComplete = names.length > 0, success = true
+          const workspaceChanged = before !== workspaceIdentity(root)
           if (!directFinish) {
-            const seal = JSON.parse(readFileSync(join(binding.dir, 'seal.json'), 'utf8')) as { runId: string; expectedBatches: number; completedBatches: number }
-            complete &&= seal.runId === binding.runId && seal.expectedBatches === names.length && seal.completedBatches === names.length
+            try {
+              const seal = JSON.parse(readFileSync(join(binding.dir, 'seal.json'), 'utf8')) as { runId: string; expectedBatches: number; completedBatches: number }
+              executionComplete &&= seal.runId === binding.runId && seal.expectedBatches === names.length && seal.completedBatches === names.length
+            } catch { executionComplete = false }
           }
           const files: TestCompletionCoverage['files'] = []
+          const totals = { tests: 0, passed: 0, failed: 0, skipped: 0, cancelled: 0, todo: 0 }
           for (const name of names) {
-            const batchId = name.slice(0, -6)
-            const start = JSON.parse(readFileSync(join(binding.dir, name), 'utf8')) as { runId: string; cwd: string; batchId: string; args: string[] }
-            const end = JSON.parse(readFileSync(join(binding.dir, batchId + '.end'), 'utf8')) as typeof start & { success: boolean }
-            const receipt = JSON.parse(readFileSync(join(binding.dir, batchId + '.json'), 'utf8')) as Receipt
-            complete &&= start.runId === binding.runId && end.runId === binding.runId && receipt.runId === binding.runId
-              && start.batchId === receipt.batchId && start.cwd === receipt.cwd && end.cwd === start.cwd && end.success && receipt.complete && receipt.success
-            const selected = classifyVerificationCommand(['node', ...start.args].map(shellWord).join(' ')).targets
-            for (const target of selected) {
-              if (/[*?\[]/.test(target)) continue
-              const path = resolve(start.cwd, target)
-              if (!receipt.files.some(file => realpathSync(resolve(binding.root, file.path)) === realpathSync(path))) complete = false
-            }
-            for (const file of receipt.files) {
-              if (!file.path || file.path.startsWith('../') || file.path.startsWith('/') || files.some(f => f.path === file.path)) { complete = false; continue }
-              files.push(file)
-            }
+            try {
+              const batchId = name.slice(0, -6)
+              const start = JSON.parse(readFileSync(join(binding.dir, name), 'utf8')) as { runId: string; cwd: string; batchId: string; args: string[] }
+              const end = JSON.parse(readFileSync(join(binding.dir, batchId + '.end'), 'utf8')) as typeof start & { success: boolean }
+              const receipt = JSON.parse(readFileSync(join(binding.dir, batchId + '.json'), 'utf8')) as Receipt
+              const bound = start.runId === binding.runId && end.runId === binding.runId && receipt.runId === binding.runId
+                && start.batchId === receipt.batchId && end.batchId === start.batchId && start.cwd === receipt.cwd && end.cwd === start.cwd
+              if (!bound) { executionComplete = false; continue }
+              executionComplete &&= receipt.complete && !!receipt.totals
+              success &&= end.success && receipt.success
+              if (receipt.totals) for (const key of Object.keys(totals) as Array<keyof typeof totals>) totals[key] += receipt.totals[key]
+              const selected = classifyVerificationCommand(['node', ...start.args].map(shellWord).join(' ')).targets
+              for (const target of selected) {
+                if (/[*?\[]/.test(target)) continue
+                const path = resolve(start.cwd, target)
+                if (!receipt.files.some(file => realpathSync(resolve(binding.root, file.path)) === realpathSync(path))) executionComplete = false
+              }
+              for (const file of receipt.files) {
+                if (!file.path || file.path.startsWith('../') || file.path.startsWith('/') || files.some(f => f.path === file.path)) { executionComplete = false; continue }
+                files.push(file)
+              }
+            } catch { executionComplete = false }
           }
-          return { version: 1, runId: binding.runId, runner: 'node-test', cwd: resolve(cwd), repositoryRoot: binding.root, complete: complete && exitCode === 0, filtered: false, files }
+          return { version: 1, runId: binding.runId, runner: 'node-test', cwd: resolve(cwd), repositoryRoot: repositoryRoot ?? binding.root, executionRoot: binding.root, executionComplete, workspaceChanged, totals, complete: executionComplete && success && !workspaceChanged && exitCode === 0, filtered: false, files }
         } catch {
-          return { version: 1, runId: binding.runId, runner: 'node-test', cwd: resolve(cwd), repositoryRoot: binding.root, complete: false, filtered: false, files: [] }
+          return { version: 1, runId: binding.runId, runner: 'node-test', cwd: resolve(cwd), repositoryRoot: repositoryRoot ?? binding.root, executionRoot: binding.root, executionComplete: false, workspaceChanged: before !== workspaceIdentity(root), complete: false, filtered: false, files: [] }
         }
       },
       dispose() { rmSync(binding.dir, { recursive: true, force: true }) },
@@ -160,5 +177,8 @@ export function readCompletionCoverage(value: unknown): TestCompletionCoverage |
     || typeof c.complete !== 'boolean' || typeof c.filtered !== 'boolean' || !Array.isArray(c.files)) return undefined
   if (!c.files.every(f => f && typeof f.path === 'string' && !!f.path && !/[\x00]|^[A-Za-z]:/.test(f.path) && !f.path.startsWith('/') && !f.path.split(/[\\/]/).includes('..')
     && ['passed', 'failed', 'incomplete'].includes(f.outcome) && [f.tests, f.skipped, f.cancelled].every(n => Number.isInteger(n) && n >= 0) && f.skipped + f.cancelled <= f.tests)) return undefined
+  if (c.executionComplete !== undefined && typeof c.executionComplete !== 'boolean' || c.workspaceChanged !== undefined && typeof c.workspaceChanged !== 'boolean'
+    || c.executionRoot !== undefined && typeof c.executionRoot !== 'string'
+    || c.totals && !['tests', 'passed', 'failed', 'skipped', 'cancelled', 'todo'].every(key => Number.isInteger(c.totals![key as keyof typeof c.totals]) && c.totals![key as keyof typeof c.totals] >= 0)) return undefined
   return c
 }

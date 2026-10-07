@@ -69,10 +69,13 @@ export interface TypecheckShareDeps {
   onEvent?: (event: TypecheckShareEvent) => void
 }
 
-/** 锁被视为陈旧的墙钟上限。tsc 全量 43s，2 分钟是 timeout 默认值，10 分钟给足
- *  了慢机器与排队的余量——超过它基本只能是持锁者被 SIGKILL 后没跑 finally。 */
-const STALE_LOCK_MS = 10 * 60_000
-
+/** 锁被视为陈旧的墙钟上限。tsc 全量实测 15.5s（空载）→ 41s（4-5 路并发劣化），
+ *  满载"几分钟"——300s（≈实测上界的数倍）之后仍持有的锁基本只能是持锁者被
+ *  SIGKILL 没跑 finally，或锁泄漏（2026-10-08 实测：桌面端 serve 进程持锁 ≥10
+ *  分钟且无 tsc 子进程在跑，后到的每个等待者都白等满旧上限 600s）。
+ *  误清"真在慢跑"的锁的代价是并发跑（fail-open 既有语义，见 runTypecheckShared
+ *  的「拿不到也继续」），远小于白等 10 分钟的反复代价——600→300 是二者再平衡。 */
+export const STALE_LOCK_MS = 5 * 60_000
 /**
  * 调用方（bash 工具等）应给全量类型检查留的工具级预算——**必须大于闸门的等待
  * 上限**，因为等待者可能排在 N-1 个实跑后面。
@@ -152,7 +155,7 @@ export function resolveWatchdogTimeout(command: string, requestedMs: number, def
 }
 
 /** 缓存条目保留数量。多会话交替修改时各自的指纹会轮换，只留一份等于互相踢掉。 */
-const MAX_CACHE_ENTRIES = 8
+const MAX_CACHE_ENTRIES = 16
 const WAIT_POLL_MS = 200
 
 /**
@@ -575,7 +578,8 @@ export interface RunSharedOptions extends TypecheckShareDeps {
   cacheable?: (outcome: TscRunOutcome) => boolean
 }
 
-/** 与陈旧锁上限对齐：超过它说明持锁者虽然活着但已经不正常，那时自己跑才有意义。 */
+/** 兜底等待上限（=陈旧阈值）：循环已在「失联/超龄」时提前 break 接管，本预算
+ *  只应发生在漏判的病态情形。别把它调小——等待者齐刷超时各自开跑会抬高负载。 */
 const DEFAULT_WAIT_BUDGET_MS = STALE_LOCK_MS
 
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
@@ -622,10 +626,12 @@ export async function runTypecheckShared(options: RunSharedOptions): Promise<Tsc
         return { status: afterWait.status, stdout: afterWait.stdout, stderr: afterWait.stderr }
       }
       if (!isLockHeld(cacheDir)) break
-      // 持锁者失联才是放弃等待的正当理由——它死了才等不到结果。只要它还在推进，
-      // 等下去几乎总优于自己跑：自己跑要付全额时间，还会抢走它的核心让两边都更慢。
+      // 持锁者失联或持有超龄才是放弃等待的正当理由——失联等不到结果；超龄
+      // （>STALE_LOCK_MS，已远超 tsc 上界）说明这把锁大概率泄漏，不会再产出结果。
+      // 立即 break 交下方 tryAcquireLock 清理接管，不白等满 waitBudget
+      //（2026-10-08：泄漏锁曾让每个等待者白等满旧上限 600s）。
       const holder = readLockOwner(cacheDir)
-      if (holder && !isAlive(holder.pid)) break
+      if (holder && (!isAlive(holder.pid) || now() - holder.startedAt > STALE_LOCK_MS)) break
     }
     if (timedOut) emit({ kind: 'wait-timeout', waitedMs: now() - waitStarted })
     // 拿不到也继续：并发跑回退到闸门接入前的行为，永远不因为锁而不检查。

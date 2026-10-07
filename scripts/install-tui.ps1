@@ -4,16 +4,19 @@
 #   powershell -ExecutionPolicy Bypass -File scripts\install-tui.ps1             # 安装 + 启动
 #   powershell -ExecutionPolicy Bypass -File scripts\install-tui.ps1 -NoLaunch  # 只安装
 #
-# 远程一键（irm | iex；参数开关仅克隆仓库本地跑时可带）：
+# 远程一键（irm | iex）。不要加回脚本级 param()：Invoke-Expression 在当前作用域
+# 执行文本，param 会被当成命令名，整段在那一行停住。
 #   powershell -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/huiliyi37/Tianshu-harness/main/scripts/install-tui.ps1 | iex"
 #
 # 说明：
 #   - 官方 npm 包 tianshu-harness，主命令 tianshu（rivet 为兼容别名）；需要 Node.js >= 24（engines 钉死）。
 #   - 默认走 npmmirror 镜像（国内网络加速）；设 NPM_CONFIG_REGISTRY 可覆盖。
 #   - 幂等：重复执行覆盖升级到最新版。
-param([switch]$NoLaunch)
+#   - -NoLaunch 只在 -File 本地跑时从 $args 读取。远程 iex 不带参数，装完即启动。
 
 $ErrorActionPreference = "Stop"
+# -File 时 -NoLaunch 落在 $args。iex 远程一键不带参数，$args 为空，默认安装后启动。
+$NoLaunch = @($args) -contains '-NoLaunch' -or @($args) -contains '--no-launch'
 $Registry = if ($env:NPM_CONFIG_REGISTRY) { $env:NPM_CONFIG_REGISTRY } else { "https://registry.npmmirror.com" }
 # npm 经环境变量读 registry（大小写两份都设，与 install-tui.sh 同口径）
 $env:NPM_CONFIG_REGISTRY = $Registry

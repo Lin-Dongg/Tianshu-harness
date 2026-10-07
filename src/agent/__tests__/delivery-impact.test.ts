@@ -21,6 +21,32 @@ function fixture() {
   return { cwd, write, dispose: () => rmSync(cwd, { recursive: true, force: true }) }
 }
 
+it('both impact paths exclude helpers and preserve tests reached through them', async () => {
+  const f = fixture()
+  execFileSync('git', ['init', '-q'], { cwd: f.cwd })
+  const indexer = new MeridianIndexer(f.cwd)
+  try {
+    f.write('src/feature.ts', 'export const feature = 1;')
+    f.write('src/fixture.ts', 'export const fixture = 1;')
+    f.write('src/__tests__/helpers/fixture.ts', "import '../../feature.js'; export const fixture = 1;")
+    f.write('src/__tests__/consumer.test.ts', "import './helpers/fixture.js';")
+    for (const source of ['src/feature.ts', 'src/__tests__/helpers/fixture.ts']) {
+      for (const active of [undefined, indexer]) {
+        const impact = await resolveDeliveryImpact(f.cwd, [source], active)
+        assert.equal(impact.resolved, true, impact.reason)
+        assert.deepEqual(impact.requiredTests, ['src/__tests__/consumer.test.ts'])
+        assert.ok(!impact.advisoryTests.includes('src/__tests__/helpers/fixture.ts'))
+      }
+    }
+    f.write('src/__tests__/helpers/fixture.ts', 'export const fixture = 1;')
+    for (const update of [false, true]) {
+      await indexer.indexFile('src/__tests__/helpers/fixture.ts')
+      if (update) await indexer.invalidateFile('src/__tests__/helpers/fixture.ts')
+      assert.deepEqual(indexer.getDb().getTestsFor('src/fixture.ts'), [])
+    }
+  } finally { indexer.close(); f.dispose() }
+})
+
 it('ambiguous calls stay advisory; extracted edges beyond an advisory path never become required', () => {
   const f = fixture(), db = new MeridianDb(join(f.cwd, '.rivet'))
   try {

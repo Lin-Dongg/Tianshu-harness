@@ -26,6 +26,45 @@ describe('ownership-ledger — file ownership tracking', () => {
     assert.equal(ownership.isOwned('src/other.ts'), false)
   })
 
+  it('#369：基线不完整（非 git 工作区）时，本会话写过的文件仍应算 owned', () => {
+    // 非 git 工作区 → snapshot.complete === false → isExternal 曾恒真 → 本会话新建的
+    // 文件全落 co-owned → owned=0 → deliver_task 报 GREEN 却 commit 失败（issue #369）。
+    // 判据修正：基线不完整只说明「无法区分外部性」，不推翻 ledger 里 file_write 的铁证。
+    const baseline = createWorktreeBaseline({ ...baselineSnap, complete: false })
+    const ledger = createTaskLedger({ taskId: 't369' })
+    const ownership = createOwnershipLedger({ baseline, taskLedger: ledger })
+
+    ledger.record({ type: 'file_write', path: 'probe/package.json' })
+    ledger.record({ type: 'file_write', path: 'github-issue.md' })
+    ownership.autoOwnFromLedger()
+
+    assert.equal(ownership.isOwned('probe/package.json'), true, '基线不完整时 ledger 的铁证应认 owned')
+    assert.deepEqual(ownership.getOwnedFiles().sort(), ['github-issue.md', 'probe/package.json'])
+    assert.deepEqual(ownership.getCoOwnedFiles(), [], '本会话写过的文件不该落 co-owned')
+  })
+
+  it('#369：基线不完整时仅补认 ledger 有写入证据的文件', () => {
+    const baseline = createWorktreeBaseline({ ...baselineSnap, complete: false })
+    const ledger = createTaskLedger({ taskId: 't369-auto' })
+    const ownership = createOwnershipLedger({ baseline, taskLedger: ledger })
+    ledger.record({ type: 'file_write', path: 'src/written.ts' })
+    ownership.autoOwnFromBaseline(['src/written.ts', 'src/other-session.ts'])
+    assert.deepEqual(ownership.getOwnedFiles(), ['src/written.ts'])
+    assert.equal(ownership.isOwned('src/other-session.ts'), false)
+  })
+
+  it('#369 反向：基线完整时既有语义不变（预存在脏文件仍 co-owned）', () => {
+    const baseline = createWorktreeBaseline(baselineSnap) // complete 未设 → 视为完整
+    const ledger = createTaskLedger({ taskId: 't369b' })
+    const ownership = createOwnershipLedger({ baseline, taskLedger: ledger })
+
+    ledger.record({ type: 'file_write', path: 'src/external-dirty.ts' })
+    ownership.autoOwnFromLedger()
+
+    assert.equal(ownership.isOwned('src/external-dirty.ts'), false, '预存在脏文件仍应 co-owned')
+    assert.deepEqual(ownership.getCoOwnedFiles(), ['src/external-dirty.ts'])
+  })
+
   it('exposes baseline.head as getBaselineHead (VSW commit-ish, not the structural hash)', () => {
     const baseline = createWorktreeBaseline(baselineSnap)
     const ledger = createTaskLedger({ taskId: 't1' })

@@ -3,8 +3,12 @@
  *
  * 设计动机：信任门（config/project-trust.ts）默认剥离未授信项目的安全敏感键，
  * 但此前只在 stderr 打一行通知——用户发现时机会话已过半，项目里配的
- * agent.approval 等键"神秘失效"。本提示在进入目录（bootstrap 之前、
+ * provider/network 等键"神秘失效"。本提示在进入目录（bootstrap 之前、
  * loadConfig 消费项目配置之前）主动问一次，授信则**当次会话生效**，无需重启。
+ *
+ * 注意：审批 / 沙箱 / 权限档位（agent.approval / agent.unsandboxed /
+ * agent.permissions）由「永久门」剥离，**授信与否都不生效**——它们不是信任
+ * 赌注，归入 stakes.ignoredSafetyKeys 如实告知，不混进「授信以启用」叙事。
  *
  * 只在有真实赌注时出现（项目配置含敏感键或存在 .rivet/hooks.json）；
  * RIVET_TRUST_PROJECT env 覆盖、已授信、已选"不再提示"时完全跳过。
@@ -35,13 +39,22 @@ export function buildTrustPromptText(stakes: ProjectTrustStakes, options: { cwd?
   if (stakes.sensitiveKeys.length > 0) {
     lines.push(`项目配置会改变安全设置：${stakes.sensitiveKeys.join('、')}`)
   }
+  if (stakes.ignoredSafetyKeys.length > 0) {
+    lines.push(`以下安全档位无论是否授信都被忽略（安全设计）：${stakes.ignoredSafetyKeys.join('、')}`)
+  }
   if (stakes.hasHooks) {
     lines.push('项目 .rivet/hooks.json 可在工具执行前后运行进程。')
+  }
+  if (stakes.hasSkills) {
+    lines.push('项目 .rivet/skills/ 携带技能——技能正文可驱动本会话的动作，未授信时不装载。')
+  }
+  if (stakes.hasRules) {
+    lines.push('项目 .rivet/rules/ 携带项目规则（会随会话注入执行上下文），未授信时不载入。')
   }
   lines.push(
     '',
     '请确认这是你创建或信任的项目；不确定时，先检查项目配置。',
-    '授信可更改审批模式、预授权命令和出方向；记录仅保存在本机，绝不写回仓库。',
+    '授信可启用项目其余安全敏感配置（MCP / provider / 网络出口等）与 hooks；审批档与权限档不来自项目配置。记录仅保存在本机，绝不写回仓库。',
     '暂不授信仍可继续，项目安全敏感配置和 hooks 将被忽略。',
     '',
     '  [y] 信任此项目（当次会话生效）',

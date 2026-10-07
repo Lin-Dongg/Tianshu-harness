@@ -23,7 +23,7 @@ import type { FileHistory } from './file-history.js'
 import type { ContextClaimStore } from '../context/claim-store.js'
 
 /** Flat files that make up a session's on-disk state (claims excluded, see above). */
-const SESSION_FLAT_FILES = ['.jsonl', '.meta.json', '.memory.json', '.handoff.md', '.goal.json', '.frozen.json'] as const
+const SESSION_FLAT_FILES = ['.jsonl', '.meta.json', '.memory.json', '.handoff.md', '.goal.json', '.frozen.json', '.skills.json', '.skill-modes.json'] as const
 
 export interface SessionMigrationResult {
   fromDir: string

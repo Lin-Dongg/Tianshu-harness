@@ -95,10 +95,17 @@ import type { ToolDefinition } from '../../api/types.js'
  *  探测 / PNG 判读工单，worker 只能 blocked 白跑）；配套把同一能力边界同步进
  *  delegate_task / delegate_batch 的 profile 字段描述。行数不变仍 292（同一行内追加）。
  *  同前几笔：改 hash 即所有会话前缀缓存冷启动一次，这是本笔的已知代价，不是意外。
+ *  2026-10-07 **有意变更**：交付验证的「全量升级」陷阱治理——delivery-contract 的
+ *  「阻塞不重试」段补：超时/blocked 的常见形态点名（「[阶段 A · 隔离快照] … 超时」且无
+ *  exit code）、改枢纽模块（被全仓 import）时 required 影响面大→用门禁打印的分批命令或
+ *  scoped、禁重跑全量 run_tests 凑绿、判据「交付门点名文件隔离单跑全绿 ⇒ 外部阻塞/污染」；
+ *  shared-worktree 段放宽 scoped-commit 出口（门能跑但被影响面覆盖义务卡死也算）。来源：
+ *  本项目一次把交付验证做错、卡约 2 小时。行数不变（同一行内追加文案）。
+ *  同前几笔：改 hash 即所有会话前缀缓存冷启动一次，这是本笔的已知代价，不是意外。
  */
 // 辅胶囊可读性调校：固定四栏目替换为五条按信息关系组织的规则，保留交付披露。
 // 静态前缀有意变更；新提示词可能冷启动缓存，运行中的冻结快照不在此迁移。
-const MAIN_PROMPT_SHA256 = 'b7885a6111da5b4bacbad2269560a52a6aada4ea6e6719620d9b8b88889631e9'
+const MAIN_PROMPT_SHA256 = 'ef3329996c264310e214dfafe24b7d4b817ae6a49f585a694387024c4e3a73e7'
 
 function tool(name: string): ToolDefinition {
   return { name, description: '', input_schema: { type: 'object', properties: {} } } as ToolDefinition

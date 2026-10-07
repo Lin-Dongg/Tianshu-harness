@@ -1,13 +1,14 @@
 import { spawnGit } from './spawn-git.js'
 import { repositoryCapability, NonRepositoryError } from '../agent/repository-capability.js'
 import { readFile as fsReadFile, stat as fsStat } from 'node:fs/promises'
-import { isAbsolute, resolve } from 'node:path'
+import { dirname, isAbsolute, resolve } from 'node:path'
 import type { Tool, ToolCallParams } from './types.js'
 import { relativePosix } from '../path-format.js'
 import { auditCommitTagScope } from './commit-audit.js'
 import { createWorkspaceGuard } from '../agent/workspace-guard.js'
 import { killProcessTreeAsync, killProcessTree } from './process-kill.js'
 import { detectSensitiveFile } from './sensitive-file-detector.js'
+import { isForbiddenGrantRoot } from './request-path-access.js'
 
 const ACTIONS = ['status', 'diff_summary', 'commit', 'log', 'log_graph', 'stash', 'stash_pop'] as const
 type GitAction = (typeof ACTIONS)[number]
@@ -148,6 +149,24 @@ async function runGitSafe(args: string[], cwd: string, abortSignal?: AbortSignal
     const output = err instanceof Error ? err.message : String(err)
     return { ok: false, output }
   }
+}
+
+/**
+ * v2（认领即租约）：该路径在工作区是否「干净」（无未提交改动）。
+ *
+ * L3 判据的唯一实现点，供 R2 写前守卫判断「持有方是否还压着未提交的改动」：
+ *  - 非仓库 → `true`：没有版本状态需要保护，staleness 才是主守卫；
+ *  - 能力未知 → `'unknown'`：判定方保守落 L3（走人工确认），不臆断干净；
+ *  - 否则 `git status --porcelain=v1 -z -uall -- <path>` 空输出即干净。
+ * 用 `-z` 避免非 ASCII 路径被引号包裹导致的解析歧义（与 git-workbench 同口径）。
+ */
+export async function isPathClean(cwd: string, relPath: string): Promise<boolean | 'unknown'> {
+  const capability = await repositoryCapability(cwd)
+  if (capability === 'non_repository') return true
+  if (capability !== 'repository') return 'unknown'
+  const { ok, output } = await runGitSafe(['status', '--porcelain=v1', '-z', '-uall', '--', relPath], cwd)
+  if (!ok) return 'unknown'
+  return output.trim().length === 0
 }
 
 function normalizeProjectRelativePath(cwd: string, filePath: string): string | null {
@@ -418,6 +437,60 @@ export function nullDeviceFor(platform: NodeJS.Platform = process.platform): str
 }
 
 /**
+ * Thrown when the path judgement rejects an input (traversal shape, or a
+ * relative path escaping cwd). Typed so the HTTP routes can answer 400 for it
+ * instead of letting it escape into the server-level 500 fallback.
+ */
+export class GitPathError extends Error {
+  constructor(message: string) { super(message); this.name = 'GitPathError' }
+}
+
+/**
+ * Guard the out-of-workspace branch of the file readers below.
+ *
+ * A path outside cwd is a legitimate work shape — an agent may write a
+ * deliverable into a staging area outside the workspace and the client still
+ * has to render it (issue #358). But 「工作区外」≠「无上界」：the repository
+ * already fixes an upper bound for out-of-workspace access (request-path-access,
+ * issue #117) — filesystem/system roots and sensitive filenames are never
+ * readable, approvals or not. Reusing that judgement keeps the boundary defined
+ * in one place instead of growing a second opinion here; without it these
+ * readers degenerate into an unbounded text-file channel (`?path=~/.ssh/id_rsa`).
+ *
+ * The target *and* its parent are checked, mirroring the grant tool: `/etc/passwd`
+ * itself escapes the root check while its grant root `/etc` does not.
+ */
+function assertOutsidePathReadable(filePath: string): void {
+  const target = resolve(filePath)
+  if (isForbiddenGrantRoot(target) || isForbiddenGrantRoot(dirname(target))) {
+    throw new GitPathError(`无效文件路径：${filePath}`)
+  }
+  if (detectSensitiveFile(target).sensitive) {
+    throw new GitPathError(`无效文件路径：${filePath}`)
+  }
+}
+
+/**
+ * Whole-file-as-addition rendering of one path via `--no-index` against the
+ * platform null device. Used for an untracked file inside cwd, and for any file
+ * outside it (which has no repository baseline at all). `git diff --no-index`
+ * exits 1 when the files differ (the normal case) but prints the diff on
+ * stdout, which runGitExitCode preserves; binary files print "Binary files ...
+ * differ". Returns '' when git yields nothing — a missing file, or a path git
+ * refuses to read.
+ *
+ * `anchorPath` is both the git argument and the `+++` header anchor:
+ * normalizeNoIndexHeader rewrites the header to that literal path, because git
+ * relativizes an absolute path against the filesystem root and drops the
+ * leading slash (`a/tmp/...` for `/tmp/...`) — which would desync the desktop
+ * diff parser's (file, oldLine, newLine) comment anchors.
+ */
+async function noIndexDiff(cwd: string, anchorPath: string): Promise<string> {
+  const { stdout } = await runGitExitCode(['diff', '--no-index', '--', nullDeviceFor(), anchorPath], cwd)
+  return stdout && stdout.trim() ? normalizeNoIndexHeader(stdout, anchorPath) : ''
+}
+
+/**
  * Fetch the unified diff of a single file relative to `baseRef` (default
  * HEAD), for on-demand rendering in the desktop "changes" tab. Empty string =
  * no textual diff (binary file, or untracked with no base to diff against).
@@ -425,20 +498,23 @@ export function nullDeviceFor(platform: NodeJS.Platform = process.platform): str
 export async function getFileDiff(cwd: string, path: string, baseRef = 'HEAD'): Promise<string> {
   // Guard against path traversal / pathspec injection — pathspec must be relative
   const rel = normalizeProjectRelativePath(cwd, path)
-  if (!rel) throw new Error(`无效文件路径：${path}`)
+  if (!rel) {
+    // A path outside cwd is a normal work shape, not an error: an agent may
+    // write a deliverable into a directory outside the workspace (a staging
+    // area, a handoff folder), and that absolute path enters the session file
+    // history. Only absolute inputs qualify here — a relative path escaping
+    // cwd is a traversal shape and stays rejected.
+    if (!isAbsolute(path)) throw new GitPathError(`无效文件路径：${path}`)
+    assertOutsidePathReadable(path)
+    return noIndexDiff(cwd, path)
+  }
   const base = safeBaseRef(baseRef)
   // Tracked changes (modified/deleted/staged) diff cleanly against the base.
   const tracked = await runGitSafe(['diff', base, '--', rel], cwd)
   if (tracked.ok && tracked.output.trim()) return tracked.output
-  // New / untracked file: not in HEAD, so `git diff HEAD` is empty. Render the
-  // whole file as additions via --no-index against the platform null device
-  // (see nullDeviceFor). This exits 1 when the files differ (the normal case)
-  // but prints the diff on stdout, which runGitExitCode preserves. Binary files
-  // print "Binary files ... differ".
-  const fallback = await runGitExitCode(['diff', '--no-index', '--', nullDeviceFor(), rel], cwd)
-  const out = fallback.stdout
-  if (out && out.trim()) return normalizeNoIndexHeader(out, rel)
-  return tracked.ok ? tracked.output : ''
+  // New / untracked file: not in HEAD, so `git diff HEAD` is empty — render the
+  // whole file as additions (see noIndexDiff for the null-device contract).
+  return (await noIndexDiff(cwd, rel)) || (tracked.ok ? tracked.output : '')
 }
 
 /**
@@ -453,7 +529,13 @@ export async function getFileAtBase(
   baseRef = 'HEAD',
 ): Promise<{ exists: boolean; content: string }> {
   const rel = normalizeProjectRelativePath(cwd, path)
-  if (!rel) throw new Error(`无效文件路径：${path}`)
+  if (!rel) {
+    if (!isAbsolute(path)) throw new GitPathError(`无效文件路径：${path}`)
+    assertOutsidePathReadable(path)
+    // Outside the repository nothing was recorded at the task baseline, so the
+    // client renders it as a whole-file addition — same as a newly added file.
+    return { exists: false, content: '' }
+  }
   const base = safeBaseRef(baseRef)
   const shown = await runGitSafe(['show', `${base}:${rel}`], cwd)
   if (!shown.ok) return { exists: false, content: '' }
@@ -463,20 +545,31 @@ export async function getFileAtBase(
 /**
  * `git diff --no-index <null-device> file` emits headers referencing the literal
  * paths (the null device, and the file path without a/ b/ prefixes). Rewrite the
- * `+++` header to the conventional `b/<rel>` form so the desktop diff parser
+ * `+++` header to the conventional `b/<path>` form so the desktop diff parser
  * (which strips a leading `b/`) anchors line comments on the right file path.
  * `--- ` is normalized to POSIX `/dev/null` regardless of which null device the
  * platform actually passed — consumers key on that single spelling.
+ *
+ * `anchorPath` is the path the client asked for: repository-relative for a file
+ * inside cwd, absolute for a file outside it. Either way the `+++` line must
+ * echo it, because line-comment anchors are keyed on (file, oldLine, newLine).
+ *
+ * Only the header region — everything before the first hunk marker — is fair
+ * game. An all-additions body puts every source line behind a '+' prefix, so a
+ * source line that already begins with '++ ' surfaces as '+++ '; a bare
+ * `startsWith` scan over the whole diff mistakes it for a header, rewrites it,
+ * and silently drops the line from the rendered diff.
  */
-function normalizeNoIndexHeader(diff: string, rel: string): string {
-  return diff
-    .split('\n')
-    .map((line) => {
-      if (line.startsWith('+++ ')) return `+++ b/${rel}`
-      if (line.startsWith('--- ')) return '--- /dev/null'
-      return line
-    })
-    .join('\n')
+function normalizeNoIndexHeader(diff: string, anchorPath: string): string {
+  const out: string[] = []
+  let inHunks = false
+  for (const line of diff.split('\n')) {
+    if (line.startsWith('@@')) inHunks = true
+    if (!inHunks && line.startsWith('+++ ')) out.push(`+++ b/${anchorPath}`)
+    else if (!inHunks && line.startsWith('--- ')) out.push('--- /dev/null')
+    else out.push(line)
+  }
+  return out.join('\n')
 }
 
 

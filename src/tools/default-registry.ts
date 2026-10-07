@@ -199,3 +199,16 @@ export function createDefaultToolRegistry(extraTools: Tool[] = [], options: Defa
   for (const tool of extraTools) registry.register(tool)
   return registry
 }
+
+/**
+ * 从「内建全集 + 新增」的暂存表里减掉内建，只留新增。
+ *
+ * headless 用 createDefaultToolRegistry() 收集 MCP：工厂先注册全部内建，
+ * initializeMcp 只追加 mcp__ 工具，getAll() 因此含内建全集。这些内建再注册进
+ * 真正的 registry 时，web_fetch / web_search 等由配置生成的新实例会触发
+ * 「同名覆盖」告警（防 MCP 描述 rug-pull）。按名字减掉后，MCP 前缀工具保留。
+ * 同形先例：main.ts 的 pluginTools、plugin-session-cache.ts。
+ */
+export function excludeBuiltinTools(tools: readonly Tool[], builtinNames: ReadonlySet<string>): Tool[] {
+  return tools.filter(t => !builtinNames.has(t.definition.name))
+}

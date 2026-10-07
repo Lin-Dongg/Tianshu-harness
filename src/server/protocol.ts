@@ -306,6 +306,11 @@ export interface SessionRecord {
    */
   workspaceSource?: 'explicit' | 'config-default' | 'scratch' | 'runtime-default'
   title?: string
+  titleSource?: 'manual' | 'generated' | 'fallback'
+  titleGenerationState?: 'pending' | 'failed' | 'complete'
+  titleGenerationAttempts?: number
+  /** Original human input, capped for the title side path; never expanded attachment text. */
+  titleInput?: string
   currentPhase?: string
   /**
    * 禅相位镜像——**建连补发**用。`zen_phase` 事件只在 run 起点 arm 与每次晋升
@@ -441,4 +446,29 @@ export interface ProfileOverview {
   login: { totalMs: number; trackedSince: number | null }
   tokens: { total: number; peak: number; activeDays: number; scannedFiles: number } | null
   repositories: FeaturedRepository[]
+}
+export type ProviderUsageStatus = 'ok' | 'unconfigured' | 'unsupported' | 'error'
+export type ProviderUsageError = 'auth' | 'rate-limit' | 'timeout' | 'network' | 'invalid-response' | 'unavailable'
+export type ProviderQuotaPeriod = '5h' | '7d' | 'monthly' | 'monthly-code' | 'tools' | 'quota'
+
+/** Account usage is an official snapshot, independent of session token accounting. */
+export interface ProviderUsageAccount {
+  provider: string
+  providerLabel: string
+  keyId: string
+  keyLabel?: string
+  kind: 'balance' | 'subscription' | 'unsupported'
+  status: ProviderUsageStatus
+  error?: ProviderUsageError
+  updatedAt?: string
+  retryAt?: string
+  available?: boolean
+  balances: { currency: string; total: string; toppedUp?: string; granted?: string }[]
+  quotas: { id: string; period: ProviderQuotaPeriod; remainingPercent: number; resetAt?: string }[]
+}
+
+export interface ProviderUsageSnapshot {
+  available: boolean
+  defaultAccount: { provider: string; keyId: string } | null
+  accounts: ProviderUsageAccount[]
 }

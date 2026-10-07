@@ -19,6 +19,8 @@
  * 面——写不进磁盘时 serve 照常服务，只是桌面壳发现不了它。
  */
 import { mkdirSync, writeFileSync, renameSync, readFileSync, unlinkSync, existsSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { userInfo } from 'node:os'
 import { join, dirname } from 'node:path'
 import { rivetHome } from '../config/paths.js'
 import { setServerLogger, formatLog } from './logger.js'
@@ -39,10 +41,28 @@ export function serverInfoPath(): string {
 }
 
 /**
+ * Windows 上 POSIX mode 0o600 对 NTFS 无效（走 ACL；secure-store.ts 同款教训，
+ * 2026-10-07 审计 Finding 4）——用 icacls 把发现文件收紧到「当前用户 + SYSTEM +
+ * Administrators」，防止低权沙箱进程读取明文 Bearer token 或替换文件劫持发现面。
+ * 权限给 F（完全控制）而非 R：rename 覆盖已存在文件需要目标 delete/file-write
+ * 权限。SID 形式（*S-1-5-*）规避本地化组名。best-effort——收紧失败不阻塞 serve
+ *（发现文件是优化面不是正确性面，与文件头契约一致）。
+ */
+function hardenServerInfoAclWin32(filePath: string): void {
+  if (process.platform !== 'win32') return
+  try {
+    const user = userInfo().username
+    execFileSync('icacls', [filePath, '/inheritance:r',
+      '/grant:r', `${user}:F`, '*S-1-5-18:F', '*S-1-5-32-544:F'],
+      { stdio: 'ignore', windowsHide: true, timeout: 5_000 })
+  } catch { /* best-effort */ }
+}
+
+/**
  * 原子写发现文件：先写同目录临时文件再 rename，读者永远看不到半截 JSON。
  * 语义「最后写的赢」——见文件头竞态契约。
  * 文件含明文 Bearer token，mode 0600（owner-only）——rename 原子保持权限，
- * 不按 umask 落 644。
+ * 不按 umask 落 644。Windows 上 mode 无效，由 hardenServerInfoAclWin32 补 ACL。
  */
 export function writeServerInfo(info: ServerInfo, filePath = serverInfoPath()): void {
   try {
@@ -50,6 +70,7 @@ export function writeServerInfo(info: ServerInfo, filePath = serverInfoPath()): 
     mkdirSync(dirname(filePath), { recursive: true })
     writeFileSync(tmp, JSON.stringify(info, null, 2), { mode: 0o600 })
     renameSync(tmp, filePath)
+    hardenServerInfoAclWin32(filePath)
   } catch {
     // best-effort — 发现文件写不进磁盘不阻塞 serve
   }

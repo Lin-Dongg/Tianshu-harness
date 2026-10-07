@@ -123,8 +123,23 @@ export function listTrustedProjectEntries(): { path: string; trustedAt: string }
 /** 单次进程内提示去重——hooks 每事件读取、config 可能 HMR 重载、prompt 每次用户
  *  边界重建，避免刷屏。 */
 const noticed = new Set<string>()
+
+/** 信任门族：未授信即拒绝的项目表面（2026-10-07 安全审计补齐）。 */
+export type UntrustedProjectSurface = 'skills' | 'rules' | 'commands' | 'playbook' | 'presence' | 'agents' | 'plans'
+
+/** 各表面未授信跳过时的一次性提示文案。 */
+const SURFACE_NOTICE: Record<UntrustedProjectSurface, string> = {
+  skills: '项目技能目录（.rivet/skills / .agents/skills）',
+  rules: '项目规则目录（.rivet/rules）',
+  commands: '项目命令目录（.rivet/commands）',
+  playbook: '项目教训库（.rivet/playbook.jsonl）',
+  presence: '项目在线状态文件（.rivet/presence.json）',
+  agents: '项目装配目录（.rivet/agents / .rivet/domains）',
+  plans: '项目计划目录（.rivet/plans）',
+}
+
 export function notifyUntrustedOnce(
-  kind: 'hooks' | 'config' | 'project-instructions' | 'project-state',
+  kind: 'hooks' | 'config' | 'project-instructions' | 'project-state' | UntrustedProjectSurface,
   projectDir: string,
   strippedKeys?: string[],
 ): void {
@@ -141,8 +156,26 @@ export function notifyUntrustedOnce(
       ? `检测到项目指令（${join(projectDir, 'AGENTS.md')} / ${join(projectDir, '.rivet.md')}），项目未授信，已跳过注入——未进入模型上下文`
       : kind === 'project-state'
         ? `检测到项目状态文件（${join(projectDir, '.rivet', 'knowledge', 'memory.jsonl')} / ${join(projectDir, '.rivet', 'knowledge', 'manifest.md')}），项目未授信，已跳过注入——未进入模型上下文`
-        : `检测到项目配置（${join(projectDir, '.rivet-config.json')}），项目未授信，其中安全敏感键（${keyList}）已忽略`
+        : kind === 'config'
+          ? `检测到项目配置（${join(projectDir, '.rivet-config.json')}），项目未授信，其中安全敏感键（${keyList}）已忽略`
+          : `检测到${SURFACE_NOTICE[kind]}，项目未授信，已跳过——未进入模型上下文`
   console.error(`[rivet] ${what}——${how}。信任决策存于 ${trustStorePath()}，绝不写回仓库。`)
+}
+
+/**
+ * 项目配置里的安全档位被永久门忽略时的一次性提示。**授信与否都提示**——
+ * 静默失效正是本修复要杜绝的（用户以为项目设的档生效了，实际没有）。
+ */
+export function notifyProjectSafetyKeysIgnored(projectDir: string, keys: string[]): void {
+  const noticeKey = `safety:${projectDir}`
+  if (noticed.has(noticeKey)) return
+  noticed.add(noticeKey)
+  console.error(
+    `[rivet] 项目配置 ${join(projectDir, PROJECT_CONFIG_FILE_NAME)} 里的安全档位`
+    + `（${keys.join('/')}）已忽略——审批档 / 沙箱豁免 / 授权规则不来自项目配置`
+    + `（安全设计，授信与否一致）。请在全局配置（~/.rivet/config.json）或 CLI`
+    + `（--approval-mode）设置。`,
+  )
 }
 
 /** 目录内是否存在项目指令文件（AGENTS.md / .rivet.md）——供未受信时的跳过提示判定。 */
@@ -183,6 +216,31 @@ export function hasProjectStateInjectionFiles(cwd: string): boolean {
 export function projectStateAllowed(cwd: string): boolean {
   if (isProjectTrusted(cwd)) return true
   if (hasProjectStateInjectionFiles(cwd)) notifyUntrustedOnce('project-state', cwd)
+  return false
+}
+
+/** 各表面在项目目录下的存在性探测路径（未授信时用于决定是否发一次性提示）。 */
+const UNTRUSTED_SURFACE_PATHS: Readonly<Record<UntrustedProjectSurface, readonly string[]>> = {
+  skills: ['.rivet/skills', '.agents/skills'],
+  rules: ['.rivet/rules'],
+  commands: ['.rivet/commands'],
+  playbook: ['.rivet/playbook.jsonl'],
+  presence: ['.rivet/presence.json'],
+  agents: ['.rivet/agents', '.rivet/domains'],
+  plans: ['.rivet/plans'],
+}
+
+/**
+ * 项目表面（skills/rules/commands/playbook/presence/agents/plans）是否允许读取/注入。
+ * 与 projectStateAllowed / projectInstructionsAllowed 同契约：未授信一律不读不注入
+ * （2026-10-07 安全审计：信任门族补齐——门必须下沉到读取函数内部，防新调用点漏）。
+ * 不缓存跳过结论——/trust 授信后当次会话内即时生效（与 verify-config 同约定）。
+ */
+export function projectSurfaceAllowed(cwd: string, surface: UntrustedProjectSurface): boolean {
+  if (isProjectTrusted(cwd)) return true
+  if (UNTRUSTED_SURFACE_PATHS[surface].some(p => existsSync(join(cwd, p)))) {
+    notifyUntrustedOnce(surface, cwd)
+  }
   return false
 }
 
@@ -234,6 +292,54 @@ export function stripUntrustedProjectKeys(raw: Record<string, unknown>): Record<
   return out
 }
 
+/**
+ * 项目配置层**永久**不得设置的安全档位（与信任无关）——点路径相对项目层配置根。
+ *
+ * 与 `UNTRUSTED_NESTED_KEYS`（信任门：未授信才剥离）不同，这组键是**用户本人的
+ * 安全决定**（审批档 / 沙箱豁免 / 授权规则），不是「项目内容配置」。因此仓库内容
+ * （含**已授信**项目）都不得设置它们——授信只应信任项目的编码内容，不应顺带授权
+ * 「是否禁用审批」。参照 deepseek-harness：approval policy 无外部 config store，
+ * 工作目录文件对它零路径；天枢等价 = 这三个键不进 project config 层。
+ *
+ * 合法来源保留：内置默认 / 用户全局 config / profile / CLI flag / 运行时切换。
+ */
+const PROJECT_FORBIDDEN_SAFETY_NESTED_KEYS: ReadonlyArray<readonly [string, string]> = [
+  ['agent', 'approval'],
+  ['agent', 'unsandboxed'],
+  ['agent', 'permissions'],
+]
+
+/**
+ * 剥离项目层**永久**禁止设置的安全档位（agent.approval / agent.unsandboxed /
+ * agent.permissions）。与 `stripUntrustedProjectKeys` 同形：返回浅拷贝，原对象
+ * 不被修改，非安全键保留。**授信与否都调用**——这是「永久门」，独立于信任门。
+ */
+export function stripProjectSafetyKeys(raw: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...raw }
+  for (const [parent, child] of PROJECT_FORBIDDEN_SAFETY_NESTED_KEYS) {
+    const node = out[parent]
+    if (node && typeof node === 'object' && !Array.isArray(node)) {
+      const clone = { ...(node as Record<string, unknown>) }
+      delete clone[child]
+      out[parent] = clone
+    }
+  }
+  return out
+}
+
+/** 列出项目层实际存在、会被永久剥离的安全档位（点路径），供提示。 */
+export function findForbiddenProjectSafetyKeys(raw: Record<string, unknown>): string[] {
+  const found: string[] = []
+  for (const [parent, child] of PROJECT_FORBIDDEN_SAFETY_NESTED_KEYS) {
+    const node = raw[parent]
+    if (node && typeof node === 'object' && !Array.isArray(node)
+      && Object.prototype.hasOwnProperty.call(node, child)) {
+      found.push(`${parent}.${child}`)
+    }
+  }
+  return found
+}
+
 /** 列出项目层配置中实际存在、未授信时会被剥离的敏感键（嵌套键报点路径）。 */
 export function findSensitiveProjectKeys(raw: Record<string, unknown>): string[] {
   const found: string[] = []
@@ -251,25 +357,48 @@ export function findSensitiveProjectKeys(raw: Record<string, unknown>): string[]
 }
 
 export interface ProjectTrustStakes {
-  /** 项目配置中实际会被剥离的敏感键（点路径）。 */
+  /** 项目配置中**授信后会生效**的敏感键（点路径）——即「信任的赌注」。
+   *  不含永久门剥离的安全档位（那些授信与否都不生效）。 */
   sensitiveKeys: string[]
+  /** 项目配置中的安全档位（approval / unsandboxed / permissions）——无论是否授信
+   *  都被忽略，**不构成信任赌注**，但需如实告知用户（杜绝静默失效）。 */
+  ignoredSafetyKeys: string[]
   /** 是否存在项目级 hooks（.rivet/hooks.json）。 */
   hasHooks: boolean
+  /** 是否存在项目级技能目录（.rivet/skills 或 .agents/skills）——授信后装载，
+   *  未授信不装载（2026-10-07 审计 Finding 2：纯技能仓库也要触发授信提示）。 */
+  hasSkills: boolean
+  /** 是否存在项目级规则目录（.rivet/rules）——授信后载入 claimStore，未授信不载入。 */
+  hasRules: boolean
+}
+
+/** 某敏感键是否为永久门剥离的安全档位（授信与否都不生效）。 */
+function isForbiddenSafetyKey(dotted: string): boolean {
+  return PROJECT_FORBIDDEN_SAFETY_NESTED_KEYS.some(([parent, child]) => `${parent}.${child}` === dotted)
 }
 
 /**
  * 启动授信提示的赌注检测：项目里有没有"未授信就会失效"的东西。
  * 配置文件读失败/无敏感键且无 hooks → 无赌注，不该打扰用户。
+ *
+ * 安全档位（approval / unsandboxed / permissions）单独归入 `ignoredSafetyKeys`：
+ * 它们不随授信生效（永久门），所以**不算赌注**——把它们列进「信任以启用」会误导。
  */
 export function detectProjectTrustStakes(cwd: string): ProjectTrustStakes {
-  let sensitiveKeys: string[] = []
+  let all: string[] = []
   try {
     const raw: unknown = JSON.parse(readFileSync(join(cwd, PROJECT_CONFIG_FILE_NAME), 'utf-8'))
     if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
-      sensitiveKeys = findSensitiveProjectKeys(raw as Record<string, unknown>)
+      all = findSensitiveProjectKeys(raw as Record<string, unknown>)
     }
   } catch {
     // 配置文件缺失/坏 JSON → 无配置侧赌注
   }
-  return { sensitiveKeys, hasHooks: existsSync(join(cwd, '.rivet', 'hooks.json')) }
+  return {
+    sensitiveKeys: all.filter(key => !isForbiddenSafetyKey(key)),
+    ignoredSafetyKeys: all.filter(key => isForbiddenSafetyKey(key)),
+    hasHooks: existsSync(join(cwd, '.rivet', 'hooks.json')),
+    hasSkills: existsSync(join(cwd, '.rivet', 'skills')) || existsSync(join(cwd, '.agents', 'skills')),
+    hasRules: existsSync(join(cwd, '.rivet', 'rules')),
+  }
 }

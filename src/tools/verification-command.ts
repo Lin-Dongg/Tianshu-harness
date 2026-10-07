@@ -10,6 +10,7 @@ export interface VerificationInvocation {
   filtered: boolean
   targets: string[]
   reason?: string
+  fixedPackageTargets?: boolean
 }
 
 /** Classification only. Unsupported shell syntax fails towards less evidence. */
@@ -59,7 +60,7 @@ export function classifyVerificationCommand(command: string, cwd?: string, depth
         const inner = classifyVerificationCommand(script, cwd, depth + 1)
         if (inner.nodeTest || inner.batchRunner) {
           const resolved = classifyVerificationCommand([...inner.argv, ...rest].map(shellWord).join(' '), cwd, depth + 1)
-          return { ...resolved, argv, resolvedArgv: resolved.argv, runnerIndex: index }
+          return { ...resolved, argv, resolvedArgv: resolved.argv, runnerIndex: index, fixedPackageTargets: inner.nodeTest && inner.targets.length > 0 }
         }
       }
     } catch { /* Unknown package scripts never acquire completion evidence. */ }

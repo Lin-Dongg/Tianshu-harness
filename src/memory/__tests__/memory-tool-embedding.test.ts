@@ -9,6 +9,11 @@ import { createMemoryTool } from '../../tools/memory.js'
 import { appendMemoryEntry } from '../unified-memory.js'
 import { resetKnowledgeIndexCache } from '../knowledge-index.js'
 
+// 信任门族（2026-10-07 审计修复）：memory recall 经 KnowledgeIndex，现带信任门——
+// 本文件验「授信项目的语义召回」正常语义；未授信拒绝语义在
+// src/config/__tests__/project-trust-surface-gates.test.ts 覆盖。node:test 文件级进程隔离。
+process.env.RIVET_TRUST_PROJECT = '1'
+
 const roots: string[] = []
 
 afterEach(() => {

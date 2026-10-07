@@ -11,7 +11,7 @@
  *    install/enable takes effect next session.
  */
 
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { join, resolve, sep, basename } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { rivetHome } from '../config/paths.js'
@@ -419,6 +419,21 @@ async function loadOnePlugin(
       error: `Entry path "${manifest.entry}" escapes plugin directory`,
     }
   }
+  // 真实层（对齐 import-resource.ts:67-79 的 issue #119 先例，2026-10-07 审计加固）：
+  // 插件目录可自带 symlink，纯字符串 resolve 拦不住指向外部的链接。两侧 realpath 后
+  // 再比对；路径不存在（realpath 抛错）交后续 import 报错——词法层已过。
+  try {
+    const realDir = realpathSync(pluginDir)
+    const realEntry = realpathSync(resolvedEntry)
+    const inside = realEntry === realDir || realEntry.startsWith(realDir.endsWith(sep) ? realDir : realDir + sep)
+    if (!inside) {
+      return {
+        pluginName: manifest.name,
+        status: 'skipped_import_error',
+        error: `Entry path "${manifest.entry}" escapes plugin directory (realpath)`,
+      }
+    }
+  } catch { /* 路径不存在：交后续 import 的报错路径处理 */ }
 
   // 5. Dynamic import — use pathToFileURL for cross-platform safety.
   //    Windows absolute paths (C:\...) are interpreted as URL protocol by

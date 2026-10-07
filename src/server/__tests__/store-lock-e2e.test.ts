@@ -1,3 +1,4 @@
+import { readLockFile } from '../cron-lock.js'
 /**
  * Store lock — 跨进程端到端黑盒验收（P0-1『假续跑』）
  *
@@ -198,7 +199,7 @@ function readStoreLock(root: string): StoredLockInfo | null {
   const path = join(desktopDir(root), 'sidecar.lock')
   if (!existsSync(path)) return null
   try {
-    return JSON.parse(readFileSync(path, 'utf8')) as StoredLockInfo
+    return readLockFile(path) as StoredLockInfo | null
   } catch {
     return null
   }

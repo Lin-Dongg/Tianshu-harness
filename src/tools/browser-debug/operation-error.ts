@@ -1,6 +1,6 @@
-export type BrowserErrorCode = 'control_conflict' | 'stale_context' | 'invalid_input' | 'capability_unsupported' | 'browser_disconnected' | 'operation_failed' | 'no_selection'
+export type BrowserErrorCode = 'control_conflict' | 'stale_context' | 'invalid_input' | 'capability_unsupported' | 'browser_disconnected' | 'operation_failed' | 'no_selection' | 'resource_limit'
 const statuses: Record<BrowserErrorCode, number> = {
-  control_conflict: 409, stale_context: 409, invalid_input: 400,
+  resource_limit: 429, control_conflict: 409, stale_context: 409, invalid_input: 400,
   capability_unsupported: 501, browser_disconnected: 503, operation_failed: 500, no_selection: 422,
 }
 export class BrowserOperationError extends Error {

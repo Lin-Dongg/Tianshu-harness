@@ -1,5 +1,6 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { basename, join } from 'node:path'
+import { projectSurfaceAllowed } from '../config/project-trust.js'
 
 export interface CustomCommand {
   name: string
@@ -23,7 +24,9 @@ const COMMAND_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/
 export function loadCustomCommands(cwd: string, pluginCommands?: PluginCommand[]): CustomCommand[] {
   const dir = join(cwd, '.rivet', 'commands')
   const projectCommands: CustomCommand[] = []
-  if (existsSync(dir)) {
+  // 未授信项目不展开自定义命令——正文会以「用户消息」身份进模型（2026-10-07 审计 Finding 1d）。
+  // plugin 槽位不受门管辖（插件是用户级安装物 ~/.rivet/plugins，非仓库内容）。
+  if (projectSurfaceAllowed(cwd, 'commands') && existsSync(dir)) {
     const projectRaw = readdirSync(dir, { withFileTypes: true })
       .filter(entry => entry.isFile() && entry.name.endsWith('.md'))
       .map(entry => ({

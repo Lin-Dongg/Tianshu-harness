@@ -149,6 +149,25 @@ let _esbuild: EsbuildLike | null | undefined
 /** 本 worker 里 esbuild 拉起、尚未被回收的 service 子进程（issue #315）。 */
 const _esbuildChildren = new Set<ChildProcess>()
 
+/** esbuild 的语法/解析失败（TransformFailure）带结构化 errors 数组（Message[]，
+ *  每条含 text + location）；基础设施故障（平台二进制包缺失、service 起不来）
+ *  只抛普通 Error，没有 errors 字段。分类必须在**错误产生点**完成：跨到主线程
+ *  之后只剩 message 字符串，只能拿正则猜——issue #366 的用户可见泄漏正是这条
+ *  猜法漏了 "could not be found"（Windows 包缺 @esbuild/win32-x64）。 */
+export function isEsbuildSyntaxFailure(err: unknown): boolean {
+  const errors = (err as { errors?: unknown } | null | undefined)?.errors
+  return Array.isArray(errors) && errors.length > 0
+}
+
+/** worker 内部的「基础设施故障」标记，经 cpu-worker 透传为消息字段 `infra`。 */
+export const ESBUILD_INFRA_FLAG = '__esbuildInfra'
+
+export function esbuildInfraError(cause: unknown): Error {
+  const e = new Error(cause instanceof Error ? cause.message : String(cause))
+  ;(e as Error & Record<string, unknown>)[ESBUILD_INFRA_FLAG] = true
+  return e
+}
+
 export async function esbuildTransformRaw(content: string, options: unknown): Promise<true> {
   if (_esbuild === undefined) {
     try {
@@ -158,7 +177,7 @@ export async function esbuildTransformRaw(content: string, options: unknown): Pr
       _esbuild = null
     }
   }
-  if (!_esbuild) throw new Error('esbuild unavailable in worker')
+  if (!_esbuild) throw esbuildInfraError('esbuild unavailable in worker')
   // esbuild 在 transform() 的同步段里懒启动 `esbuild --service` 子进程，且不暴露句柄。
   // 子进程只能由拉起它的线程回收（libuv 按 loop 各自 waitpid）：worker 被 terminate
   // 后它退出了也没人收尸 → 永久 <defunct>，每次空闲回收 +1（issue #315）。这里只在
@@ -177,7 +196,15 @@ export async function esbuildTransformRaw(content: string, options: unknown): Pr
   } finally {
     cp.spawn = origSpawn
   }
-  await pending
+  try {
+    await pending
+  } catch (err) {
+    // 语法失败原样上抛（主线程 tsSecondOpinion 复核后可能判为误报）；其余一律
+    // 标记为基础设施故障——它们不是「文件有问题」，是「工具链有问题」，
+    // 绝不参与「语法检查提示」的渲染与回滚决策。
+    if (isEsbuildSyntaxFailure(err)) throw err
+    throw esbuildInfraError(err)
+  }
   return true
 }
 

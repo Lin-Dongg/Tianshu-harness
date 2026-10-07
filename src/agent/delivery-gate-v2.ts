@@ -96,7 +96,12 @@ export interface DeliveryGateResult {
   /** Count of verifications dropped because their snapshotRef is stale
    *  (owned diff changed since they ran — ran on outdated code). */
   staleSnapshotDropped: number
-  latestVerificationTotals?: { passed: number; failed: number; skipped: number; command: string }
+  /** Count of verifications dropped because their workspace fingerprint was
+   *  unavailable/mismatched (meta.stale === true) — distinct from snapshotRef
+   *  staleness. Typically: an owned path resolved outside the repo root, so no
+   *  comparable fingerprint could be computed. */
+  staleFingerprintDropped: number
+  latestVerificationTotals?: { passed?: number; failed?: number; skipped?: number; countsReliable?: boolean; command: string; executionId?: string; timestamp?: number; durationMs?: number; executionComplete?: boolean }
   /** @deprecated use supersededFailures instead — renamed for semantic clarity. */
   staleFailureCandidates: number
   toolInvocationFailureCandidates: string[]
@@ -130,9 +135,12 @@ export interface DeliveryReport {
   supersededFailures: number
   /** Count of verifications dropped because their snapshotRef is stale. */
   staleSnapshotDropped: number
+  /** Count of verifications dropped because their workspace fingerprint was
+   *  unavailable/mismatched (meta.stale === true) — see DeliveryGateResult. */
+  staleFingerprintDropped: number
   /** Latest verification pass/fail/skipped totals — for "声明即实测" echo in deliver_task output.
    *  Agents copy these numbers into delivery reports instead of guessing from memory. */
-  latestVerificationTotals?: { passed: number; failed: number; skipped: number; command: string }
+  latestVerificationTotals?: { passed?: number; failed?: number; skipped?: number; countsReliable?: boolean; command: string; executionId?: string; timestamp?: number; durationMs?: number; executionComplete?: boolean }
   /** @deprecated use supersededFailures instead — renamed for semantic clarity. */
   staleFailureCandidates: number
   toolInvocationFailureCandidates: string[]
@@ -211,6 +219,7 @@ export function createDeliveryGateV2(opts: {
     supersededFailures: 0,
     staleFailureCandidates: 0,
     staleSnapshotDropped: 0,
+    staleFingerprintDropped: 0,
     toolInvocationFailureCandidates: [] as string[],
   }
 
@@ -220,7 +229,7 @@ export function createDeliveryGateV2(opts: {
     return isInvocationFailure(v)
   }
 
-  function verificationDiagnostics(verifications: VerificationMetadata[], supersededFailures: number, staleSnapshotDropped: number): Pick<DeliveryGateResult, 'supersededFailures' | 'staleFailureCandidates' | 'staleSnapshotDropped' | 'toolInvocationFailureCandidates' | 'shortestNextStep'> {
+  function verificationDiagnostics(verifications: VerificationMetadata[], supersededFailures: number, staleSnapshotDropped: number, staleFingerprintDropped: number): Pick<DeliveryGateResult, 'supersededFailures' | 'staleFailureCandidates' | 'staleSnapshotDropped' | 'staleFingerprintDropped' | 'toolInvocationFailureCandidates' | 'shortestNextStep'> {
     const invocationFailures = verifications.filter(isToolInvocationFailure)
     const shortestNextStep = invocationFailures
       .map(v => v.recommendedCommand ?? v.resolvedCommand)
@@ -229,6 +238,7 @@ export function createDeliveryGateV2(opts: {
       supersededFailures,
       staleFailureCandidates: supersededFailures,
       staleSnapshotDropped,
+      staleFingerprintDropped,
       toolInvocationFailureCandidates: invocationFailures.map(v => v.command),
       ...(shortestNextStep ? { shortestNextStep } : {}),
     }
@@ -261,6 +271,16 @@ export function createDeliveryGateV2(opts: {
   }
 
   function assess(externalVerifications: VerificationMetadata[], currentDirtyFiles?: string[], currentSnapshotRef?: string, moduleCoverage?: ModuleCoverageInput): DeliveryGateResult {
+    const result = assessVerification(externalVerifications, currentDirtyFiles, currentSnapshotRef, moduleCoverage)
+    if (ownership.isBaselineComplete()) return result
+    return {
+      ...result,
+      state: result.state === 'GREEN' ? 'YELLOW' : result.state,
+      reason: `${result.reason ?? ''}\n该工作区不是 git 仓库（或归属基线未能建立）：无法建立归属基线，也无法提交——deliver_task(commit=true) 会失败。文件改动仍然生效；验证与覆盖要求仍需满足。`.trim(),
+    }
+  }
+
+  function assessVerification(externalVerifications: VerificationMetadata[], currentDirtyFiles?: string[], currentSnapshotRef?: string, moduleCoverage?: ModuleCoverageInput): DeliveryGateResult {
     const { ownedFilesForGate: ownedFiles, coOwnedFiles, externalFiles } = getGateFiles(currentDirtyFiles)
 
     // Check ownership health for unclassified dirty files
@@ -288,19 +308,19 @@ export function createDeliveryGateV2(opts: {
 
     // Use effective verifications (deduplicated by supersession + VSW staleness)
     const rawVerifications = taskLedger.getVerifications()
-    const { effective: ownedVerifications, supersededFailures, staleSnapshotDropped } = getEffectiveVerifications(rawVerifications, currentSnapshotRef)
+    const { effective: ownedVerifications, supersededFailures, staleSnapshotDropped, staleFingerprintDropped } = getEffectiveVerifications(rawVerifications, currentSnapshotRef)
 
     // Combine owned + external verifications for full picture
     const allVerifications = [
       ...ownedVerifications,
       ...externalVerifications,
     ]
-    const diagnostics = verificationDiagnostics(allVerifications, supersededFailures, staleSnapshotDropped)
+    const diagnostics = verificationDiagnostics(allVerifications, supersededFailures, staleSnapshotDropped, staleFingerprintDropped)
 
     // 层 1a: latest verification totals for "声明即实测" echo
     const _lv = allVerifications.length > 0 ? allVerifications[allVerifications.length - 1] : undefined
     const latestVerificationTotals = _lv
-      ? { passed: _lv.passed ?? 0, failed: _lv.failed ?? 0, skipped: _lv.skipped ?? 0, command: _lv.command }
+      ? { passed: _lv.passed, failed: _lv.failed, skipped: _lv.skipped, countsReliable: _lv.countsReliable, command: _lv.command, executionId: _lv.executionId, timestamp: _lv.timestamp, durationMs: _lv.durationMs, executionComplete: _lv.coverage?.executionComplete }
       : undefined
 
     // Nothing to deliver
@@ -332,12 +352,25 @@ export function createDeliveryGateV2(opts: {
       && aggregate.attribution !== 'owned_failure'
       ? assessImpactedTestCoverage(moduleCoverage.impactedTests, allVerifications, moduleCoverage.testExists, moduleCoverage.repositoryRoot)
       : undefined
-    if (coverage?.failed?.length) return {
-      state: 'RED', canDeliver: false, isBlocked: true,
-      reason: `Required impacted tests failed: ${coverage.failed.join(', ')}`,
-      ownedFileCount: ownedFiles.length, externalFileCount: externalFiles.length,
-      verificationCount: allVerifications.length, ...diagnostics, latestVerificationTotals,
-      attributionClass: 'module_unverified', uncoveredImpactedTests: coverage.failed,
+    if (coverage?.failed?.length) {
+      // 外部阻塞 / 未归因的全量失败降级（2026-10-07 对齐）：受影响测试的失败若
+      // 无法归因到本次改动（`unattributed_failure`）或来自外部阻塞（`external_blocked`），
+      // 在共享工作区里很可能是其他会话的在途改动污染了全量 run_tests（假红）。降级
+      // 为 YELLOW（可交付 + 警示），仍逐条列出失败的受影响测试供人裁决。覆盖**义务
+      // 本身不豁免**（守卫 8784b64b8「覆盖义务不受聚合归因影响」不变，只放宽 `failed`
+      // 这一支的硬 RED）；本会话自己的回归仍走 `owned_failure` 分支硬拦。
+      const externallyBlocked = aggregate.attribution === 'unattributed_failure' || aggregate.attribution === 'external_blocked'
+      return {
+        state: externallyBlocked ? 'YELLOW' : 'RED',
+        canDeliver: externallyBlocked,
+        isBlocked: !externallyBlocked,
+        reason: externallyBlocked
+          ? `受影响测试失败，但聚合归因未指向本次改动（${aggregate.attribution}）：${coverage.failed.join(', ')}。共享工作区的外部在途改动（${externalFiles.length} 个）可能造成假红——可降级 scoped 交付，但须在报告点名。`
+          : `Required impacted tests failed: ${coverage.failed.join(', ')}`,
+        ownedFileCount: ownedFiles.length, externalFileCount: externalFiles.length,
+        verificationCount: allVerifications.length, ...diagnostics, latestVerificationTotals,
+        attributionClass: 'module_unverified', uncoveredImpactedTests: coverage.failed,
+      }
     }
     if (coverage && coverage.uncovered.length > 0) {
       const sample = coverage.uncovered.slice(0, 5)
@@ -546,6 +579,7 @@ export function createDeliveryGateV2(opts: {
       verificationCount: result.verificationCount,
       supersededFailures: result.supersededFailures,
       staleSnapshotDropped: result.staleSnapshotDropped,
+      staleFingerprintDropped: result.staleFingerprintDropped,
       latestVerificationTotals: result.latestVerificationTotals,
       staleFailureCandidates: result.staleFailureCandidates,
       toolInvocationFailureCandidates: result.toolInvocationFailureCandidates,

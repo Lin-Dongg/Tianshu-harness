@@ -20,6 +20,7 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
 import { memoryDir } from '../config/paths.js'
+import { projectStateAllowed } from '../config/project-trust.js'
 import { appendKnowledgeJsonl, acquireLock } from '../context/project-memory-writer.js'
 import { writeFileAtomicSync } from '../fs-atomic.js'
 import { tokenizeRecallQuery } from './query-terms.js'
@@ -417,6 +418,10 @@ export function renderMemoryBlock(
   sourceFilter?: MemorySource,
   options?: RenderMemoryBlockOptions,
 ): string | null {
+  // 未授信项目的跨会话记忆不注入（2026-10-07 审计 Finding 1b：两条通道读同一
+  // 文件，volatile 侧有门、此处此前无门）。与 volatile-snapshot 的 projectStateAllowed
+  // 同契约；覆盖 craftedMemory / crossSession push 两种渲染消费形态。
+  if (!projectStateAllowed(cwd)) return null
   const excludedSessionIds = new Set<string>()
   if (options?.excludeSessionId) excludedSessionIds.add(options.excludeSessionId)
   for (const id of options?.excludeSessionIds ?? []) excludedSessionIds.add(id)

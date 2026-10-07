@@ -8,7 +8,7 @@ Terminal coding agent optimized for DeepSeek V4 prefix cache. Node.js 24+ (`engi
 
 ```bash
 npm install && npm run build
-npm test          # ~1,133 test files / ~13,000 cases, node:test + node:assert/strict (runner: scripts/run-node-tests.ts，分批 spawn，末尾 tests 行只是最后一批)
+npm test          # ~1,713 test files / ~13,000 cases, node:test + node:assert/strict (runner: scripts/run-node-tests.ts，分批 spawn，末尾 tests 行只是最后一批)
 npm run typecheck # 跨进程闸门：并发会话检查同一份源码时只跑一次，其余复用（秒回 = 命中缓存，不是没跑）
                   # 指纹 = git HEAD + 脏文件内容 hash；逃生口 typecheck:direct 或 RIVET_TYPECHECK_SHARE=0
 ```

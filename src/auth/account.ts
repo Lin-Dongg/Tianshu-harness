@@ -19,6 +19,7 @@
  * `<RIVET_HOME>/account.json` vs `<RIVET_HOME>/license.json`。
  */
 import { TokenStore, type AccountProfileSnapshot as StoredAccountProfile, type FoundingBadgeSnapshot, type TokenData } from './token-store.js'
+import { fetchAccountSnapshot as fetchSnapshot, type AccountSyncResult } from './account-sync.js'
 import { FOUNDING_USER_LIMIT, isFoundingBadge, tierOfBadgeCode, tierOfRank } from '../agent/founding-tiers.js'
 
 // 快照类型是消费方（sidecar 路由、桌面端镜像）要用的形状——从本模块再导出一次，
@@ -44,8 +45,8 @@ const DEFAULT_ACCOUNT_SITE = 'https://tianshuharness.com'
  */
 const DEFAULT_PUBLISHABLE_KEY = 'sb_publishable_9fLEHwAUNOLZpayKfPW1-g_bbcNNoCR'
 
-/** 单次 HTTP 调用的超时。轮询本身靠 deadline 控制，这里防的是单请求挂死。 */
-const HTTP_TIMEOUT_MS = 10_000
+/** 单次 HTTP 调用的超时。轮询本身靠 deadline 控制，这里防的是单请求挂死。导出供 account-license 复用。 */
+export const HTTP_TIMEOUT_MS = 10_000
 
 /**
  * `fetch` 注入点。
@@ -63,8 +64,8 @@ export interface FetchInjection {
   fetchImpl?: FetchLike
 }
 
-/** Edge Function 调用所需的头（apikey 是 verify_jwt 的凭据）。 */
-function accountHeaders(): Record<string, string> {
+/** Edge Function 调用所需的头（apikey 是 verify_jwt 的凭据）。导出供 account-license 复用。 */
+export function accountHeaders(): Record<string, string> {
   return {
     'Content-Type': 'application/json',
     apikey: process.env.RIVET_ACCOUNT_ANON_KEY ?? DEFAULT_PUBLISHABLE_KEY,
@@ -168,6 +169,7 @@ export async function requestDeviceCode(opts: RequestDeviceCodeOpts = {}): Promi
       tuiVersion: opts.tuiVersion ?? null,
       deviceName: opts.deviceName ?? null,
       deviceFingerprint: opts.deviceFingerprint ?? null,
+      purpose: 'account-login',
     }),
     signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
   })
@@ -423,6 +425,7 @@ export async function refreshAccountToken(refreshToken: string, opts: FetchInjec
     return result.refreshToken ? result : null
   } catch { return null }
 }
+
 
 // ── 星籍（stellar identity）─────────────────────────────────────────────
 
@@ -748,4 +751,28 @@ export function cancelDeviceCode(deviceCode: string, opts: FetchInjection = {}):
 }
 export function revokeAccountSession(accessToken: string, opts: FetchInjection = {}): Promise<boolean> {
   return endAccountRequest({accessToken}, opts)
+}
+
+export function fetchAccountSnapshot(accessToken: string, opts: FetchInjection = {}): Promise<AccountSyncResult> {
+  return fetchSnapshot(accessToken, accountApiBase(), accountHeaders(), jwtSubject(accessToken), opts)
+}
+
+export async function refreshAccountTokenWithStatus(credential: string, opts: FetchInjection = {}): Promise<{ poll: DevicePollResult | null; code: AccountSyncResult['code'] }> {
+  const outcome: {code: AccountSyncResult['code']} = {code:'protocol_error'}
+  const started = Date.now()
+  let httpStatus: number | undefined
+  const poll = await refreshAccountToken(credential, { fetchImpl: async (input, init) => {
+    try {
+      const response = await (opts.fetchImpl ?? fetch)(input, init)
+      httpStatus = response.status
+      outcome.code = response.ok ? 'ok' : response.status === 401 ? 'auth_required' : response.status === 403 ? 'forbidden' : response.status === 404 ? 'endpoint_unavailable' : 'service_error'
+      return response
+    } catch (error) {
+      outcome.code = error instanceof Error && ['TimeoutError', 'AbortError'].includes(error.name) ? 'timeout' : 'network_error'
+      throw error
+    }
+  } })
+  if (!poll && outcome.code === 'ok') outcome.code = 'protocol_error'
+  if (!poll) console.warn('[account-sync]', JSON.stringify({ stage: 'renewal', endpoint: 'tui-auth-refresh', code:outcome.code, httpStatus, elapsedMs:Date.now()-started, runtime: process.version, desktopVersion: /^[0-9a-zA-Z.+-]{1,40}$/.test(process.env.RIVET_DESKTOP_VERSION ?? '') ? process.env.RIVET_DESKTOP_VERSION : 'unknown' }))
+  return { poll, code:outcome.code }
 }

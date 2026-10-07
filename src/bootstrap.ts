@@ -121,6 +121,7 @@ import { scheduleMeridianBackfill } from './repo/meridian-backfill.js'
 import { detectProjectFingerprint } from './repo/project-fingerprint.js'
 import { loadProjectRules } from './context/rules-loader.js'
 import { loadProjectSkills } from './skills/skill-loader.js'
+import { projectSurfaceAllowed } from './config/project-trust.js'
 import { killAllSync } from './tools/process-tracker.js'
 import { persistFileHistory } from './agent/file-history-persist.js'
 import { cleanupOrphanedTmpFiles } from './fs-atomic.js'
@@ -2240,18 +2241,21 @@ export async function bootstrapInteractiveSession(opts: BootstrapOptions = {}): 
   const domainKnowledgeStore = new DomainKnowledgeStore(join(cwd, '.rivet', 'knowledge'))
 
   // 8. Load profiles + star domains
-  const agentsDir = join(cwd, '.rivet', 'agents')
-  const agentLoadResult = await profileRegistry.loadFromDirectory(agentsDir)
-  if (agentLoadResult.loaded.length > 0 || agentLoadResult.errors.length > 0) {
-    for (const err of agentLoadResult.errors) {
-      console.warn(`[agents] ${err}`)
+  // 项目级装配受信任门管辖——未授信不装载 .rivet/agents、.rivet/domains（2026-10-07 审计 Finding 1e）
+  if (projectSurfaceAllowed(cwd, 'agents')) {
+    const agentsDir = join(cwd, '.rivet', 'agents')
+    const agentLoadResult = await profileRegistry.loadFromDirectory(agentsDir)
+    if (agentLoadResult.loaded.length > 0 || agentLoadResult.errors.length > 0) {
+      for (const err of agentLoadResult.errors) {
+        console.warn(`[agents] ${err}`)
+      }
     }
-  }
-  const domainsDir = join(cwd, '.rivet', 'domains')
-  const domainLoadResult = await starDomainRegistry.loadFromDirectory(domainsDir)
-  if (domainLoadResult.errors.length > 0) {
-    for (const err of domainLoadResult.errors) {
-      console.warn(`[domains] ${err}`)
+    const domainsDir = join(cwd, '.rivet', 'domains')
+    const domainLoadResult = await starDomainRegistry.loadFromDirectory(domainsDir)
+    if (domainLoadResult.errors.length > 0) {
+      for (const err of domainLoadResult.errors) {
+        console.warn(`[domains] ${err}`)
+      }
     }
   }
 

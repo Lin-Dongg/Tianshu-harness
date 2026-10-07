@@ -329,8 +329,9 @@ export async function startServer(
       // Health endpoint is intentionally not auth-gated — the desktop shell and
       // Rust monitor probe it from cold-start / token-rotation windows where the
       // Bearer token may not be available yet. No user data is exposed.
-      // Use startsWith so /health?foo=bar also bypasses auth.
-      const isHealth = req.url?.startsWith('/health') ?? false
+      // 精确匹配 cleanUrl（2026-10-07 审计加固）：/health 与 /health?foo=bar 免鉴权
+      // 行为不变；/healthfoo、/health/../sessions 等前缀变体落回 Bearer 校验。
+      const isHealth = cleanUrl === '/health'
       if (!isHealth && !isAuthorizedRequest({ headers: reqHeaders }, apiToken)) {
         res.writeHead(401, { 'Content-Type': 'application/json', ...(origin ? { 'Access-Control-Allow-Origin': origin } : {}) })
         res.end(JSON.stringify({ error: 'Unauthorized' }))

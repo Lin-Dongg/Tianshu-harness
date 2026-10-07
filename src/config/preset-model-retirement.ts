@@ -8,6 +8,76 @@
  * 每个退役都应当是一个独立的一次性迁移：preset 删条目只影响新装，存量用户靠这里。
  */
 
+import { findPresetModel } from './provider-presets.js'
+import type { ModelConfig } from './schema.js'
+
+/**
+ * 重定向前保证 REPLACEMENT 在契约池中可达（2026-10-06，开源仓 3.28 用户反馈族）。
+ *
+ * 退役迁移把 defaultModel / visionModel / worker / review 等引用改指 REPLACEMENT，
+ * 但池侧补救只有「池里恰有旧 id 条目时改名」一种——用户池子里既没有旧 id 也没有
+ * REPLACEMENT（设置页剪枝 userSaved、或 keys 池形态下顶层快照不进契约池）时，
+ * 引用指向池外模型：每次启动报「配置的模型 X 不在 provider 下」并位置性回退
+ * models[0]（实测：剪到只剩 v4-pro 的池，回退档 v4-pro，Flash 价位静默变 Pro 价位）。
+ *
+ * 不变量：**迁移不得制造悬空引用**。这里把 REPLACEMENT 的 preset 条目补进
+ * 事实源池——keys 池存在时补首个含模型的 key 池（契约层只认 keys 并集），否则
+ * 补顶层 models。不做无差别回流（userSaved 的剪枝语义仍由 backfill 尊重），
+ * 只在确有引用需要重定向时补——调用方在 redirect 之前调用，幂等由池内查重守卫。
+ *
+ * Mutates `raw` in place. Returns true if any value was changed.
+ */
+function ensureReplacementInPool(
+  raw: Record<string, unknown>,
+  providerName: string,
+  replacementId: string,
+): boolean {
+  const provider = raw.provider as Record<string, unknown> | undefined
+  const providers = provider?.providers as Record<string, unknown> | undefined
+  const prov = providers?.[providerName] as Record<string, unknown> | undefined
+  if (!prov) return false
+
+  const hasId = (models: unknown): boolean =>
+    Array.isArray(models) && models.some(m =>
+      !!m && typeof m === 'object' && (m as { id?: unknown }).id === replacementId)
+
+  const preset = findPresetModel(providerName, replacementId)
+  const appendPresetEntry = (models: unknown[]): void => {
+    if (!preset) return
+    models.push({
+      id: preset.id,
+      contextWindow: preset.contextWindow,
+      maxTokens: preset.maxTokens,
+      ...(preset.supportsVision ? { supportsVision: true } : {}),
+      ...(preset.supportsImageGen ? { supportsImageGen: true } : {}),
+      ...(preset.tier ? { tier: preset.tier } : {}),
+      ...(preset.reasoningEffort ? { reasoningEffort: preset.reasoningEffort } : {}),
+      pricing: { ...preset.pricing },
+    } satisfies Partial<ModelConfig> & { id: string })
+  }
+
+  // 事实源池：keys 池存在 → 首个含模型的 key 池；否则顶层 models（契约层回退路径）。
+  const keys = prov.keys
+  if (Array.isArray(keys) && keys.length > 0) {
+    for (const key of keys) {
+      if (!key || typeof key !== 'object') continue
+      const slot = key as Record<string, unknown>
+      if (!Array.isArray(slot.models) || slot.models.length === 0) continue
+      if (hasId(slot.models)) return false
+      appendPresetEntry(slot.models as unknown[])
+      return true
+    }
+    // keys 全是空池：契约层会回退顶层 models——检查顶层（有 keys 但顶层也无条目时，补顶层）。
+  }
+  const models = prov.models
+  if (Array.isArray(models)) {
+    if (hasId(models)) return false
+    appendPresetEntry(models as unknown[])
+    return true
+  }
+  return false
+}
+
 /**
  * One-shot migration: 退役 deepseek-v4-flash-vision-exp（2026-09-12 决策；官方文档：
  * 旧名仍可调用，但请求由最新的 Flash 承接，即该档已下线）。preset 已删条目，而存量
@@ -50,6 +120,7 @@ export function migrateDeepseekVisionExpRetirement(raw: Record<string, unknown>)
     // 识图桥指向退役档 → 改指正式视觉档（不重定向 = 桥起不来 + 图片照旧丢）
     const vm = agent.visionModel as Record<string, unknown> | undefined
     if (vm && vm['provider'] === 'deepseek' && (vm['model'] === RETIRED || vm['model'] === RETIRED_ALIAS)) {
+      if (ensureReplacementInPool(raw, 'deepseek', REPLACEMENT)) changed = true
       agent.visionModel = { ...vm, model: REPLACEMENT }
       changed = true
     }
@@ -60,6 +131,7 @@ export function migrateDeepseekVisionExpRetirement(raw: Record<string, unknown>)
       const provName = sep >= 0 ? dm.slice(0, sep) : ''
       const modelName = sep >= 0 ? dm.slice(sep + 1) : ''
       if (provName === 'deepseek' && (modelName === RETIRED || modelName === RETIRED_ALIAS)) {
+        if (ensureReplacementInPool(raw, 'deepseek', REPLACEMENT)) changed = true
         agent.defaultModel = `deepseek:${REPLACEMENT}`
         changed = true
       }
@@ -136,10 +208,20 @@ export function migrateDeepseekV4FlashRetirement(raw: Record<string, unknown>): 
     return parts.join(':')
   }
 
+  // 引用改指 REPLACEMENT 前保证它在事实源池可达——否则迁移制造悬空引用，
+  // 启动报「不在 provider 下」并位置性回退（见 ensureReplacementInPool 头注释）。
+  let poolEnsured = false
+  const ensurePoolOnce = (): void => {
+    if (poolEnsured) return
+    poolEnsured = true
+    if (ensureReplacementInPool(raw, 'deepseek', REPLACEMENT)) changed = true
+  }
+
   const redirectProfile = (profile: unknown): void => {
     if (!profile || typeof profile !== 'object') return
     const p = profile as Record<string, unknown>
     if (p.provider === 'deepseek' && isRetired(p.model)) {
+      ensurePoolOnce()
       p.model = REPLACEMENT
       changed = true
     }
@@ -149,18 +231,21 @@ export function migrateDeepseekV4FlashRetirement(raw: Record<string, unknown>): 
   if (agent) {
     const vm = agent.visionModel as Record<string, unknown> | undefined
     if (vm && vm.provider === 'deepseek' && isRetired(vm.model)) {
+      ensurePoolOnce()
       agent.visionModel = { ...vm, model: REPLACEMENT }
       changed = true
     }
     if (typeof agent.defaultModel === 'string') {
       const next = redirectRef(agent.defaultModel)
       if (next) {
+        ensurePoolOnce()
         agent.defaultModel = next
         changed = true
       }
     }
     const greeting = agent.greeting as Record<string, unknown> | undefined
     if (greeting && greeting.model === RETIRED) {
+      ensurePoolOnce()
       greeting.model = REPLACEMENT
       changed = true
     }
@@ -173,6 +258,7 @@ export function migrateDeepseekV4FlashRetirement(raw: Record<string, unknown>): 
 
   const compact = raw.compact as Record<string, unknown> | undefined
   if (compact && compact.model === RETIRED) {
+    ensurePoolOnce()
     compact.model = REPLACEMENT
     changed = true
   }

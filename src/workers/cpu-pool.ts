@@ -146,13 +146,13 @@ function spawnWorker(): Worker | null {
     execArgv: path.endsWith('.ts') ? [] : undefined,
   })
   w.unref()
-  w.on('message', (msg: { id: number; ok: boolean; result?: unknown; error?: string }) => {
+  w.on('message', (msg: { id: number; ok: boolean; result?: unknown; error?: string; infra?: boolean }) => {
     const p = _pending.get(msg.id)
     if (!p) return
     _pending.delete(msg.id)
     p.clear()
     if (msg.ok) p.resolve(msg.result)
-    else p.reject(new Error(msg.error ?? 'unknown worker error'))
+    else p.reject(taskError(msg.error, msg.infra))
     if (_pending.size === 0) armIdleRecycle()
   })
   // 只处置「当前」worker：被摘下（空闲回收）或已替换的旧 worker 退出时，
@@ -201,6 +201,24 @@ function getWorker(): Worker | null {
 }
 
 // ── Public API ──
+
+/** worker 报告的「任务自身的基础设施故障」标记——与输入无关（工具链坏了、
+ *  平台二进制包缺失、service 起不来…）。调用方应据此静默降级/熔断，而不是把
+ *  message 当业务信号渲染给模型（issue #366：esbuild 平台包缺失被渲染成
+ *  「语法检查提示」）。分类在错误产生点（cpu-tasks）完成，跨线程只传标记。 */
+export interface InfraTaskError extends Error {
+  infra: true
+}
+
+export function isInfraTaskError(err: unknown): err is InfraTaskError {
+  return typeof err === 'object' && err !== null && (err as { infra?: unknown }).infra === true
+}
+
+function taskError(message: string | undefined, infra?: boolean): Error {
+  const err = new Error(message ?? 'unknown worker error')
+  if (infra === true) (err as Partial<InfraTaskError>).infra = true
+  return err
+}
 
 export const cpuPool = {
   /**

@@ -30,6 +30,21 @@ function makeApp() {
 const tick = () => new Promise(r => setTimeout(r, 10))
 const stripAnsi = (s: string) => s.replace(/\x1B\[[0-9;]*[a-zA-Z]/g, '')
 
+test('no-answer stop displays the reason and leaves the main task failed instead of completed', async () => {
+  const { app } = makeApp()
+  await (app as unknown as { commitUserPrompt(text: string): Promise<boolean> | null }).commitUserPrompt('inspect prompt')
+  app.setStreamingState(true)
+  app.callbacks.onPhaseChange?.('stop-reason', {
+    source: 'no-answer', voluntary: false,
+    reason: '未完成：模型未返回有效答案，自动恢复未能完成。发送「继续」可重试。',
+  })
+  app.callbacks.onTurnComplete({}, 1, true, undefined, undefined, 'no_answer')
+  await tick()
+  assert.equal(app.busy, false)
+  assert.equal(app.getTasksData('all').groups.find(g => g.parentToolId === 'main')?.workers[0]?.status, 'failed')
+  assert.match(stripAnsi(app.getScrollbackContent()), /未返回有效答案/)
+})
+
 test('handleError 清空 toolAccumulator——error 后终态提交不含残留流式数据', async () => {
   const { app, out } = makeApp()
   app.setStreamingState(true)

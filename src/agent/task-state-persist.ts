@@ -22,16 +22,35 @@ function rootOf(cwd: string): string {
   try { return realpathSync(cwd) } catch { return resolve(cwd) }
 }
 
-function fingerprint(root: string, files: string[]): string | null {
+/** 敏感路径（不得读取/哈希其内容）——与 fingerprint 的 fail-closed 同源。 */
+const SENSITIVE_PATH_RE = /(?:^|\/)(?:\.env|credentials\.)|private.*key|token|secret/i
+
+/**
+ * 交付指纹的路径归类。交付是 repo-scoped 概念：
+ * - `out-of-project`：解析到 root 之外的路径**不可交付**（git 提交不了它），不参与
+ *   指纹——否则往 /tmp 或兄弟目录写一个 fixture 就使本会话所有验证被判 stale、
+ *   交付门结构性 RED，且本会话无工具摘除该事件（与 plan 草稿排除同一机制）。
+ * - `sensitive`：不得读取/哈希其内容（fail-closed 保留，行为不变）。
+ */
+export function classifyFingerprintPath(root: string, file: string): 'in-project' | 'out-of-project' | 'sensitive' {
+  const rel = relative(root, resolve(root, file)).replace(/\\/g, '/')
+  if (isAbsolute(rel) || rel.startsWith('..')) return 'out-of-project'
+  if (SENSITIVE_PATH_RE.test(rel)) return 'sensitive'
+  return 'in-project'
+}
+
+function fingerprint(root: string, files: string[], isolated = false): string | null {
   const hash = createHash('sha256')
-  for (const args of [['rev-parse', 'HEAD'], ['ls-files', '--stage', '-z']]) {
+  for (const args of isolated ? [] : [['rev-parse', 'HEAD'], ['ls-files', '--stage', '-z']]) {
     const result = spawnSync('git', args, { cwd: root, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, windowsHide: true })
     if (result.status !== 0) return null
     hash.update(result.stdout)
   }
   for (const file of [...new Set(files)].sort()) {
     const path = resolve(root, file), rel = relative(root, path)
-    if (isAbsolute(rel) || rel.startsWith('..') || /(?:^|\/)(?:\.env|credentials\.)|private.*key|token|secret/i.test(rel)) return null
+    // 越界路径 = 不可交付：跳过而非作废（原实现与敏感路径共用 `return null`，是本缺陷根源）。
+    if (classifyFingerprintPath(root, file) === 'out-of-project') continue
+    if (SENSITIVE_PATH_RE.test(rel)) return null
     hash.update(file)
     try {
       const actual = realpathSync(path), inside = relative(root, actual)
@@ -54,7 +73,9 @@ function fingerprint(root: string, files: string[]): string | null {
  *  那些验证事件上（8784b64b8 审查 P1 W1-2）。 */
 function fingerprintPaths(events: ReadonlyArray<TaskLedgerEvent>, adopted: ReadonlySet<string> | readonly string[], root: string): string[] {
   const adoptedList = Array.isArray(adopted) ? adopted : [...adopted]
+  // 越界路径（不可交付）不参与指纹——与 plan 草稿同为「不得影响指纹」的排除项。
   return [...events.filter(e => e.type === 'file_write' && e.path && !isTransientPlanDraftPath(e.path, root)).map(e => e.path!), ...adoptedList]
+    .filter(p => classifyFingerprintPath(root, p) !== 'out-of-project')
 }
 
 /** A restored identity proves provenance; it never grants ownership of all dirty files. */
@@ -76,7 +97,8 @@ export function createPersistentTaskState(cwd: string, sessionId: string, fallba
     const verifications = events.filter(event => event.type === 'verification' && !event.meta?.stale && event.meta?.workspaceFingerprint)
     if (!verifications.length) return
     const current = fingerprint(root, fingerprintPaths(events, adopted, root))
-    for (const event of verifications) if (!current || event.meta?.workspaceFingerprint !== current) event.meta = { ...event.meta, stale: true }
+    const snapshotCurrent = fingerprint(root, fingerprintPaths(events, adopted, root), true)
+    for (const event of verifications) if (!current || event.meta?.workspaceFingerprint !== (event.meta?.verificationPhase === 'isolated' ? snapshotCurrent : current)) event.meta = { ...event.meta, stale: true }
   } })
   const baseline = createWorktreeBaseline(saved?.baseline ?? fallback)
   const ownership = createOwnershipLedger({ baseline, taskLedger })
@@ -84,7 +106,7 @@ export function createPersistentTaskState(cwd: string, sessionId: string, fallba
   if (saved) {
     valid = saved.fingerprint !== null && saved.fingerprint === fingerprint(root, fingerprintPaths(saved.events, saved.adopted, root))
     for (const event of saved.events) {
-      taskLedger.record(event.type === 'verification' && !valid ? { ...event, meta: { ...event.meta, stale: true } } : event)
+      taskLedger.record(event.type === 'verification' && !valid && event.meta?.verificationPhase !== 'isolated' ? { ...event, meta: { ...event.meta, stale: true } } : event)
     }
     ownership.autoOwnFromLedger()
     ownership.adoptFiles(saved.adopted)
@@ -106,11 +128,14 @@ export function createPersistentTaskState(cwd: string, sessionId: string, fallba
       for (const previous of taskLedger.getVerifications()) previous.meta = { ...previous.meta, stale: true }
     }
     if (event.type === 'verification') {
-      event = { ...event, meta: { ...event.meta, workspaceFingerprint: fingerprint(root, fingerprintPaths(taskLedger.getEvents(), adopted, root)) } }
+      const current = fingerprint(root, fingerprintPaths(taskLedger.getEvents(), adopted, root), event.meta?.verificationPhase === 'isolated')
+      const captured = event.meta && 'workspaceFingerprint' in event.meta ? event.meta.workspaceFingerprint : current
+      event = { ...event, meta: { ...event.meta, workspaceFingerprint: captured, stale: event.meta?.stale || !captured || captured !== current } }
     }
     record(event)
     if (event.type === 'file_write' || event.type === 'verification' || event.type === 'git_action') persist()
   }
+  taskLedger.captureVerificationFingerprint = (isolated, executionRoot) => fingerprint(executionRoot ?? root, fingerprintPaths(taskLedger.getEvents(), adopted, root), isolated)
   const adopt = ownership.adoptFiles
   ownership.adoptFiles = files => { const result = adopt(files); for (const file of files) adopted.add(file); persist(); return result }
   return { taskLedger, ownership, baseline, persist, recovery: saved ? valid ? 'restored' : 'verification_stale' : 'baseline_missing' }

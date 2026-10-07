@@ -52,6 +52,9 @@ export interface OwnershipLedger {
   isOwned(filePath: string | null | undefined): boolean
   isExternal(filePath: string): boolean
   isCoOwned(filePath: string): boolean
+  /** 基线是否完整建立（非 git 工作区 → false）。门禁据此避免在「结构上无法建立
+   *  归属/无法提交」时仍报 GREEN（issue #369）。 */
+  isBaselineComplete(): boolean
   getOwnedFiles(): string[]
   getCoOwnedFiles(): string[]
   /** Get external files, optionally enriched with dynamic externals from current dirty files.
@@ -78,8 +81,12 @@ export function createOwnershipLedger(opts: {
   const adoptedSet = new Set<string>()
 
   function registerOwned(filePath: string): void {
-    // External files can be co-owned (shared worktree scenario)
-    if (baseline.isExternal(filePath)) {
+    // 本会话写过 = ledger/工具级铁证。基线**完整**时，预存在的脏文件仍算 co-owned
+    //（可能是别的会话的改动，共享工作区场景）；基线**不完整**（非 git 工作区，
+    // snapshot.complete === false）时 isExternal 恒真、无法区分外部性——但也不能
+    // 因此否决 ledger 的铁证，否则 owned 恒为空、deliver_task 报 GREEN 却 commit
+    // 失败（issue #369）。
+    if (baseline.isComplete() && baseline.isExternal(filePath)) {
       coOwnedSet.add(filePath)
       return
     }
@@ -112,7 +119,7 @@ export function createOwnershipLedger(opts: {
       // Already classified — skip
       if (ownedSet.has(f) || coOwnedSet.has(f)) continue
       // Pre-existing in baseline — not ours to auto-own
-      if (baseline.isExternal(f)) continue
+      if (baseline.isComplete() && baseline.isExternal(f)) continue
       // Must have a ledger trace (file_write/git_action) to auto-own.
       // Files modified by other sessions without our ledger record are not ours.
       if (!ledgerPaths.has(f)) continue
@@ -124,12 +131,18 @@ export function createOwnershipLedger(opts: {
     if (!filePath) return false
     // Adopted files (cross-session takeover) are always considered owned
     if (adoptedSet.has(filePath)) return true
-    if (baseline.isExternal(filePath)) return false
+    // 基线不完整（非 git 工作区）时不短路——否则会把本会话刚 write_file 的文件
+    // 一律判成非 owned（issue #369 的另一半原因）。
+    if (baseline.isComplete() && baseline.isExternal(filePath)) return false
     return ownedSet.has(filePath)
   }
 
   function isExternal(filePath: string): boolean {
     return baseline.isExternal(filePath)
+  }
+
+  function isBaselineComplete(): boolean {
+    return baseline.isComplete()
   }
 
   function isCoOwned(filePath: string): boolean {
@@ -209,6 +222,7 @@ export function createOwnershipLedger(opts: {
     isOwned,
     isExternal,
     isCoOwned,
+    isBaselineComplete,
     getOwnedFiles,
     getCoOwnedFiles,
     getExternalFiles,

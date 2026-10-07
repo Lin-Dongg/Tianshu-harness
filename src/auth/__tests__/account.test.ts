@@ -137,6 +137,25 @@ test('账号 token 落到 <RIVET_HOME>/account.json，权限 0600', () => {
   }
 })
 
+test('信封顶层没有 accessToken——任何按明文解析凭据文件的消费方必然读不到', () => {
+  const home = mkdtempSync(join(tmpdir(), 'rivet-acct-'))
+  try {
+    const store = accountStore(home)
+    saveAccountToken(store, { status: 'approved', accessToken: 'at-1', refreshToken: 'rt-1', expiresIn: 3600 })
+
+    // 格式契约（`secure-store.ts` encodeSecret）：密文信封顶层只有 v/s/b/d。
+    // 这条断言把「谁可以消费凭据」写实——读取只可能发生在持有 TokenStore
+    // 的 Node 侧（sidecar / CLI）。曾有一个 Rust 壳按 `data.get("accessToken")`
+    // 读这个文件，于是「恢复 Pro 激活」在默认安装下恒返回 auth_required
+    // （2026-10-06，桌面端 P0）；格式演进时这条会先红，别再让第二个消费方踩进来。
+    const envelope = JSON.parse(readFileSync(join(home, 'account.json'), 'utf8')) as Record<string, unknown>
+    assert.deepEqual(Object.keys(envelope).sort(), ['b', 'd', 's', 'v'])
+    assert.equal(envelope.accessToken, undefined)
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
 test('saveAccountToken 拒绝没有 token 的轮询结果', () => {
   const home = mkdtempSync(join(tmpdir(), 'rivet-acct-'))
   try {

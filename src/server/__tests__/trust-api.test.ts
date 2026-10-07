@@ -34,7 +34,7 @@ function makeProject(config?: Record<string, unknown>, withHooks = false): strin
   return dir
 }
 
-test('GET /project/trust：未授信项目列出会被剥离的敏感键', async () => {
+test('GET /project/trust：未授信项目区分「信任赌注」与「永久门忽略的安全档位」', async () => {
   await withTempHome(async () => {
     const cwd = makeProject({ mcp: { servers: { a: { command: 'npx' } } }, agent: { approval: 'auto' } })
     try {
@@ -44,14 +44,19 @@ test('GET /project/trust：未授信项目列出会被剥离的敏感键', async
       const body = res.body as {
         trusted: boolean
         projectPath?: string
-        stakes: { sensitiveKeys: string[]; hasHooks: boolean }
+        stakes: { sensitiveKeys: string[]; ignoredSafetyKeys: string[]; hasHooks: boolean }
       }
       assert.equal(body.trusted, false)
       assert.ok(body.projectPath?.endsWith('.rivet-config.json'), `应回项目配置路径：${body.projectPath}`)
       assert.ok(body.stakes.sensitiveKeys.includes('mcp'), `敏感键应含 mcp：${body.stakes.sensitiveKeys.join(',')}`)
+      // 安全档位（永久门剥离）不算「授信能得到什么」——单列 ignoredSafetyKeys。
+      assert.equal(
+        body.stakes.sensitiveKeys.includes('agent.approval'), false,
+        `安全档位不应出现在 sensitiveKeys：${body.stakes.sensitiveKeys.join(',')}`,
+      )
       assert.ok(
-        body.stakes.sensitiveKeys.includes('agent.approval'),
-        `嵌套敏感键应报点路径 agent.approval：${body.stakes.sensitiveKeys.join(',')}`,
+        body.stakes.ignoredSafetyKeys.includes('agent.approval'),
+        `安全档位应报在 ignoredSafetyKeys：${body.stakes.ignoredSafetyKeys.join(',')}`,
       )
       assert.equal(body.stakes.hasHooks, false)
     } finally {

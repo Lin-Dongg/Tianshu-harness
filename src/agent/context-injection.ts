@@ -14,6 +14,7 @@ import type { AdvisoryBus } from './advisory-bus.js'
 import type { SessionContext } from './context.js'
 import type { PromptEngine } from '../prompt/engine.js'
 import { isHumanInput } from './input-origin.js'
+import { projectSurfaceAllowed } from '../config/project-trust.js'
 
 export interface ContextInjectionDeps {
   session: SessionContext
@@ -60,6 +61,10 @@ export class ContextInjectionController {
   refreshPlaybookLessons(userInput: string): void {
     if (process.env.RIVET_PLAYBOOK_INJECT !== '1' && process.env.RIVET_PLAYBOOK_INJECT !== 'true') return
     if (this.playbookLessonsLoaded) return
+    // 未授信项目不注入教训（2026-10-07 审计 Finding 1e）。getCwd 由 loop.ts 装配
+    // （:1013）；缺席（测试替身）时保持旧行为不拦。
+    const cwd = this.deps.getCwd?.()
+    if (cwd && !projectSurfaceAllowed(cwd, 'playbook')) return
     const store = this.deps.getPlaybookStore()
     if (!store) return
     try {

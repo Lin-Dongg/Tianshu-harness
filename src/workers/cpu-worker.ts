@@ -12,7 +12,7 @@
 
 import { parentPort } from 'node:worker_threads'
 // @ts-ignore — tsx dev worker uses .ts extension; tsup bundles this file separately
-import { diffUnifiedRaw, diffStructuredRaw, diffLinesRaw, parseEventsJsonlRaw, parseEventsTailRaw, esbuildTransformRaw, esbuildStopRaw, astScanRaw, astEditComputeRaw } from './cpu-tasks.ts'
+import { diffUnifiedRaw, diffStructuredRaw, diffLinesRaw, parseEventsJsonlRaw, parseEventsTailRaw, esbuildTransformRaw, esbuildStopRaw, astScanRaw, astEditComputeRaw, ESBUILD_INFRA_FLAG } from './cpu-tasks.ts'
 // @ts-ignore — worker source runs with Node's native type stripping.
 import { grepScanRaw } from './grep-scan-task.ts'
 // @ts-ignore — worker source runs with Node's native type stripping.
@@ -50,10 +50,16 @@ parentPort?.on('message', (msg: { id: number; task: string; args: unknown[] }) =
       parentPort?.postMessage({ id: msg.id, ok: true, result })
     })
     .catch((err) => {
+      // 基础设施故障（工具链坏了，与输入无关）在产生点已标记，这里原样透传成
+      // 消息字段 `infra` —— 主线程据此熔断并静默降级，不再靠 message 正则猜。
+      const infra =
+        typeof err === 'object' && err !== null &&
+        (err as Record<string, unknown>)[ESBUILD_INFRA_FLAG] === true
       parentPort?.postMessage({
         id: msg.id,
         ok: false,
         error: err instanceof Error ? err.message : String(err),
+        ...(infra ? { infra: true } : {}),
       })
     })
 })

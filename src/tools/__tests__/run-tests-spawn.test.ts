@@ -8,12 +8,19 @@ const nix: TestSpawnDeps = { isWindows: false, exists: () => true }
 
 describe('resolveTestSpawn — Windows .cmd runner handling', () => {
   it('non-Windows spawns everything directly (no shell)', () => {
-    for (const cmd of ['npm', 'npx', 'tsx', 'node', 'pytest']) {
+    for (const cmd of ['npm', 'npx', 'node', 'pytest']) {
       const r = resolveTestSpawn(cmd, ['--test', 'a.test.ts'], '/proj', nix)
       assert.equal(r.shell, false)
       assert.equal(r.command, cmd)
       assert.deepEqual(r.args, ['--test', 'a.test.ts'])
     }
+  })
+
+  it('POSIX tsx uses current Node and project-local CLI without PATH lookup', () => {
+    const r = resolveTestSpawn('tsx', ['--test', 'a.test.ts'], '/missing project', nix)
+    assert.equal(r.command, process.execPath)
+    assert.deepEqual(r.args, ['/missing project/node_modules/tsx/dist/cli.mjs', '--test', 'a.test.ts'])
+    assert.equal(r.shell, false)
   })
 
   it('Windows npm/npx run under a shell (PATH .cmd shims)', () => {

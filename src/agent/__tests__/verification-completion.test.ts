@@ -44,7 +44,9 @@ it('argv normalization handles wrappers/loaders/Windows paths without loader tar
     assert.deepEqual(value, { kind: 'test', scope: 'targeted', targetFiles: ['src/space name.test.ts'] })
   }
   assert.equal(inferBashVerificationScope('"C:\\Program Files\\node.exe" --import tsx --test "src/a.test.ts"').kind, 'test')
-  for (const command of ['rtk rtk node --test a.test.ts', 'custom node --test a.test.ts', 'cd repo && rtk node --test', 'node --test | tail', 'node --test > out', 'node --test $(echo x)', 'node --test --unknown']) assert.equal(inferBashVerificationScope(command).scope, 'unknown', command)
+  for (const command of ['rtk rtk node --test a.test.ts', 'custom node --test a.test.ts', 'node --test | tail', 'node --test $(echo x)', 'node --test --unknown']) assert.equal(inferBashVerificationScope(command).scope, 'unknown', command)
+  assert.equal(inferBashVerificationScope('node --test > out').scope, 'full')
+  assert.equal(inferBashVerificationScope('cd repo && rtk node --test').scope, 'full')
   for (const option of ['--test-name-pattern=x', '--test-skip-pattern x']) assert.equal(classifyVerificationCommand(`rtk node --test ${option} a.test.ts`).filtered, true)
 })
 

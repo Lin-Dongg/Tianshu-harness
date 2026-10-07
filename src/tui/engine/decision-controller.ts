@@ -19,7 +19,7 @@ export interface DecisionHost {
   preview(slug: string): void
   participate(): void
   plan(decision: PlanDecision): Promise<PlanDecisionResult>
-  answer(text: string): Promise<void>
+  answer(text: string, requestId: string): Promise<void>
   record(text: string): void
 }
 interface BaseRequest {
@@ -165,7 +165,7 @@ export class DecisionController {
     item.submitting = true; item.error = undefined; this.answering = true
     this.host.participate(); this.host.changed()
     try {
-      await this.host.answer(composeAnswers(item.questions, item.drafts, '已全部跳过'))
+      await this.host.answer(composeAnswers(item.questions, item.drafts, '已全部跳过'), item.id)
       if (this.generation !== generation || !this.questions.includes(item)) return
       this.settled.add(item.id)
       this.questions = this.questions.filter(q => q !== item)

@@ -1069,6 +1069,9 @@ function removeSessionFilesIn(dir: string, id: string): void {
   try { unlinkSync(join(dir, `${id}.memory.json`)) } catch { /* ignore */ }
   try { unlinkSync(join(dir, `${id}.claims.jsonl`)) } catch { /* ignore */ }
   try { unlinkSync(join(dir, `${id}.frozen.json`)) } catch { /* ignore */ }
+  for (const suffix of ['skills.json', 'skill-modes.json']) {
+    try { unlinkSync(join(dir, `${id}.${suffix}`)) } catch { /* ignore */ }
+  }
   try { rmSync(join(dir, id), { recursive: true, force: true }) } catch { /* ignore */ }
 }
 

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { makeApp } from './_harness.js'
+import { makeApp, stripAnsi } from './_harness.js'
 import { attachDecisionSession } from '../../decision-session.js'
 import { PLAN_TOOL } from '../../../tools/plan.js'
 import { ASK_USER_QUESTION_TOOL } from '../../../tools/ask-user-question.js'
@@ -232,4 +232,47 @@ test('replacing the model runtime preserves a saved decision awaiting delivery',
     assert.match(delivered, /开始执行已批准方案/)
     assert.equal(app.decisions.count, 0)
   } finally { app.dispose(); await rm(cwd, { recursive: true, force: true }) }
+})
+
+test('production binding archives the question card only once the user answers', async () => {
+  const { app } = makeApp()
+  const agent = { cwd: '/unused' } as AgentLoop
+  const buffer = () => stripAnsi((app as any).commit.getContent())
+  try {
+    attachDecisionSession(app, () => agent)
+    assert.equal(app.decisionPanelsAttached, true, '挂载即声明面板接管提问')
+    const result = await ASK_USER_QUESTION_TOOL.execute({ cwd: '/unused', toolUseId: 'ask-archive',
+      input: { question: '选哪个？', options: [
+        { label: '仅审批', recommended: true, recommendation_reason: '目标清晰且风险低' }, { label: '所有交互' },
+      ] }, onAskUserQuestion: info => agent.onAskUserQuestionRequested?.(info) })
+    app.callbacks.onToolResult('ask-archive', 'ask_user_question', result.content, false, undefined, result.uiContent)
+    await tick()
+    assert.equal(app.decisions.question?.id, 'ask-archive', '面板持有该提问')
+    assert.doesNotMatch(buffer(), /需要你的回答/, '作答前不落第二张卡片')
+    app.submitText('仅审批')
+    await tick()
+    assert.equal((buffer().match(/转入讨论/g) ?? []).length, 1, '作答后恰好归档一次')
+    assert.match(buffer(), /仅审批/, '历史里提问卡与用户答案相邻')
+  } finally { app.dispose() }
+})
+
+test('keyboard answer through the panel archives the question card exactly once', async () => {
+  const { app, stdin } = makeApp()
+  const agent = { cwd: '/unused' } as AgentLoop
+  const buffer = () => stripAnsi((app as any).commit.getContent())
+  try {
+    attachDecisionSession(app, () => agent)
+    app.onSubmit(() => {})
+    const result = await ASK_USER_QUESTION_TOOL.execute({ cwd: '/unused', toolUseId: 'ask-keys',
+      input: { question: '选哪个？', options: [
+        { label: '仅审批', recommended: true, recommendation_reason: '目标清晰且风险低' }, { label: '所有交互' },
+      ] }, onAskUserQuestion: info => agent.onAskUserQuestionRequested?.(info) })
+    app.callbacks.onToolResult('ask-keys', 'ask_user_question', result.content, false, undefined, result.uiContent)
+    await tick()
+    assert.doesNotMatch(buffer(), /需要你的回答/, '作答前不落卡')
+    stdin.dataHandler!('2'); stdin.dataHandler!('\r')
+    await waitFor(() => app.decisions.question === undefined || !!app.decisions.question?.error)
+    assert.equal((buffer().match(/已提交回答/g) ?? []).length, 1, '键盘作答后恰好归档一次')
+    assert.match(buffer(), /所有交互/, '历史里能看到用户的选择紧随提问')
+  } finally { app.dispose() }
 })

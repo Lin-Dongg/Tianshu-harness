@@ -851,12 +851,24 @@ function parseWorkerResultObject(parsed: unknown, expectedWorkOrderId: string): 
  *  in-session repair re-ask (worker context is prefix-cached). See session
  *  2c1186f5: a 10.9k-char scout report was discarded because the terminal
  *  blocked-return bypassed the repair loop entirely. */
+/** worker 是否至少尝试过写最终报告——判据是文本里出现报告骨架关键词。
+ *  `workOrderId` 是契约必填、任何真实报告都带；没有它说明 worker 在探索中就被
+ *  中断（预算/取消），从未进入 final-answer 阶段。此时报 "N candidates" 是误导：
+ *  读起来像"写了 N 个坏报告"，实则根本没写报告（2026-10-06 verifier 空转事故）。 */
+function looksLikeReportAttempt(text: string): boolean {
+  return /"?workOrderId"?\s*:/.test(text)
+}
+
 export class WorkerResultParseError extends Error {
   constructor(
     readonly candidateCount: number,
     readonly parseErrors: readonly string[],
+    /** 'no_report'：worker 未产出报告（中断于探索中）；'malformed'：产出了但格式/契约错。 */
+    readonly reason: 'no_report' | 'malformed' = 'malformed',
   ) {
-    super(`JSON candidates found (${candidateCount}) but none parseable. Errors: ${parseErrors.join(' | ')}`.slice(0, 500))
+    super(reason === 'no_report'
+      ? `Worker emitted no final report (interrupted mid-exploration?) — ${candidateCount} incidental JSON fragment(s) found, none carrying a workOrderId skeleton. Narrow the objective or raise the budget and re-dispatch; this is not a format error.`
+      : `JSON candidates found (${candidateCount}) but none parseable. Errors: ${parseErrors.join(' | ')}`.slice(0, 500))
     this.name = 'WorkerResultParseError'
   }
 }
@@ -900,7 +912,7 @@ export function parseWorkerResult(text: string, expectedWorkOrderId: string): Wo
   // All JSON candidates failed to parse or validate. Throw so the caller's
   // repair loop fires (repair prompt / json-mode re-ask). Terminal handling
   // (salvage → blocked) is the caller's responsibility after retries exhaust.
-  throw new WorkerResultParseError(candidates.length, errors)
+  throw new WorkerResultParseError(candidates.length, errors, looksLikeReportAttempt(text) ? 'malformed' : 'no_report')
 }
 
 /** Field-level salvage — the terminal tier between "repair retries exhausted"

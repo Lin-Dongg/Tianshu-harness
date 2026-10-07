@@ -21,15 +21,15 @@ Only the latest minor release receives security fixes (npm `tianshu-tui@latest` 
 - **敏感文件拒绝**:`.env`、`credentials.*`、`*key*`、`*token*` 等禁止读取与提交。
 - **破坏性命令门禁**:`rm -rf`、force push、`DROP/TRUNCATE` 等需显式确认;三档权限模式(监督 / 自动 / 全自动)统一管理。
 - **插件安全**:插件安装强制 `npm install --ignore-scripts`(禁止 postinstall 任意代码);manifest entry 路径禁止逃逸插件目录;插件工具不得静默覆盖内置工具;安装前展示权限声明。
-- **网络防护**:web 工具逐跳 DNS 解析 + 私有 IP 拦截(SSRF 防护),作用于每次重定向。
+- **网络防护**:web 工具**直连路径**为强保证——逐跳 DNS 解析 + 私有 IP 拦截 + socket 钉死(SSRF 防护,作用于每次重定向);**配置代理时降级为请求前一次性预检**(代理解析目标,客户端无 post-CONNECT 校验点——详见 `src/tools/net/http-fetch.ts` 的 `dispatcherConnectOptions` 注释)。
 
 ## 信任边界 · Trust Boundary
 
 天枢把以下内容视为**数据**而非**指令**:仓库内容(README/issue/注释/第三方项目的 AGENTS.md)、模型输出、工具返回、网络响应。它们可以被分析、被引用、作为证据,但不能单独构成执行动作的授权——任何写操作、网络请求或命令执行仍需你的指令或审批门禁通过。
 
-天枢会读取项目中的 `AGENTS.md` 等指引文件并遵循其中的规则(这是设计特性);但第三方仓库中的同名文件等同于该仓库的普通文档,不覆盖你的指令。项目指令与状态文件(`AGENTS.md`、`.rivet.md`、`.rivet/knowledge/` 的记忆与索引)只在你显式授信该项目后才进入模型上下文(TUI `/trust`、启动加 `--trust` 或设 `RIVET_TRUST_PROJECT=1`),未授信项目一律不读不注入。若发现仓库内容冒充系统指令(如伪造系统前缀)、诱导越界操作或要求暴露凭据,请按上方渠道报告。
+天枢会读取项目中的 `AGENTS.md` 等指引文件并遵循其中的规则(这是设计特性);但第三方仓库中的同名文件等同于该仓库的普通文档,不覆盖你的指令。项目指令与状态文件(`AGENTS.md`、`.rivet.md`、`.rivet/knowledge/` 的记忆与索引,以及 `.rivet/skills`、`.agents/skills`、`.rivet/rules`、`.rivet/commands`、`.rivet/playbook.jsonl`、`.rivet/presence.json`、`.rivet/agents`、`.rivet/domains`、`.rivet/plans` 等项目级内容)只在你显式授信该项目后才进入模型上下文(TUI `/trust`、启动加 `--trust` 或设 `RIVET_TRUST_PROJECT=1`),未授信项目一律不读不注入。若发现仓库内容冒充系统指令(如伪造系统前缀)、诱导越界操作或要求暴露凭据,请按上方渠道报告。
 
-The terminal treats repository content (README/issues/comments/third-party AGENTS.md), model output, tool output, and network responses as **data, not instructions**. They may be analyzed and cited as evidence, but never authorize an action by themselves — writes, network requests, and command execution still require your instruction or an approval gate. Tianshu reads `AGENTS.md` guidance files in your project by design; the same file in a third-party repository is ordinary documentation and does not override your instructions. Project instruction and state files (`AGENTS.md`, `.rivet.md`, and `.rivet/knowledge/` memory/index) enter the model context only after you explicitly trust the project (TUI `/trust`, `--trust`, or `RIVET_TRUST_PROJECT=1`); untrusted projects are never read or injected.
+The terminal treats repository content (README/issues/comments/third-party AGENTS.md), model output, tool output, and network responses as **data, not instructions**. They may be analyzed and cited as evidence, but never authorize an action by themselves — writes, network requests, and command execution still require your instruction or an approval gate. Tianshu reads `AGENTS.md` guidance files in your project by design; the same file in a third-party repository is ordinary documentation and does not override your instructions. Project instruction and state files (`AGENTS.md`, `.rivet.md`, `.rivet/knowledge/` memory/index, and other project-level content such as `.rivet/skills`, `.agents/skills`, `.rivet/rules`, `.rivet/commands`, `.rivet/playbook.jsonl`, `.rivet/presence.json`, `.rivet/agents`, `.rivet/domains`, `.rivet/plans`) enter the model context only after you explicitly trust the project (TUI `/trust`, `--trust`, or `RIVET_TRUST_PROJECT=1`); untrusted projects are never read or injected.
 
 以上任一防线的绕过都属于有效漏洞,欢迎报告。
 A bypass of any of the above is a valid vulnerability — reports welcome.

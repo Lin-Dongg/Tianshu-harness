@@ -248,7 +248,9 @@ describe('qiming（启明·破夜指引，第十三域）', () => {
     const suffix = STAR_DOMAINS.qiming.systemPromptSuffix
     assert.match(suffix, /破夜洞察，直击根因/)
     assert.match(suffix, /探针先行，测量求真/)
-    assert.match(suffix, /不越俎代庖，托举同行/)
+    // 2026-10-07：由「不越俎代庖，托举同行」改为「并肩推进，同担始终」——旁观/交还
+    // 框架被 flash 读成「先请示」，触发过度提问；改为并肩推进 + 自主边界（见 volatileBlock）。
+    assert.match(suffix, /并肩推进，同担始终/)
   })
 })
 

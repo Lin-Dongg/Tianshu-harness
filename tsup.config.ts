@@ -2,7 +2,7 @@ import { defineConfig, type Options } from 'tsup'
 import { builtinModules } from 'node:module'
 import { createRequire } from 'node:module'
 import { existsSync } from 'node:fs'
-import { SCAN_ALLOWED, RUNTIME_BUNDLED, verifyConsistency } from './scripts/external-deps.js'
+import { FORCE_BUNDLED, SCAN_ALLOWED, verifyConsistency } from './scripts/external-deps.js'
 
 const require = createRequire(import.meta.url)
 const pkgJson = require('./package.json') as { version: string; scripts?: Record<string, string> }
@@ -11,35 +11,11 @@ const pkgVersion = pkgJson.version
 // chain that stages the runtime payload next".
 const pkgScripts = pkgJson.scripts ?? {}
 
-// 强制内联的纯 JS 依赖（不进 dist/node_modules）。与 RUNTIME_BUNDLED 互斥——
-// 单一数据源不变量 3（exceljs 曾同时出现在 noExternal 与 ROOTS，2026-08-10 收敛）。
-const FORCE_BUNDLED = [
-  'string-width',
-  'get-east-asian-width',
-  'chalk',
-  'ink',
-  'react',
-  'diff',
-  'undici',
-  'zod',
-  // zod 的伴生纯 JS 库（worker 收尾轮 schema 转换）：必须内联。2026-09-18 它被
-  // 声明进 dependencies（幽灵依赖收口）后 tsup 按「deps 默认 external」不再内联，
-  // dist 裸导入过不了 assert-runtime-imports——声明合规与打包形态要同时满足。
-  'zod-to-json-schema',
-  '@modelcontextprotocol/sdk',
-  'turndown',
-  'pixelmatch',
-  'pngjs',
-]
-
+// 强制内联的纯 JS 依赖（不进 dist/node_modules）。清单本体在
+// scripts/external-deps.js（唯一数据源）——与 RUNTIME_BUNDLED 互斥由
+// verifyConsistency 内聚校验（不变量 3）。
 // 构建期自检：外部依赖清单漂移在构建时 fail loud，而不是发布后缺包。
 verifyConsistency()
-{
-  const overlap = FORCE_BUNDLED.filter((n) => RUNTIME_BUNDLED.includes(n))
-  if (overlap.length > 0) {
-    throw new Error(`tsup: noExternal 与 RUNTIME_BUNDLED 重叠: ${overlap.join(', ')} — 见 scripts/external-deps.js 不变量 3`)
-  }
-}
 
 // src/pro/index.ts 作为独立 entry：闭源模块产物 dist/pro/index.js，供
 // loadProModule 的 dist 形态候选路径加载（桌面 sidecar 运行时）。
@@ -56,6 +32,7 @@ const proRuntimeEntries = existsSync('src/pro/runtime/backend.ts')
 // pro computer-use 同理：产物 dist/pro/computer-use/index.js，供
 // tools/computer-use/bridge.ts 的 dist 形态候选路径加载。
 const proComputerUseEntry = existsSync('src/pro/computer-use/index.ts') ? ['src/pro/computer-use/index.ts'] : []
+const providerUsageEntry = existsSync('src/pro/provider-usage/index.ts') ? ['src/pro/provider-usage/index.ts'] : []
 
 // better-sqlite3 is kept `external` (below) and never imported as a bare
 // specifier at runtime — the live consumers (session-registry, meridian-db) load
@@ -69,7 +46,7 @@ export default defineConfig({
   // 供 loadProModule 的 dist 形态候选路径加载（桌面 sidecar 运行时）。
   // src/cli/entry.ts 是 npm bin（P0-1/P0-2）：轻量 launcher + V8 编译缓存 +
   // CLI 早期路由；未命中才动态 import main.ts。产物 dist/cli/entry.js。
-  entry: ['src/main.ts', 'src/cli/entry.ts', 'src/workers/cpu-worker.ts', 'src/agent/worker-process/child.ts', ...proEntry, ...proComputerUseEntry, ...proRuntimeEntries],
+  entry: ['src/main.ts', 'src/cli/entry.ts', 'src/workers/cpu-worker.ts', 'src/agent/worker-process/child.ts', ...proEntry, ...proComputerUseEntry, ...proRuntimeEntries, ...providerUsageEntry],
   format: ['esm'],
   target: 'node24',
   // Inject the package version as a build-time constant so the packaged sidecar

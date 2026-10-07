@@ -15,6 +15,7 @@ import {
   fetchGitHubLatestVersion,
   npmPackageExists,
   detectInstallRoot,
+  formatDeclinedUpdate,
   getCurrentVersion,
 } from '../updater.js'
 import { WinStreamDecoder } from '../../platform.js'
@@ -69,6 +70,46 @@ describe('updateInstallSpec', () => {
     assert.equal(updateInstallSpec('v3.18.2'), '3.18.2')
     assert.equal(updateInstallSpec('3.18.2'), '3.18.2')
     assert.equal(updateInstallSpec('v3.18.2-canary.1'), '3.18.2-canary.1')
+  })
+})
+
+describe('formatDeclinedUpdate', () => {
+  it('local 安装写明没装上、原因，以及全局和项目两条手动命令', () => {
+    const lines = formatDeclinedUpdate({
+      current: '3.27.0',
+      latest: '3.28.0',
+      packageName: 'tianshu-harness',
+      kind: 'local',
+    })
+    const text = lines.join('\n')
+    assert.match(text, /没有安装 3\.28\.0/)
+    assert.match(text, /当前仍是 3\.27\.0/)
+    assert.match(text, /原因：/)
+    assert.match(text, /npm install -g tianshu-harness@3\.28\.0/)
+    assert.match(text, /npm install tianshu-harness@3\.28\.0/)
+    assert.doesNotMatch(text, /Run \/update/)
+    assert.doesNotMatch(text, /Install source/)
+  })
+
+  it('无法判断安装方式时说明没有自动安装', () => {
+    const text = formatDeclinedUpdate({
+      current: '3.27.0',
+      latest: 'v3.28.0',
+      packageName: 'tianshu-harness',
+      kind: 'unknown',
+    }).join('\n')
+    assert.match(text, /没有安装 v3\.28\.0/)
+    assert.match(text, /无法判断/)
+    assert.match(text, /npm install -g tianshu-harness@3\.28\.0/)
+  })
+})
+
+describe('/update 不再复读启动横幅', () => {
+  it('拒绝安装时走 formatDeclinedUpdate，不打印 Install source', () => {
+    const src = readFileSync(new URL('../slash-commands.ts', import.meta.url), 'utf8')
+    assert.match(src, /formatDeclinedUpdate\(/)
+    assert.doesNotMatch(src, /Install source:/)
+    assert.doesNotMatch(src, /formatUpdateBanner\(/)
   })
 })
 

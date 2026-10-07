@@ -35,7 +35,7 @@ import { runResumePreflightOai } from '../context/resume-preflight.js'
 import type { WriteProbe } from '../context/write-evidence-probe.js'
 import { createContextLayer, createContextLayerReport, type ContextLayerReport } from './context-layer.js'
 import { debugLog } from '../utils/debug.js'
-import { skillRegistry } from '../skills/skill-loader.js'
+import { skillRegistry, type SkillRegistry } from '../skills/skill-loader.js'
 import { parseFrozenSnapshotData, type FrozenSnapshotData } from './frozen-snapshot.js'
 import { stableStringify } from '../api/stable-json.js'
 
@@ -466,7 +466,9 @@ export class PromptEngine {
 
   /** Worker resume uses the same snapshot inheritance path as startup resume. */
   withFrozenSnapshot(snapshot: FrozenSnapshotData): PromptEngine {
-    return new PromptEngine({ ...this.config, staticCtx: { ...this.config.staticCtx, tools: [...this.getTools()] }, inheritFrozenFrom: snapshot })
+    const engine = new PromptEngine({ ...this.config, staticCtx: { ...this.config.staticCtx, tools: [...this.getTools()] }, inheritFrozenFrom: snapshot })
+    engine.sessionSkills = this.sessionSkills
+    return engine
   }
 
   /** 冻结锚点总数（resume 公告「继承 N 个前缀锚点」用）。 */
@@ -682,7 +684,7 @@ export class PromptEngine {
               this.gitDirty = false
               this.userMessagesSinceGitRefresh = 0
             }
-            const dynamicCtx: VolatileContext = { ...this.config.volatileCtx, toolHistory, taskProgress: this.taskProgress, toolContext: this.toolContext, planCacheAdvisory: this.planCacheAdvisory, planTraceAppendix: this.planTraceAppendix, activePlanPointer: this.activePlanPointer, intentRetrievalRoute: this.intentRetrievalRoute, taskDepthAdvisory: this.taskDepthAdvisory, planMethodologyAdvisory: this.planMethodologyAdvisory, planExecutingBlock: this.planExecutingBlock, skillAdvisoryBlock: this.skillAdvisoryBlock ?? undefined, invokedSkillsBlock: skillRegistry.renderInvokedSkillsBlock([...this.invokedSkillNames], this.config.volatileCtx.cwd) ?? undefined, crossSessionMemoryBlock: this.crossSessionMemoryBlock ?? undefined, mentionContextBlock: this.mentionContextBlock ?? undefined, harnessAdvisoryBlock: this.harnessAdvisoryBlock, controlPlaneBlock: this.controlPlaneBlock, tersenessEscalate: this.tersenessEscalate, zenLean: this.zenLean || undefined, decisions: this.decisions, activeClaims: this.activeClaims, excludedPathAnchors: this.excludedPathAnchors.length > 0 ? this.excludedPathAnchors : undefined, goalAnchor: this.goalAnchor, playbookLessons: this.playbookLessons, onLessonsRendered: this.onLessonsRendered, sessionMemoryBlock: this.sessionMemoryOverride ?? this.config.volatileCtx.sessionMemoryBlock, crossSessionEvents: this.crossSessionEvents, companionPresence: this.companionPresence, sessionState: this.sessionStateText, worktreeReality: this.worktreeReality, planModeState: this.planModeState, askModeState: this.askModeState, approvalMode: this.approvalMode, activePlanFilePath: this.activePlanFilePath, planExitReminderPending: this.planExitReminderPending, cognitiveProjection: this.cognitiveProjection, ...(refreshGit ? { gitStatus: undefined } : {}) } as VolatileContext
+            const dynamicCtx: VolatileContext = { ...this.config.volatileCtx, toolHistory, taskProgress: this.taskProgress, toolContext: this.toolContext, planCacheAdvisory: this.planCacheAdvisory, planTraceAppendix: this.planTraceAppendix, activePlanPointer: this.activePlanPointer, intentRetrievalRoute: this.intentRetrievalRoute, taskDepthAdvisory: this.taskDepthAdvisory, planMethodologyAdvisory: this.planMethodologyAdvisory, planExecutingBlock: this.planExecutingBlock, skillAdvisoryBlock: this.skillAdvisoryBlock ?? undefined, invokedSkillsBlock: this.getSkillRegistry().renderInvokedSkillsBlock([...this.invokedSkillNames], this.config.volatileCtx.cwd) ?? undefined, crossSessionMemoryBlock: this.crossSessionMemoryBlock ?? undefined, mentionContextBlock: this.mentionContextBlock ?? undefined, harnessAdvisoryBlock: this.harnessAdvisoryBlock, controlPlaneBlock: this.controlPlaneBlock, tersenessEscalate: this.tersenessEscalate, zenLean: this.zenLean || undefined, decisions: this.decisions, activeClaims: this.activeClaims, excludedPathAnchors: this.excludedPathAnchors.length > 0 ? this.excludedPathAnchors : undefined, goalAnchor: this.goalAnchor, playbookLessons: this.playbookLessons, onLessonsRendered: this.onLessonsRendered, sessionMemoryBlock: this.sessionMemoryOverride ?? this.config.volatileCtx.sessionMemoryBlock, crossSessionEvents: this.crossSessionEvents, companionPresence: this.companionPresence, sessionState: this.sessionStateText, worktreeReality: this.worktreeReality, planModeState: this.planModeState, askModeState: this.askModeState, approvalMode: this.approvalMode, activePlanFilePath: this.activePlanFilePath, planExitReminderPending: this.planExitReminderPending, cognitiveProjection: this.cognitiveProjection, ...(refreshGit ? { gitStatus: undefined } : {}) } as VolatileContext
             // One-shot: the plan-mode exit reminder is snapshotted into dynamicCtx
             // above; clear it so it renders on this turn only, not every subsequent turn.
             if (this.planExitReminderPending) this.planExitReminderPending = false
@@ -1275,6 +1277,11 @@ export class PromptEngine {
     return this.planMethodology
   }
 
+  private sessionSkills?: SkillRegistry
+
+  setSkillRegistry(registry: SkillRegistry): void { this.sessionSkills = registry }
+  getSkillRegistry(): SkillRegistry { return this.sessionSkills ?? skillRegistry }
+
   setSkillAdvisoryBlock(block: string | null): void {
     this.skillAdvisoryBlock = block
   }
@@ -1285,7 +1292,7 @@ export class PromptEngine {
 
   markSkillCompleted(name: string): void {
     // Resolve case-insensitively then remove the canonical name.
-    const canonical = skillRegistry.get(name)?.name
+    const canonical = this.getSkillRegistry().get(name)?.name
       ?? [...this.invokedSkillNames].find(n => n.toLowerCase() === name.toLowerCase())
       ?? name
     this.invokedSkillNames.delete(canonical)

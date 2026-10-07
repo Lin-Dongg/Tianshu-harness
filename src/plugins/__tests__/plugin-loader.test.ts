@@ -1,6 +1,6 @@
 import { describe, it, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { ToolRegistry } from '../../tools/registry.js'
@@ -112,6 +112,31 @@ export const tools = [{
     assert.equal(result.loaded, 1)
     assert.equal(result.totalTools, 1)
     assert.ok(registry.has('hello_tool'))
+  })
+
+  it('rejects entry escaping via symlink — realpath 层（2026-10-07 审计加固）', async (t) => {
+    const { pluginsDir, pluginsSubdir } = freshEnv()
+    setHome(pluginsDir)
+
+    // 词法层守不住：entry 字符串在 plugin 目录内，但它是指向外部的符号链接。
+    // realpath 层（对齐 import-resource issue #119 先例）应拒绝，错误带 (realpath)。
+    const outside = join(pluginsDir, 'outside-entry.js')
+    writeFileSync(outside, 'export const tools = []')
+    const pluginDir = setupPlugin(pluginsSubdir, 'symlink-plugin')
+    try {
+      symlinkSync(outside, join(pluginDir, 'index.js'))
+    } catch {
+      t.skip('symlink 不可用（平台权限）')
+      return
+    }
+
+    const registry = new ToolRegistry()
+    const result = await initializePlugins(undefined, registry, process.cwd())
+    const item = result.results.find(r => r.pluginName === 'symlink-plugin')
+    assert.ok(item)
+    assert.equal(item!.status, 'skipped_import_error')
+    assert.match(String(item!.error), /realpath/)
+    assert.equal(result.loaded, 0)
   })
 
   it('skips plugin with invalid manifest', async () => {

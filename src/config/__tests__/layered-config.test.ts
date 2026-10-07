@@ -111,13 +111,16 @@ describe('loadConfig — 3-layer resolution', () => {
     const projectDir = join(tempDir, 'my-project')
     mkdirSync(projectDir, { recursive: true })
     writeFileSync(join(projectDir, '.rivet-config.json'), JSON.stringify({
-      agent: { approval: 'manual', maxTurns: 10 },
+      // 非安全键——安全档位（approval/unsandboxed/permissions）由「永久门」覆盖，
+      // 专项用例见本文件底部的 describe（安全键不来自项目配置）。
+      agent: { maxTurns: 10 },
+      tools: { preset: 'full' },
     }))
 
     withTrustedProject(() => {
       const config = loadConfig({ cwd: projectDir })
-      assert.equal(config.agent.approval, 'manual')
       assert.equal(config.agent.maxTurns, 10)
+      assert.equal(config.tools.preset, 'full')
       // Other defaults preserved
       assert.equal(config.agent.mode, 'code')
     })
@@ -157,12 +160,12 @@ describe('loadConfig — 3-layer resolution', () => {
   it('uses explicit projectConfigPath when provided', () => {
     const customConfigPath = join(tempDir, 'custom-config.json')
     writeFileSync(customConfigPath, JSON.stringify({
-      agent: { approval: 'suggest' },
+      agent: { maxTurns: 42 },
     }))
 
     withTrustedProject(() => {
       const config = loadConfig({ projectConfigPath: customConfigPath })
-      assert.equal(config.agent.approval, 'suggest')
+      assert.equal(config.agent.maxTurns, 42)
     })
 
     rmSync(customConfigPath, { force: true })
@@ -492,12 +495,17 @@ describe('loadConfig — project trust gating', () => {
     rmSync(projectDir, { recursive: true, force: true })
   })
 
-  it('trusted project (env=1): security keys merge as before', () => {
+  it('trusted project (env=1): safety keys never merge, other keys still do', () => {
+    // 安全收窄（替代旧的 trusted-merge 语义）：授信只授权「项目的编码内容」，
+    // 不授权「是否禁用审批」。agent.approval / agent.unsandboxed /
+    // agent.permissions 是「用户本人的安全决定」，由永久门剥离——授信与否都剥离。
+    // 参照 deepseek-harness：approval policy 无外部 config store。
     const projectDir = writeProjectConfig({
       mcp: { enabled: true, servers: { legit: { command: 'node', args: ['server.js'] } } },
       agent: {
-        approval: 'manual',
-        permissions: { additionalWriteDirs: [trustTempDir] },
+        approval: 'dangerously-skip-permissions',
+        unsandboxed: true,
+        permissions: { additionalWriteDirs: [trustTempDir], allow: [{ tool: 'bash' }] },
       },
     })
 
@@ -506,9 +514,13 @@ describe('loadConfig — project trust gating', () => {
     try {
       withTrustedProject(() => {
         const config = loadConfig({ cwd: projectDir })
+        // 项目内容配置仍随授信合并
         assert.ok(config.mcp.servers['legit'], 'trusted project mcp servers merge')
-        assert.equal(config.agent.approval, 'manual')
-        assert.deepEqual(config.agent.permissions.additionalWriteDirs, [trustTempDir], 'trusted project agent.permissions merge')
+        // 永久门：安全档位**不**来自项目配置——即使项目已授信
+        assert.notEqual(config.agent.approval, 'dangerously-skip-permissions', 'approval must NOT merge from a trusted project')
+        assert.equal(config.agent.unsandboxed, false, 'unsandboxed must NOT merge from a trusted project')
+        assert.deepEqual(config.agent.permissions.additionalWriteDirs, [], 'agent.permissions.additionalWriteDirs must NOT merge')
+        assert.deepEqual(config.agent.permissions.allow, [], 'agent.permissions.allow must NOT merge')
       })
     } finally {
       if (prevCfg === undefined) delete process.env.RIVET_CONFIG_PATH
@@ -516,6 +528,36 @@ describe('loadConfig — project trust gating', () => {
     }
 
     rmSync(projectDir, { recursive: true, force: true })
+  })
+
+  it('untrusted project: safety keys also absent (permanent gate, not only the trust gate)', () => {
+    const projectDir = writeProjectConfig({
+      agent: { approval: 'dangerously-skip-permissions', unsandboxed: true },
+    })
+
+    withUntrustedProject(() => {
+      const config = loadConfig({ cwd: projectDir })
+      assert.notEqual(config.agent.approval, 'dangerously-skip-permissions', 'approval stripped while untrusted')
+      assert.equal(config.agent.unsandboxed, false, 'unsandboxed stripped while untrusted')
+    })
+
+    rmSync(projectDir, { recursive: true, force: true })
+  })
+
+  it('user global config approval still applies (only the project layer is stripped)', () => {
+    // 非回归守卫：修复只剥夺「项目配置」这条来源，用户本人仍可在全局 config 设档。
+    const userCfgPath = join(trustTempDir, 'user-approval.json')
+    writeFileSync(userCfgPath, JSON.stringify({ agent: { approval: 'manual' } }))
+    const prevCfg = process.env.RIVET_CONFIG_PATH
+    process.env.RIVET_CONFIG_PATH = userCfgPath
+    try {
+      const config = loadConfig({ cwd: trustTempDir })
+      assert.equal(config.agent.approval, 'manual', 'user-level approval must be honored')
+    } finally {
+      if (prevCfg === undefined) delete process.env.RIVET_CONFIG_PATH
+      else process.env.RIVET_CONFIG_PATH = prevCfg
+      rmSync(userCfgPath, { force: true })
+    }
   })
 
   it('cleanup trust temp dir', () => {

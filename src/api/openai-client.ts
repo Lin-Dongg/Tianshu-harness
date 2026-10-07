@@ -26,6 +26,8 @@ import { parseOpenAIError } from './error-hints.js'
 import { createBodyGuardNotifyState, enforceRequestBodyLimit, notifyBodyGuard } from './request-body-guard.js'
 import { stableStringify } from './stable-json.js'
 import { RequestInvariantMonitor } from './request-invariant.js'
+import { recoverDsmlToolCallsFromContent } from './dsml-tool-calls.js'
+import { stripThinkTags, filterThinkTagDelta } from './inline-reasoning.js'
 import { wireAbortToReaderCancel, wrapBodyTimeoutError } from './abort-reader.js'
 import { debugLog } from '../utils/debug.js'
 import { repairInvalidJsonEscapes } from './json-escape-repair.js'
@@ -402,6 +404,8 @@ export class OpenAIClient implements StreamClient {
   /** Whether any content delta has started this stream (channel monotonicity:
    *  reasoning_content arriving after content is a protocol anomaly, reclassified as text). */
   private contentStarted = false
+  /** 流式 think 标签过滤的扣留窗口（跨增量；见 inline-reasoning.ts）。 */
+  private thinkHold = ''
   /** Stable suffix appended to system message for Chinese thinking (computed once, cache-safe). */
   private readonly systemSuffix: string
   /**
@@ -850,6 +854,7 @@ export class OpenAIClient implements StreamClient {
       this.toolCallHintFired.clear()
       this.pendingStopReason = null
       this._textAccum = ''
+      this.thinkHold = ''
       this.contentStarted = false
 
       // Inject previous reasoning into messages on retry so the model can
@@ -1061,7 +1066,7 @@ export class OpenAIClient implements StreamClient {
       if (!reader) throw new Error('Response body is not readable')
 
       parserStarted = true
-      await this.parseStreamFromReader(reader, observedCallbacks, signal, reasoningRef, lifecycle, firstByteMs, identity)
+      await this.parseStreamFromReader(reader, observedCallbacks, signal, reasoningRef, lifecycle, firstByteMs, identity, !!((body.tools as unknown[] | undefined)?.length))
       audit.finish({ status: 'complete', responseId: identity.responseId, responseModel: identity.responseModel, systemFingerprint: identity.systemFingerprint, finishReason: identity.finishReason })
       } catch (error) {
         audit.finish({ status: lifecycle.signal.aborted ? 'aborted' : 'failed', responseId: identity.responseId, errorName: (error as Error).name })
@@ -1162,6 +1167,8 @@ export class OpenAIClient implements StreamClient {
      */
     firstByteTimeoutMs?: number,
     identity: Omit<NonNullable<Usage['observation']>, 'status' | 'fields'> = { requestId: crypto.randomUUID(), attemptId: crypto.randomUUID() },
+    /** 本请求是否声明了 tools——DSML 兜底的开关（默认 true，保持测试直调语义）。 */
+    toolsDeclared = true,
   ): Promise<void> {
     const settlement = new UsageSettlement()
     const settledUsage = (status: 'complete' | 'aborted') => {
@@ -1397,6 +1404,11 @@ export class OpenAIClient implements StreamClient {
         textConsumedAsToolJson = this.tryParseToolJsonFromContent(this._textAccum, callbacks) > 0
       }
 
+      // 网#2: DSML 标记文本形态兜底（实现/抓样见 dsml-tool-calls.ts；只对声明了 tools 的请求开）
+      const dsmlRemainingText = !textConsumedAsToolJson && toolsDeclared && this.toolCallBuffer.size === 0 && this._textAccum
+        ? recoverDsmlToolCallsFromContent(this._textAccum, b => callbacks.onContentBlock?.(b))
+        : null
+
       // Emit thinking content block so reasoning_content can be passed back
       // in subsequent requests. Mimo, MiniMax, and other OpenAI-compatible
       // providers that return reasoning_content require it to be echoed.
@@ -1415,13 +1427,15 @@ export class OpenAIClient implements StreamClient {
       }
 
       // Persist final text only on successful completion, never during retries.
-      const finalText = !textConsumedAsToolJson && this._textAccum
-        ? this._textAccum
+      const visibleText = stripThinkTags(dsmlRemainingText ?? this._textAccum)
+      const finalText = !textConsumedAsToolJson && visibleText
+        ? visibleText
         : promotionFired ? reasoningAccum : ''
       if (finalText) {
         callbacks.onContentBlock?.({ type: 'text', text: finalText })
       }
       this._textAccum = ''
+      this.thinkHold = ''
       this.contentStarted = false
 
       const usage = settledUsage('complete')
@@ -1559,7 +1573,11 @@ export class OpenAIClient implements StreamClient {
 
     if (delta.content) {
       this.contentStarted = true
-      callbacks.onTextDelta?.(delta.content)
+      // 推理结束标签必须在实时流就挡掉：漏出去的话，用户先看到带 `</think>` 的串，
+      // 回合结束时落盘 block 又是干净的——同一次回复出现两种形态。
+      const filtered = filterThinkTagDelta(this.thinkHold, delta.content)
+      this.thinkHold = filtered.hold
+      if (filtered.out) callbacks.onTextDelta?.(filtered.out)
       // Always accumulate: the final text content block (emitted at stream end)
       // is built from this — it is what the agent loop persists into session
       // history. Without it, text-only replies were displayed but never stored,
@@ -1855,6 +1873,7 @@ export class OpenAIClient implements StreamClient {
       return emitted
     } catch { return 0 /* Not valid JSON */ }
   }
+
 }
 
 /**

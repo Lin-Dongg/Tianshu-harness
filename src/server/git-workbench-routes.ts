@@ -4,6 +4,7 @@ import { withAuth } from './route-auth.js'
 import type { RouteHandler } from './index.js'
 import type { RuntimeSessionManager } from './session-manager.js'
 import { checkGitPath, checkedRepositoryWrite, commitStaged, gitRead, GitWorkbenchError, history, repositorySnapshot, workbenchDiff } from './git-workbench.js'
+import { GitPathError } from '../tools/git.js'
 
 export function resolveGitCwd(manager: RuntimeSessionManager, input: { cwd?: unknown; sessionId?: unknown }): string {
   const session = typeof input.sessionId === 'string' ? manager.getSession(input.sessionId) : undefined
@@ -106,4 +107,30 @@ function bounded(value: unknown, fallback: number, max: number): number {
 export function validSha(value: unknown): string {
   if (typeof value !== 'string' || !/^[a-f0-9]{40,64}$/.test(value)) throw new GitWorkbenchError('invalid_sha', '缺少有效提交 SHA', 400)
   return value
+}
+
+/**
+ * Run a single-file route body and map its outcome onto HTTP.
+ *
+ * These handlers resolve a request-supplied path against a session cwd — the
+ * one place where a client path reaches git — so the outcomes must stay
+ * distinguishable: a rejected path (traversal shape, or a relative path
+ * escaping cwd) is a client error (400); an unknown session is 404; anything
+ * else (git timeout, spawn failure) keeps escaping to the server-level
+ * fallback so real faults stay loud. Without this mapping the thrown
+ * `无效文件路径` reached the client as a bare 500 (issue #358).
+ */
+export async function serveFileRoute<T>(
+  call: () => Promise<T | null>,
+  wrap: (value: T) => unknown = (value) => value,
+): Promise<{ status: number; body: unknown }> {
+  let result: T | null
+  try {
+    result = await call()
+  } catch (err) {
+    if (err instanceof GitPathError) return { status: 400, body: { error: err.message } }
+    throw err
+  }
+  if (result === null) return { status: 404, body: { error: 'Session not found' } }
+  return { status: 200, body: wrap(result) }
 }

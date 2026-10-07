@@ -1,6 +1,7 @@
 import type { DeliveryImpact } from './delivery-impact.js'
 import { getEffectiveVerifications } from './verification-attribution.js'
 import { captureCommitVersion } from './commit-version.js'
+import { formatDeliveryVerificationPlan } from './delivery-verification-plan.js'
 /**
  * deliver_task — 语义化交付工具 (B1-8)
  *
@@ -82,8 +83,7 @@ function runGateAsync(command: string, cwd: string): Promise<{ ok: boolean; deta
     }
   })
 }
-import type { DeliveryGateV2 } from './delivery-gate-v2.js'
-import { filterExternalNoise } from './delivery-gate-v2.js'
+import { filterExternalNoise, type DeliveryGateV2 } from './delivery-gate-v2.js'
 import { summarizeOwnershipHealth } from './ownership-health.js'
 import { classifyChange, createGitDiffProvider, isMechanicalFastPathEnabled } from './change-classification.js'
 import { commitScopedFiles, type ScopedCommitResult } from './scoped-git-commit.js'
@@ -540,13 +540,13 @@ export function createDeliverTaskTool(getB1Context: (params?: ToolCallParams) =>
         for (const test of impact.requiredTests.slice(0, 5)) lines.push(`  ${test}: ${(impact.reasons?.[test] ?? []).map(step => `${step.from} → ${step.to} (${step.kind}/${step.confidence})`).join('; ') || 'modified test'}`)
         if (impact.advisoryTests.length) lines.push(`  Advisory: ${impact.advisoryTests.slice(0, 5).join(', ')}`)
       }
-      if (ctx.continuityStatus) lines.push(`Session evidence continuity: ${ctx.continuityStatus}`)
+      if (ctx.continuityStatus) lines.push(`Session evidence continuity: ${ctx.continuityStatus}${ctx.continuityStatus === 'baseline_missing' ? '（启动时无历史任务状态，与当前验证结果分开）' : ''}`)
 
-      // 层 1a: echo latest verification totals so agents copy real numbers
-      // into delivery reports instead of guessing from memory.
+      // Echo producer facts; incomplete counts must remain visibly incomplete.
       if (report.latestVerificationTotals) {
         const v = report.latestVerificationTotals
-        lines.push(`  Latest: ${v.passed} pass ${v.failed} fail ${v.skipped} skip — ${v.command}`)
+        lines.push(`  Latest: ${v.passed ?? '未确认'} pass ${v.countsReliable !== true && !v.failed ? '未确认' : v.failed ?? '未确认'} fail ${v.skipped ?? '未确认'} skip${v.countsReliable !== true ? '（已确认计数，非全量；失败数量未确认时须补证据）' : ''} — ${v.command}`)
+        if (v.executionId) lines.push(`  Execution: ${v.executionId} · ${v.timestamp ? new Date(v.timestamp).toISOString() : '时间未确认'} · ${v.durationMs ?? '未确认'}ms`)
       } else if (report.verificationCount === 0) {
         lines.push('  (Typecheck passed, but no test suite was executed. Run tests before claiming "verified".)')
       }
@@ -648,6 +648,7 @@ export function createDeliverTaskTool(getB1Context: (params?: ToolCallParams) =>
       }
 
       lines.push('', `Attribution: ${report.attributionSummary}`)
+      if (report.attributionClass === 'module_unverified' && report.state === 'YELLOW') lines.push(...formatDeliveryVerificationPlan(params.cwd, impactedTests, report.uncoveredImpactedTests ?? [], impact?.advisoryTests.length ?? 0))
 
       // Failure attribution summary: distinguish "my fault" vs "not my fault" failures.
       // Helps the agent understand: which failures should I fix, which are external?
@@ -864,9 +865,12 @@ export function createDeliverTaskTool(getB1Context: (params?: ToolCallParams) =>
           )
           return { content: lines.join('\n') }
         }
-        // Atomic commit reminder — injected at the exact moment before commit,
-        // not in system prompt. Keeps prompt noise low while catching "accidental
-        // batch commit" at the most dangerous moment.
+        if (!ctx.ownership.isBaselineComplete()) {
+          lines.push('', '❌ Cannot commit: 归属基线未完整建立，无法安全执行 scoped commit。')
+          lines.push('文件改动已保存在工作区中。请确认 git 仓库可用并重新建立任务基线后再提交；force 不豁免。')
+          return { content: lines.join('\n'), isError: true, errorKind: 'delivery_gate' }
+        }
+        // Keep the atomic commit reminder at the commit boundary.
         lines.push(
           '',
           '<atomic-commit-reminder>',
@@ -879,7 +883,6 @@ export function createDeliverTaskTool(getB1Context: (params?: ToolCallParams) =>
         )
 
         const forceGate = params.input.force === true
-
         // 位置 B：commit 硬拦——在 RED 判定之前，作为独立拦截条件并列
         // （不与 delivery gate 的 RED 语义混合，防火墙有自己的 Recovery 文案）。
         // force 不豁免：这是当前交付的证据债，不是预存量失败。
@@ -952,9 +955,6 @@ export function createDeliverTaskTool(getB1Context: (params?: ToolCallParams) =>
         // commit=true 必须有覆盖证明；force 不豁免缺失验证。
         if (report.state === 'YELLOW' && report.attributionClass === 'module_unverified') {
           lines.push('', '❌ Cannot commit: impacted tests were never covered by a passed verification. force=true does not waive missing verification.')
-          lines.push(`  Reason: ${report.attributionSummary}`)
-          for (const test of (report.uncoveredImpactedTests ?? []).slice(0, 10)) lines.push(`    ${test}`)
-          lines.push('  → Run these tests with explicit file targets using the appropriate project runner, then re-run deliver_task.')
           return { content: lines.join('\n'), isError: true, errorKind: 'delivery_gate' }
         }
         if (report.state === 'YELLOW') {

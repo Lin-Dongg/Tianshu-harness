@@ -2,8 +2,8 @@
 
 > v3.8.0 · Node.js 24+ / TypeScript strict / 纯 ANSI TUI（`src/tui/engine/`）+ Tauri 桌面端 / node:test / ESM
 >
-> 规模：CLI 源码 1,078 文件 / 25.8 万行，测试 1,361 文件 / 25.6 万行（16,471 用例静态声明），72 个 hook 模块。
-> 逐期数据与迭代里程碑见 [`engineering-metrics.md`](./engineering-metrics.md)（数据截至 2026-08-28）。
+> 规模：CLI 源码 2,042 文件 / 31.7 万行，测试 2,196 文件 / 33.3 万行（16,471 用例静态声明），72 个 hook 模块。
+> 逐期数据与迭代里程碑见 [`engineering-metrics.md`](./engineering-metrics.md)（数据截至 2026-10-07）。
 >
 > 开发代号曾用 **Rivet**；CLI 命令仍为 `rivet`。Agent 导航索引见根目录 [`AGENTS.md`](../AGENTS.md)。
 

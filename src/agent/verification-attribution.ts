@@ -1,6 +1,7 @@
 import { realpathSync } from 'node:fs'
 import { resolve, relative, isAbsolute } from 'node:path'
 import { readCompletionCoverage } from '../tools/test-completion.js'
+import { hasIsolatedComparison } from './verification-comparison.js'
 /**
  * VerificationAttribution — 验证结果归因 (B1-4)
  *
@@ -38,6 +39,12 @@ export interface EffectiveVerifications {
   /** Count of verifications dropped because their snapshotRef is stale
    *  (owned diff changed since the verification ran). */
   staleSnapshotDropped: number
+  /** Count of verifications dropped because their workspace fingerprint was
+   *  unavailable/mismatched (meta.stale === true) — e.g. the owned set contained a
+   *  path outside the repo root, so no comparable fingerprint could be computed.
+   *  Distinguishes "fingerprint unavailable" from "ran on outdated code"
+   *  ({@link staleSnapshotDropped}). */
+  staleFingerprintDropped: number
 }
 
 /**
@@ -183,9 +190,9 @@ function eventToVerificationMetadata(event: TaskLedgerEvent): VerificationMetada
     kind: verificationKind(event.meta),
     ...(readCompletionCoverage(event.meta?.coverage) ? { coverage: readCompletionCoverage(event.meta?.coverage) } : {}),
     exitCode: asNumber(event.meta?.exitCode, status === 'failed' ? 1 : 0),
-    passed: asNumber(event.meta?.passed, status === 'passed' ? 1 : 0),
-    failed: asNumber(event.meta?.failed, status === 'failed' ? 1 : 0),
-    skipped: asNumber(event.meta?.skipped, 0),
+    passed: typeof event.meta?.passed === 'number' ? event.meta.passed : undefined,
+    failed: typeof event.meta?.failed === 'number' ? event.meta.failed : undefined,
+    skipped: typeof event.meta?.skipped === 'number' ? event.meta.skipped : undefined,
     durationMs: asNumber(event.meta?.durationMs, 0),
     ...(failureKind ? { failureKind } : {}),
     ...(asString(event.meta?.userGuidance) ? { userGuidance: asString(event.meta?.userGuidance) } : {}),
@@ -196,6 +203,10 @@ function eventToVerificationMetadata(event: TaskLedgerEvent): VerificationMetada
     ...(verificationPhase ? { verificationPhase } : {}),
     ...(typeof event.meta?.isolatedPassed === 'boolean' ? { isolatedPassed: event.meta.isolatedPassed } : {}),
     ...(blockedReason ? { blockedReason } : {}),
+    ...(typeof event.meta?.countsReliable === 'boolean' ? { countsReliable: event.meta.countsReliable } : {}),
+    ...(asString(event.meta?.executionId) ? { executionId: asString(event.meta?.executionId) } : {}),
+    ...(asString(event.meta?.comparisonId) ? { comparisonId: asString(event.meta?.comparisonId) } : {}),
+    timestamp: asNumber(event.meta?.timestamp, event.timestamp),
   }
 }
 
@@ -248,7 +259,14 @@ export function getEffectiveVerifications(
   // matches reality. Drop it. Verifications without a snapshotRef (in-place /
   // legacy runs) are never dropped, preserving existing behavior.
   let staleSnapshotDropped = 0
-  const currentEvents = allVerificationEvents.filter(e => e.meta?.stale !== true)
+  // 因指纹不可用（meta.stale=true）被丢弃的验证单列计数：病因是"本会话结构性拿不到
+  // 可比较的指纹"（如归属集含仓库外路径），与 snapshotRef 陈旧不同——不区分就会把
+  // 病因报成"没跑过测试"（本缺陷的原症状）。
+  let staleFingerprintDropped = 0
+  const currentEvents = allVerificationEvents.filter(e => {
+    if (e.meta?.stale === true) { staleFingerprintDropped++; return false }
+    return true
+  })
   const verificationEvents = currentSnapshotRef
     ? currentEvents.filter(e => {
         const ref = asString(e.meta?.snapshotRef)
@@ -280,11 +298,11 @@ export function getEffectiveVerifications(
 
   // Convert to VerificationMetadata
   const effective: VerificationMetadata[] = []
-  for (const { event } of keyMap.values()) {
+  for (const { event } of [...keyMap.values()].sort((a, b) => a.index - b.index)) {
     effective.push(eventToVerificationMetadata(event))
   }
 
-  return { effective, supersededFailures, totalRawCount: allVerificationEvents.length, staleSnapshotDropped }
+  return { effective, supersededFailures, totalRawCount: allVerificationEvents.length, staleSnapshotDropped, staleFingerprintDropped }
 }
 
 export type AttributionClass =
@@ -360,7 +378,7 @@ export function assessImpactedTestCoverage(
     const pathForScope = (path: string) => repositoryRoot && c
       ? normalizePathForMatch(relative(canonicalRoot(repositoryRoot), resolve(canonicalRoot(c.repositoryRoot), path)))
       : normalizePathForMatch(path)
-    if (!v.stale && v.status === 'failed' && v.kind === 'test' && c) for (const f of c.files) if (f.outcome === 'failed') failedFiles.add(pathForScope(f.path))
+    if (!v.stale && v.status === 'failed' && v.kind === 'test' && c && !hasIsolatedComparison(v, verifications)) for (const f of c.files) if (f.outcome === 'failed') failedFiles.add(pathForScope(f.path))
     if (v.stale || v.status !== 'passed' || v.kind !== 'test' || v.exitCode !== 0 || !c?.complete || c.filtered) continue
     for (const f of c.files) {
       if (f.outcome === 'passed' && f.tests > f.skipped && f.cancelled === 0) coveredFiles.add(pathForScope(f.path))
@@ -394,7 +412,7 @@ export interface AttributionResult {
 }
 
 export interface VerificationAttribution {
-  attribute(result: VerificationMetadata): AttributionResult
+  attribute(result: VerificationMetadata, verifications?: readonly VerificationMetadata[]): AttributionResult
   getAggregateAttribution(results: VerificationMetadata[]): AttributionResult
 }
 
@@ -421,7 +439,7 @@ export function isInvocationFailure(result: VerificationMetadata): boolean {
 export function createVerificationAttribution(_opts: {
   ownership: OwnershipLedger
 }): VerificationAttribution {
-  function attribute(result: VerificationMetadata): AttributionResult {
+  function attribute(result: VerificationMetadata, verifications: readonly VerificationMetadata[] = []): AttributionResult {
     // Passed → verified
     if (result.status === 'passed') {
       return {
@@ -471,11 +489,11 @@ export function createVerificationAttribution(_opts: {
       // Phase B (integration) failure on current HEAD: the owned diff already
       // passed in isolation (Phase A), so this is a concurrent-change conflict,
       // not an owned defect. Advisory only — never blocks delivery.
-      if (result.verificationPhase === 'integration' && result.isolatedPassed === true && result.snapshotRef) {
+      if (hasIsolatedComparison(result, verifications)) {
         return {
           attribution: 'integration_conflict',
           isBlocking: false,
-          reason: `Integration verification failed on current HEAD: ${result.command} — ${result.failed} test(s) failed. The owned diff passed in isolation; this is a concurrent-change conflict. Rebase/coordinate before merging; delivery is not blocked.`,
+          reason: `Isolation passed, integration failed: ${result.command}. Matching complete proofs establish an integration difference; its cause is unresolved. Delivery is not blocked.`,
           source: result,
         }
       }
@@ -536,7 +554,7 @@ export function createVerificationAttribution(_opts: {
       }
     }
 
-    const attributions = results.map(r => attribute(r))
+    const attributions = results.map(r => attribute(r, results))
 
     // Priority: owned_failure > verification_timeout > tool_invocation_failure
     //           > no_test_infra > unattributed_failure > external_blocked > verified
@@ -614,7 +632,7 @@ export function createVerificationAttribution(_opts: {
       return {
         attribution: 'integration_conflict',
         isBlocking: false,
-        reason: `Integration conflict on current HEAD: ${first.source.command}. Owned changes passed in isolation; rebase/coordinate before merging. Delivery not blocked.`,
+        reason: `Isolation passed, integration failed: ${first.source.command}. Matching proofs establish an integration difference. Delivery not blocked.`,
         source: first.source,
       }
     }

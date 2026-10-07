@@ -237,3 +237,36 @@ for (const renderer of ['classic', 'fullscreen'] as const) test(`${renderer}: pl
     assert.equal(app.decisions.focused, true)
   } finally { app.dispose() }
 })
+
+// ── 提问卡归档：底部面板是唯一活动呈现，卡片等面板结算/用户发言时再落进历史 ──
+
+for (const renderer of ['classic', 'fullscreen'] as const) {
+  test(`${renderer}: 提问卡不在面板存续期间落历史，用户发言后归档一次`, async () => {
+    const { app } = await makeApp({ renderer })
+    try {
+      app.decisionPanelsAttached = true
+      app.onSubmit(() => {})
+      app.openAskUserQuestionPanel(questions)
+      app.callbacks.onToolResult('q1', 'ask_user_question', '[等待你的回复…]', false, undefined, '请选择范围\n\n  1. 范围 A\n  2. 范围 B')
+      await tick()
+      assert.equal(app.decisions.question?.id, 'q1', '面板仍持有该提问')
+      assert.doesNotMatch(stripAnsi((app as any).commit.getContent()), /需要你的回答/, '面板存续期间不落第二张卡片')
+      app.submitText('范围 A')
+      await tick()
+      const archived = stripAnsi((app as any).commit.getContent()).match(/转入讨论/g) ?? []
+      assert.equal(archived.length, 1, '发言后恰好归档一次')
+      app.submitText('再说一句')
+      await tick()
+      assert.equal((stripAnsi((app as any).commit.getContent()).match(/转入讨论/g) ?? []).length, 1, '不重复归档')
+    } finally { app.dispose() }
+  })
+
+  test(`${renderer}: 未挂载决策面板时提问卡仍直接落历史`, async () => {
+    const { app } = await makeApp({ renderer })
+    try {
+      app.callbacks.onToolResult('q9', 'ask_user_question', '[等待你的回复…]', false, undefined, '请选择范围\n\n  1. 范围 A\n  2. 范围 B')
+      await tick()
+      assert.match(stripAnsi((app as any).commit.getContent()), /需要你的回答/)
+    } finally { app.dispose() }
+  })
+}

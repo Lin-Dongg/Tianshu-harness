@@ -182,9 +182,15 @@ export interface VerificationSnapshotPlan {
   path: string
   /** Content-addressed identity (baselineHead + sha(ownedDiff)) for metadata. */
   snapshotRef: string
+  repositoryRoot?: string
+  /** 工作树里 dirty、但快照不会重放的文件（不在本会话工具写入集合内，典型是
+   *  经 bash 脚本生成的改动）。run_tests 据此在阶段 A 输出里点名，避免「隔离红
+   *  但原因不可见」。与 agent/verification-snapshot-manager.ts 的同名接口一致。 */
+  omittedDirtyFiles?: string[]
 }
 
 export interface ToolCallParams {
+  onVerificationCompleted?: (verification: VerificationMetadata) => void
   input: Record<string, unknown>
   toolUseId: string
   cwd: string
@@ -319,6 +325,7 @@ export interface ToolCallParams {
    *  workers are cleaned up immediately. */
   abortSignal?: AbortSignal
   /** Called when the model explicitly loads a skill via the skill tool. */
+  skillRegistry?: import('../skills/skill-loader.js').SkillRegistry
   onSkillInvoked?: (name: string) => void
   /** Called when the model explicitly marks a skill as complete via the skill tool. */
   onSkillCompleted?: (name: string) => void
@@ -363,11 +370,18 @@ export interface TestCompletionCoverage {
   repositoryRoot: string
   complete: boolean
   filtered: boolean
+  executionRoot?: string
+  executionComplete?: boolean
+  workspaceChanged?: boolean
+  totals?: { tests: number; passed: number; failed: number; skipped: number; cancelled: number; todo: number }
   files: Array<{ path: string; outcome: 'passed' | 'failed' | 'incomplete'; tests: number; skipped: number; cancelled: number }>
 }
 
 export interface VerificationMetadata {
   coverage?: TestCompletionCoverage
+  executionId?: string
+  comparisonId?: string
+  workspaceFingerprint?: string | null
   stale?: boolean
   command: string
   status: 'passed' | 'failed' | 'blocked'
@@ -434,6 +448,7 @@ export interface ToolResult {
   images?: string[]
   isError?: boolean
   verification?: VerificationMetadata
+  backgroundJobId?: string
   /** Additional verification events to record beyond the primary one. VSW uses
    *  this to record the Phase B (integration) verification alongside the
    *  primary Phase A (isolated) verification from a single run_tests call. */

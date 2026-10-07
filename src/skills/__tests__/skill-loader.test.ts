@@ -6,6 +6,11 @@ import { tmpdir } from 'node:os'
 import { existsSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { SkillRegistry, parseSkillMarkdown, listSkillFiles, importSkillsIntoRivet, listInstallableSkills, countInstalledSkills, seedBundledSkillsFrom, loadProjectSkills, writeSkill, readSkillContent, uninstallSkill, retireMatchingSkillCopies, skillRegistry } from '../skill-loader.js'
+
+// 信任门族（2026-10-07 审计修复）：loadProjectSkills 现带信任门——本文件验「授信
+// 项目的技能装载」正常语义；未授信拒绝语义在
+// src/config/__tests__/project-trust-surface-gates.test.ts 覆盖。node:test 文件级进程隔离。
+process.env.RIVET_TRUST_PROJECT = '1'
 import { readFileSync } from 'node:fs'
 import { validatePathSafe } from '../../tools/path-validate.js'
 

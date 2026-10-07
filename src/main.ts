@@ -1,3 +1,4 @@
+import { sessionSkillSnapshot } from './skills/session-skill-snapshot.js'
 /**
  * 天枢 T9 主入口 — 纯 ANSI 终端 UI，零 React/Ink 依赖。
  *
@@ -315,7 +316,7 @@ async function main() {
     const { SessionContext } = await import('./agent/context.js')
     const { createAgentConfig, createMainAgentConfigInput } = await import('./agent/create-agent-config.js')
     const { MeridianIndexer } = await import('./repo/meridian-indexer.js')
-    const { createDefaultToolRegistry } = await import('./tools/default-registry.js')
+    const { createDefaultToolRegistry, excludeBuiltinTools } = await import('./tools/default-registry.js')
     const { createDeliverTaskTool } = await import('./agent/deliver-task.js')
     const { createTaskLedger } = await import('./agent/task-ledger.js')
     const { createOwnershipLedger } = await import('./agent/ownership-ledger.js')
@@ -471,7 +472,11 @@ async function main() {
     const mcpStageRegistry = createDefaultToolRegistry([], registryOptions)
     const mcpRefs = { mcpManager: null } as RuntimeRefs
     await initializeMcp(cfg, mcpStageRegistry, mcpRefs)
-    const mcpTools = mcpStageRegistry.getAll()
+    // initializeMcp 只追加 mcp__ 工具。getAll() 仍含内建全集，必须减掉，否则
+    // createAgent 会把内建当 MCP 再注册一遍：带配置的 web_fetch / web_search 是
+    // 新实例，触发「同名覆盖」安全告警，每次 headless 启动误报。
+    // 与上方 pluginTools、plugin-session-cache.ts 同形。
+    const mcpTools = excludeBuiltinTools(mcpStageRegistry.getAll(), builtinNames)
 
     const result = await runHeadless({
       prompt: effectivePrompt,
@@ -719,11 +724,11 @@ async function main() {
     && !isProjectTrusted(process.cwd())
     && !isTrustPromptDismissed(process.cwd())) {
     const stakes = detectProjectTrustStakes(process.cwd())
-    if (stakes.sensitiveKeys.length > 0 || stakes.hasHooks) {
+    if (stakes.sensitiveKeys.length > 0 || stakes.hasHooks || stakes.hasSkills || stakes.hasRules) {
       const decision = await promptProjectTrust(stakes)
       if (decision === 'trust') {
         trustProject(process.cwd())
-        process.stderr.write('[rivet] 已授信本项目——安全敏感配置键当次会话生效；项目 hooks 即刻可用。\n')
+        process.stderr.write('[rivet] 已授信本项目——项目安全敏感配置键（MCP / provider / 网络出口等）与 hooks 当次会话生效；审批档与权限档不来自项目配置。\n')
       } else if (decision === 'dismiss') {
         dismissProjectTrustPrompt(process.cwd())
         process.stderr.write('[rivet] 已关闭本项目的授信提示（安全键仍被忽略）；随时可用 /trust 授信。\n')
@@ -1828,7 +1833,7 @@ async function main() {
 
     // 将 slash 命令解析为 agent prompt（对齐 Ink resolveAppPromptInput）。
     // /review → "deliver_task(...)"；未知 slash → null → 显示错误提示。
-    const resolved = options?.literalText ? { prompt: trimmed } : resolveAppPromptInput(trimmed, process.cwd(), app!.getCommandPredicate())
+    const resolved = options?.literalText ? { prompt: trimmed, skillInvoked: undefined, requiredTools: undefined } : resolveAppPromptInput(trimmed, process.cwd(), app!.getCommandPredicate(), undefined, sessionSkillSnapshot(ctx!.agent.cwd, ctx!.agent.config.sessionId))
     if (resolved === null) {
       // Backstop: a registered slash command (e.g. /plan-approve) may slip past
       // normal dispatch. Give the registry one more chance before reporting
@@ -1849,6 +1854,7 @@ async function main() {
 
     // workflow 声明的 EXTENDED 工具在发 run 前挂载——prompt 契约与工具可见性同源
     // （会话 5158719d：/council 指示调 council_convene 而门控把它摘了 → 模型被迫模拟）。
+    if (resolved.skillInvoked) ctx!.agent.markSkillInvoked(resolved.skillInvoked)
     for (const toolName of resolved.requiredTools ?? []) {
       const mount = ctx!.agent.enableTool(toolName)
       if (mount.status === 'mounted') {

@@ -6,7 +6,7 @@ import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { createDeliveryGateV2, filterExternalNoise, isJunkExternalPath } from '../delivery-gate-v2.js'
 import { createOwnershipLedger } from '../ownership-ledger.js'
-import { createWorktreeBaseline, type BaselineSnapshot } from '../worktree-baseline.js'
+import { createWorktreeBaseline } from '../worktree-baseline.js'
 import { createTaskLedger } from '../task-ledger.js'
 import { createVerificationAttribution, assessImpactedTestCoverage } from '../verification-attribution.js'
 import type { VerificationMetadata } from '../../tools/types.js'
@@ -42,12 +42,64 @@ describe('delivery-gate-v2 — ownership-aware delivery gate with GREEN/YELLOW/R
     assert.equal(result.isBlocked, false)
   })
 
+  it('#369：非 git 工作区（基线不完整）下不报 GREEN——环境结构上无法提交', () => {
+    // 非 git 工作区 → 无法建立归属基线、也无法 git commit。此时报 GREEN「就绪可交付」
+    // 会让调用方以为可以提交，而 commit=true 必然失败（issue #369 的期望第二条）。
+    const baseline = createWorktreeBaseline({
+      branch: '',
+      head: '',
+      preExistingDirty: [],
+      preExistingUntracked: [],
+      capturedAt: Date.now(),
+      complete: false,
+    })
+    const ledger = createTaskLedger({ taskId: 't369' })
+    const ownership = createOwnershipLedger({ baseline, taskLedger: ledger })
+    const attr = createVerificationAttribution({ ownership })
+    const gate = createDeliveryGateV2({ taskLedger: ledger, ownership, attribution: attr })
+
+    const result = gate.assess([])
+    assert.notEqual(result.state, 'GREEN', '基线不完整时不能说「就绪可交付」')
+    assert.match(String(result.reason), /git/, '原因里要说明是 git/归属基线不可用')
+    assert.equal(result.canDeliver, true, '文件已产出，不阻断；只是交付/提交流程不可用')
+  })
+
   it('returns GREEN when no files modified', () => {
     const { gate } = makeGate([])
 
     const result = gate.assess([])
     assert.equal(result.state, 'GREEN')
     assert.equal(result.canDeliver, true)
+  })
+
+  it('#369：非 git 工作区写入归属文件并验证后仍说明不可提交', () => {
+    const baseline = createWorktreeBaseline({ branch: '', head: '', preExistingDirty: [], preExistingUntracked: [], capturedAt: Date.now(), complete: false })
+    const ledger = createTaskLedger({ taskId: 'nongit-owned' })
+    ledger.record({ type: 'file_write', path: 'feature.ts' })
+    const ownership = createOwnershipLedger({ baseline, taskLedger: ledger })
+    ownership.autoOwnFromLedger()
+    const gate = createDeliveryGateV2({ taskLedger: ledger, ownership, attribution: createVerificationAttribution({ ownership }) })
+
+    assert.deepEqual(ownership.getOwnedFiles(), ['feature.ts'])
+    const unverified = gate.assess([])
+    assert.equal(unverified.state, 'RED', '没有验证仍须阻断，不能提前返回可交付的 YELLOW')
+    assert.equal(unverified.canDeliver, false)
+    ledger.record({ type: 'verification', command: 'tsc --noEmit', status: 'passed', meta: { kind: 'typecheck', scope: 'full', exitCode: 0 } })
+    const verified = gate.assess([])
+    assert.equal(verified.state, 'YELLOW')
+    assert.equal(verified.canDeliver, true)
+    assert.equal(verified.isBlocked, false)
+    assert.equal(verified.ownedFileCount, 1)
+    assert.match(verified.reason!, /git.*无法提交/)
+
+    const uncovered = gate.assess([], undefined, undefined, { impactedTests: ['feature.test.ts'], testExists: () => true })
+    assert.equal(uncovered.state, 'YELLOW')
+    assert.deepEqual(uncovered.uncoveredImpactedTests, ['feature.test.ts'], '非 git 说明不能消除 required 测试义务')
+    assert.equal(uncovered.attributionClass, 'module_unverified')
+    ledger.record({ type: 'verification', command: 'node --test feature.test.ts', status: 'failed', meta: { kind: 'test', scope: 'targeted', targetFiles: ['feature.ts'], exitCode: 1 } })
+    const failed = gate.assess([])
+    assert.equal(failed.state, 'RED')
+    assert.equal(failed.canDeliver, false)
   })
 
   it('returns RED when owned files are unverified', () => {
@@ -501,6 +553,26 @@ describe('8784b64b8 审查 P2 — 覆盖义务不受聚合归因影响', () => {
 
     assert.equal(result.attributionClass, 'module_unverified')
     assert.deepEqual(result.uncoveredImpactedTests, coverageInput())
+  })
+
+  it('unattributed_failure + 失败的 impacted test 降级 YELLOW（外部阻塞→scoped 对齐，2026-10-07）', () => {
+    // 与上一条的区别：受影响测试本身在**失败清单**里（有失败证据），而非仅缺证据。
+    // 全量失败无法归因到本会话改动（unattributed_failure）——共享工作区里其他会话的
+    // 在途改动会污染全量 run_tests 造假红。此支降级 YELLOW（可交付 + 仍逐条列出），
+    // 覆盖义务本身不豁免（守卫 8784b64b8 不变）；本会话回归仍走 owned_failure 硬 RED。
+    const { gate, ledger } = makeGate(['src/tools/git.ts'])
+    const failedCoverage: TestCompletionCoverage = {
+      version: 1, runId: 'fixture', runner: 'node-test', cwd: '/repo', repositoryRoot: '/repo',
+      complete: true, filtered: false,
+      files: [{ path: coverageInput()[0]!, outcome: 'failed', tests: 1, skipped: 0, cancelled: 0 }],
+    }
+    ledger.record({ type: 'verification', command: 'npm test', status: 'failed', meta: { scope: 'full', kind: 'test', failed: 1, exitCode: 1, coverage: failedCoverage } })
+
+    const result = gate.assess([], undefined, undefined, { impactedTests: coverageInput(), testExists: () => true })
+
+    assert.equal(result.state, 'YELLOW', '外部/未归因的全量失败不得硬 RED')
+    assert.equal(result.canDeliver, true)
+    assert.deepEqual(result.uncoveredImpactedTests, coverageInput(), '失败的受影响测试仍逐条列出供裁决')
   })
 
   it('no_test_infra does not waive coverage for existing impacted tests', () => {

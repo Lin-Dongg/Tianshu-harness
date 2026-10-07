@@ -660,6 +660,24 @@ export function createGalaxyTool(coordinator: GalaxyCoordinator): Tool {
           isError: true,
         }
       }
+
+      // 多维度视角策略：Galaxy 需要保留所有维度的结果以提供完整视角。
+      // weighted_confidence/first_success/majority 会选择单一结果并丢弃其他维度，
+      // 导致报告维度数与实际请求不符，丢失独立见解，产生误导性结论。
+      const resultDiscardingPolicies = ['weighted_confidence', 'first_success', 'majority']
+      if (policy && resultDiscardingPolicies.includes(policy as string)) {
+        return {
+          content: `星河已拦截：Galaxy 需要保留所有维度的结果以提供完整的多维度视角。聚合策略仅支持 all_required（默认）、primary_decides 或 quorum（组级判定）。
+
+当前策略「${policy}」会选择单一结果并丢弃其他维度，这会导致：
+- 报告维度数与实际请求不符
+- 丢失其他维度的独立见解
+- 误导性的「所有维度通过」结论
+
+如需选择最佳结果，请在 Galaxy 外部评估各维度报告后手动决策。`,
+          isError: true,
+        }
+      }
       // DP 存在时默认组级 quorum（k=1：无组 worker 独立判定、perspective 组
       // 全通过即保留；DP 组由各请求的 quorumK 覆盖为 floor(replicas/2)+1）。
       const effectivePolicy: AggregationPolicy = hasDataParallel

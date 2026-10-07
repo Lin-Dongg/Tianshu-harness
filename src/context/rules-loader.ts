@@ -1,10 +1,13 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { projectSurfaceAllowed } from '../config/project-trust.js'
 import type { ClaimProposal } from './claims.js'
 
 const MAX_RULE_LENGTH = 500
 
 export function loadProjectRules(cwd: string): ClaimProposal[] {
+  // 未授信项目不载入规则——claim 注入即进模型上下文（2026-10-07 审计 Finding 1c）。
+  if (!projectSurfaceAllowed(cwd, 'rules')) return []
   const rulesDir = join(cwd, '.rivet', 'rules')
   if (!existsSync(rulesDir)) return []
 

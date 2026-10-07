@@ -263,4 +263,17 @@ describe('getEffectiveVerifications — deduplicate by (command, scope) key', ()
     assert.equal(result.effective[0]!.passed, 0)
     assert.equal(result.effective[0]!.failureKind, 'tool_invocation_failure')
   })
+
+  it('W2-1：因指纹不可用（stale=true）被丢弃的验证单列计数——病因须可见', () => {
+    const events: TaskLedgerEvent[] = [
+      { type: 'file_write', timestamp: 500, path: 'src/a.ts' },
+      makeVerificationEvent('npm test', 'passed', 'full', 1000, { stale: true }),
+      makeVerificationEvent('npx tsc --noEmit', 'passed', 'full', 2000),
+    ]
+    const result = getEffectiveVerifications(events)
+    assert.equal(result.effective.length, 1, 'stale 验证被丢弃')
+    assert.equal(result.effective[0]!.command, 'npx tsc --noEmit')
+    assert.equal(result.staleFingerprintDropped, 1, '指纹不可用的丢弃必须计数（否则病因报成"没跑过测试"）')
+    assert.equal(result.staleSnapshotDropped, 0, '与 snapshotRef 陈旧是不同病因，不得混计')
+  })
 })

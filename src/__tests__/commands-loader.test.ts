@@ -6,6 +6,11 @@ import assert from 'node:assert/strict'
 import { loadCustomCommands, resolveCustomCommand } from '../commands/loader.js'
 import { resolveAppPromptInput } from '../tui/slash-commands.js'
 
+// 信任门族（2026-10-07 审计修复）：本文件验「授信项目的命令装载/展开」正常语义；
+// 未授信拒绝语义在 src/config/__tests__/project-trust-surface-gates.test.ts 覆盖。
+// node:test 文件级进程隔离，此 env 不外泄。
+process.env.RIVET_TRUST_PROJECT = '1'
+
 function makeProject(): string {
   const cwd = mkdtempSync(join(tmpdir(), 'rivet-commands-'))
   mkdirSync(join(cwd, '.rivet', 'commands'), { recursive: true })

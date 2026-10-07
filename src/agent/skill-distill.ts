@@ -1,3 +1,4 @@
+import { stringify as stringifyYaml } from 'yaml'
 /**
  * Skill distillation — session-end "successful workflow → reusable skill draft".
  *
@@ -196,13 +197,10 @@ export function distillSkillDraft(input: SkillDistillInput): SkillDraft | null {
 
 /** Render a draft as a valid SKILL.md (parseable by parseSkillMarkdown). */
 export function renderSkillDraftMarkdown(draft: SkillDraft): string {
-  const triggersYaml = '[' + draft.triggers.map(t => `'${t.replace(/'/g, '')}'`).join(', ') + ']'
   const id8 = draft.sessionId.slice(0, 8)
   const lines: string[] = []
   lines.push('---')
-  lines.push(`name: ${draft.slug}`)
-  lines.push(`description: ${draft.description}`)
-  lines.push(`triggers: ${triggersYaml}`)
+  lines.push(stringifyYaml({ name: draft.slug, description: draft.description, triggers: draft.triggers }).trimEnd())
   lines.push('---')
   lines.push('')
   lines.push(`# ${draft.slug}`)

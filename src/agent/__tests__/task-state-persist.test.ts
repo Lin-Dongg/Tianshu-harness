@@ -147,3 +147,58 @@ it('T04：owned 内容变更使既有验证失效（执行上下文维度属 B �
     'owned 内容变化必须使旧验证失效——去掉这条，陈旧证据会被复用',
   )
 })
+
+/**
+ * W2-1 交付门指纹治理：项目外写入不得毒化指纹。
+ *
+ * 缺陷：fingerprint()（task-state-persist.ts）对任何解析到 root 之外的路径
+ * return null（与敏感路径共用分支），而 fingerprintPaths() 喂入全部 file_write
+ * 事件路径 → 往仓库外写一个 fixture（/tmp 或兄弟目录）就使本会话所有验证被判
+ * stale、交付门结构性 RED，且本会话无法摘除该事件。
+ * 修法：out-of-project 路径排除出指纹输入集（与既有 plan 草稿同一机制），
+ * fingerprint() 对 out-of-project 跳过而非作废；敏感路径语义不变（仍 fail-closed）。
+ */
+it('W2-1：仓库外写入不得毒化指纹——可交付内容的验证不被判 stale', () => {
+  const { cwd, baseline } = fixture(), state = createPersistentTaskState(cwd, 'out-of-root', baseline)
+  writeFileSync(join(cwd, 'owned.ts'), 'modified')
+  state.taskLedger.record({ type: 'file_write', path: 'owned.ts' })
+  // 两种越界形态：绝对路径（/tmp/...）与相对上跳（../...）——用户往项目外写 fixture 的真实形态。
+  const abs = join(tmpdir(), 'task-state-outsider.js')
+  state.taskLedger.record({ type: 'file_write', path: abs })
+  state.ownership.registerOwned(abs)
+  state.taskLedger.record({ type: 'file_write', path: '../outside-sibling.js' })
+  state.taskLedger.record({ type: 'verification', command: 'npm test', status: 'passed', meta: { scope: 'full' } })
+
+  assert.equal(
+    getEffectiveVerifications(state.taskLedger.getEvents()).effective.length, 1,
+    '仓库外写入不是可交付内容，不得使可交付内容的验证被判 stale（否则会话结构性卡死）',
+  )
+})
+
+it('W2-1 对照：排除越界不得把指纹修成恒不敏感——仓内内容变化仍使旧验证失效', () => {
+  const { cwd, baseline } = fixture(), state = createPersistentTaskState(cwd, 'out-of-root-guard', baseline)
+  writeFileSync(join(cwd, 'owned.ts'), 'v1')
+  state.taskLedger.record({ type: 'file_write', path: 'owned.ts' })
+  state.taskLedger.record({ type: 'file_write', path: join(tmpdir(), 'task-state-outsider.js') })
+  state.taskLedger.record({ type: 'verification', command: 'npm test', status: 'passed', meta: { scope: 'full' } })
+  assert.equal(getEffectiveVerifications(state.taskLedger.getEvents()).effective.length, 1, '前置：排除越界后验证有效')
+
+  writeFileSync(join(cwd, 'owned.ts'), 'v2')
+  state.taskLedger.record({ type: 'file_write', path: 'owned.ts' })
+  assert.equal(
+    getEffectiveVerifications(state.taskLedger.getEvents()).effective.length, 0,
+    '仓内内容变化仍必须使旧验证失效——防修复把指纹修成恒不敏感',
+  )
+})
+
+it('W2-1 边界：敏感路径（.env）保持 fail-closed——本次语义不变', () => {
+  const { cwd, baseline } = fixture(), state = createPersistentTaskState(cwd, 'sensitive-pin', baseline)
+  writeFileSync(join(cwd, 'owned.ts'), 'modified')
+  state.taskLedger.record({ type: 'file_write', path: 'owned.ts' })
+  state.taskLedger.record({ type: 'file_write', path: '.env' })
+  state.taskLedger.record({ type: 'verification', command: 'npm test', status: 'passed', meta: { scope: 'full' } })
+  assert.equal(
+    getEffectiveVerifications(state.taskLedger.getEvents()).effective.length, 0,
+    '敏感路径不得被哈希（指纹不可用）→ 验证不作为有效证据（计划非目标：不放松该 fail-closed）',
+  )
+})

@@ -19,9 +19,11 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn, type ChildProcess } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
+
+import { readLockFile } from '../cron-lock.js'
 
 const SERVE_TS = new URL('../serve.ts', import.meta.url)
 const TOKEN = 'store-lock-smoke-token'
@@ -35,13 +37,15 @@ interface ServeHandle {
 }
 
 /** 起一个真 serve 子进程（driver 复刻生产入口 serveCommand）。 */
-function spawnServe(root: string, port: number): ServeHandle {
+function spawnServe(root: string, port: number, lockError = false): ServeHandle {
   const home = join(root, 'home')
   const desktop = join(root, 'desktop')
   const driverPath = join(root, `driver-${port}.mjs`)
   writeFileSync(
     driverPath,
-    `import { serveCommand } from ${JSON.stringify(SERVE_TS.href)}\n`
+    (lockError ? `import fs from 'node:fs'; import { syncBuiltinESMExports } from 'node:module';\n`
+      + `fs.linkSync = () => { throw Object.assign(new Error('permission denied'), {code:'EACCES'}) }; syncBuiltinESMExports();\n` : '')
+    + `const { serveCommand } = await import(${JSON.stringify(SERVE_TS.href)})\n`
     + `await serveCommand(['--port', String(${port}), '--host', '127.0.0.1'])\n`,
     'utf8',
   )
@@ -141,7 +145,7 @@ test('P0-1 接线：先到者独占会话库，后来者降级为 data-dir-locke
     )
     assert.ok(!('storeLockHolder' in firstHealth), '持锁实例不应报占用者（它自己就是属主）')
     assert.ok(existsSync(lockPath), '拿到锁的实例必须在 desktopDir()/sidecar.lock 留下锁文件')
-    const lockInfo = JSON.parse(readFileSync(lockPath, 'utf8')) as { pid: number }
+    const lockInfo = readLockFile(lockPath)!
     assert.equal(lockInfo.pid, first.child.pid, '锁文件的 pid 应是实例 1 自身')
 
     // ── 实例 2：后来者，5s 重试窗口后降级运行 ────────────────────────────
@@ -160,16 +164,17 @@ test('P0-1 接线：先到者独占会话库，后来者降级为 data-dir-locke
     assert.equal(holder!.pid, first.child.pid, '占用者 pid 应是实例 1')
     assert.equal(secondHealth.registryOk, false, '降级实例不接注册表（会话库不得被触碰）')
     // 会话库所有权不得易主
-    assert.equal((JSON.parse(readFileSync(lockPath, 'utf8')) as { pid: number }).pid, first.child.pid,
+    assert.equal(readLockFile(lockPath)?.pid, first.child.pid,
       '降级实例不得抢走活锁')
 
     // ── 实例 1 优雅退出 → 必须释放锁 ─────────────────────────────────────
-    first.child.kill('SIGTERM')
+    const shutdown = await fetch(`http://127.0.0.1:${first.port}/shutdown`, {
+      method: 'POST', headers: { authorization: `Bearer ${TOKEN}` },
+    })
+    assert.equal(shutdown.status, 200)
     const firstCode = await waitForExit(first.child, 30_000)
     assert.equal(firstCode, 0, `实例 1 应优雅退出 code=0，实际 ${firstCode}；stderr=${first.stderr.join('').slice(-400)}`)
-    if (process.platform !== 'win32') {
-      assert.ok(!existsSync(lockPath), '正常退出必须释放锁文件——残留会让下一个实例被判 contended')
-    }
+    assert.ok(!existsSync(lockPath), '正常退出必须释放锁文件——残留会让下一个实例被判 contended')
 
     // ── 实例 3：锁已释放，应立即可接管 ───────────────────────────────────
     const third = spawnServe(root, await freePort())
@@ -181,12 +186,30 @@ test('P0-1 接线：先到者独占会话库，后来者降级为 data-dir-locke
       '实例 3 未能在前持有者退出后就绪',
     )
     assert.ok(!('initializationError' in thirdHealth), '实例 3 不该再报初始化失败')
-    assert.equal((JSON.parse(readFileSync(lockPath, 'utf8')) as { pid: number }).pid, third.child.pid,
+    assert.equal(readLockFile(lockPath)?.pid, third.child.pid,
       '实例 3 必须成为新的锁属主')
   } finally {
     for (const h of handles) {
       if (h.child.exitCode === null && !h.child.killed) h.child.kill('SIGKILL')
     }
     try { rmSync(root, { recursive: true, force: true }) } catch { /* best-effort */ }
+  }
+})
+
+
+test('锁创建权限失败报告 data-dir-lock-error，不虚构占用进程', { timeout: 60_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'serve-lock-error-'))
+  const handle = spawnServe(root, await freePort(), true)
+  try {
+    const health = await waitForHealth(handle, b => b.readiness === 'failed', 40_000, 'lock error readiness')
+    assert.equal(health.initializationError, 'data-dir-lock-error')
+    assert.ok(!health.storeLockHolder)
+    assert.equal(health.registryOk, false)
+    assert.ok(handle.stderr.join('').includes('会话库锁创建失败'))
+    handle.child.kill('SIGTERM')
+    await waitForExit(handle.child, 15_000)
+  } finally {
+    if (handle.child.exitCode === null) handle.child.kill('SIGKILL')
+    rmSync(root, { recursive: true, force: true })
   }
 })

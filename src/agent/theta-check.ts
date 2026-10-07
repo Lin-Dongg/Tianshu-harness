@@ -3,6 +3,9 @@ import {
   readCachedTypecheck,
   defaultCacheDir,
   isLockHeld,
+  runTypecheckShared,
+  type TscRunOutcome,
+  TYPECHECK_CALLER_BUDGET_MS,
 } from '../lsp/typecheck-cache.js'
 import { TSC_GATE_VARIANT } from '../lsp/client.js'
 
@@ -107,19 +110,103 @@ function readSharedVerdict(cwd: string): ThetaCheckResult {
   }
 }
 
+export interface ThetaCheckOptions {
+  cwd: string
+  /** 预算（毫秒）。当前只读消费者不使用，保留为接口稳定。混合策略时将用于触发真跑的预算。 */
+  timeoutMs?: number
+  /** 当返回 no-fresh-verdict 时是否触发真跑（经过共享闸门） */
+  triggerOnMiss?: boolean
+  /** 触发原因（用于遥测和调试） */
+  triggerReason?: string
+}
+
 /**
- * Theta 一致性检查（只读消费者形态）。
+ * Theta 一致性检查（混合策略形态）。
  *
- * `timeoutMs` 参数保留是为了接口稳定（controller 传入 THETA_BUDGET_MS），当前
- * 不参与判定——没有 spawn 就没有内层预算可言。若第二步引入「未命中时触发一次
- * 真跑」，预算应改用闸门导出的 TYPECHECK_CALLER_BUDGET_MS，而不是这个拍脑袋值。
+ * **阶段 1**：优先读取共享缓存（零成本）
+ * - 如果有缓存结论（ok / type_errors），直接返回
+ * - 如果闸门持锁（busy），返回 busy
+ * - 如果无缓存（no-fresh-verdict）→ 进入阶段 2
+ *
+ * **阶段 2**：根据 triggerOnMiss 决定是否触发真跑
+ * - triggerOnMiss=false（默认）：返回 no-fresh-verdict，保持只读消费者行为
+ * - triggerOnMiss=true：经过共享闸门触发一次真检查
+ *
+ * 这个设计解决了 2026-09-22 改造后的问题：
+ * - 改造前：自己跑 tsc → 40/42 次超时（预算 15s < 实际 21s）
+ * - 改造后（只读）：99%+ no-fresh-verdict（缓存从不被写入）
+ * - 现在（混合）：优先缓存 + 必要时触发 → 既避免超时，又能获得结论
  */
-export function runThetaCheck(cwd: string, timeoutMs = 15_000): Promise<ThetaCheckResult> {
-  void timeoutMs
+export async function runThetaCheck(options: string | ThetaCheckOptions): Promise<ThetaCheckResult> {
+  // 向后兼容：支持旧的 runThetaCheck(cwd, timeoutMs) 签名
+  const opts: ThetaCheckOptions = typeof options === 'string'
+    ? { cwd: options, timeoutMs: 15_000 }
+    : options
+
+  const { cwd, triggerOnMiss = false, triggerReason } = opts
+
   try {
-    return Promise.resolve(readSharedVerdict(cwd))
+    // 阶段 1：尝试只读消费
+    const verdict = readSharedVerdict(cwd)
+
+    // 如果有结论，直接返回（最常见路径，零成本）
+    if (verdict.outcome !== 'no-fresh-verdict' && verdict.outcome !== 'busy') {
+      return verdict
+    }
+
+    // 如果闸门正在跑，返回 busy（不抢锁）
+    if (verdict.outcome === 'busy') {
+      return verdict
+    }
+
+    // 到这里是 no-fresh-verdict 的情况
+
+    // 如果不触发真跑，返回原结果（保持只读消费者行为）
+    if (!triggerOnMiss) {
+      return verdict
+    }
+
+    // 阶段 2：触发真跑（经过共享闸门）
+    const fingerprint = computeSourceFingerprint(cwd, TSC_GATE_VARIANT)
+    if (!fingerprint) {
+      // 非 git 仓库，无法触发
+      return verdict
+    }
+
+    // 触发真跑，经过共享闸门（去重 + 串行化）
+    // 使用 runTypecheckShared 的 run 回调，让闸门自己处理 tsc 的执行
+    let outcome: TscRunOutcome
+    try {
+      // 导入 runTypeCheck 来获取 tsc 执行逻辑
+      const { runTypeCheck } = await import('../lsp/client.js')
+      const result = await runTypeCheck(cwd, '*', TYPECHECK_CALLER_BUDGET_MS)
+
+      // 将 LspCheckResult 转换为我们需要的格式
+      outcome = {
+        status: result.ranOk ? (result.diagnostics.length > 0 ? 1 : 0) : null,
+        stdout: result.formatted,
+        stderr: '',
+      }
+    } catch (err) {
+      // 触发失败，返回 no-fresh-verdict
+      return verdict
+    }
+
+    // 解析结果
+    const errors = parseTypeScriptErrorFiles(outcome.stdout)
+    return {
+      errors,
+      durationMs: 0, // 保持 0，因为这是从闸门获取的结果
+      timedOut: outcome.status === null,
+      outcome: outcome.status === null
+        ? 'timeout'
+        : outcome.status === 0 && errors.length === 0
+          ? 'ok'
+          : 'type_errors',
+    }
+
   } catch {
     // 只读路径理论上不抛（闸门 API 全部 fail-open），兜底保持「永不阻断主循环」。
-    return Promise.resolve(noVerdictResult())
+    return noVerdictResult()
   }
 }

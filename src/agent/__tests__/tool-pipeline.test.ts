@@ -227,9 +227,9 @@ describe('executeToolUse', () => {
   it('VSW: injects verificationSnapshot into run_tests params when the manager returns a plan', async () => {
     let seen: any
     const deps = makeDeps({
-      ownershipLedger: { getOwnedFiles: () => ['a.ts'], getBaselineHead: () => 'head1' } as any,
+      ownershipLedger: { getOwnedFiles: () => ['a.ts'], getCoOwnedFiles: () => ['shared.ts'], getBaselineHead: () => 'head1' } as any,
       verificationSnapshotManager: {
-        prepare: (owned: string[]) => ({ path: '/snap/dir', snapshotRef: 'head1+diffX', decision: { snapshot: true } as any, ownedFiles: owned }),
+        prepare: (owned: string[]) => { assert.deepEqual(owned, ['a.ts', 'shared.ts']); return { path: '/snap/dir', snapshotRef: 'head1+diffX', decision: { snapshot: true } as any, ownedFiles: owned } },
         lastDecision: () => null,
         currentSnapshotRef: () => 'head1+diffX',
         destroy: () => {},
@@ -250,13 +250,13 @@ describe('executeToolUse', () => {
       deps, noopCallbacks as any, 1, false,
     )
 
-    assert.deepEqual(seen, { path: '/snap/dir', snapshotRef: 'head1+diffX' })
+    assert.deepEqual(seen, { path: '/snap/dir', snapshotRef: 'head1+diffX', repositoryRoot: deps.cwd })
   })
 
   it('VSW: leaves verificationSnapshot unset when the manager returns null (in-place)', async () => {
     let seen: any = 'sentinel'
     const deps = makeDeps({
-      ownershipLedger: { getOwnedFiles: () => [], getBaselineHead: () => '' } as any,
+      ownershipLedger: { getOwnedFiles: () => [], getCoOwnedFiles: () => [], getBaselineHead: () => '' } as any,
       verificationSnapshotManager: {
         prepare: () => null,
         lastDecision: () => null,
@@ -1102,6 +1102,174 @@ describe('executeToolUse', () => {
     assert.equal(executed, false, 'harness must NOT execute the write when claim is contested')
     assert.match((result.toolResult as any).content as string, /另一个会话/)
     assert.match(resultMsg, /阻断/)
+  })
+
+  it('R2 显式接管：冲突时先问用户；同意 → 释放对方认领并写入（2026-10-07）', async () => {
+    let executed = false
+    const released: Array<[string, string]> = []
+    let mine = false
+    const fakeRegistry = {
+      acquireClaim: () => mine,
+      checkClaim: (filePath: string) => ({ sessionId: 'peer-1234abcd', claimType: 'exclusive', filePath }),
+      releaseClaim: (sid: string, path: string) => {
+        released.push([sid, path])
+        if (sid === 'peer-1234abcd') mine = true
+      },
+    }
+    const deps = makeDeps({
+      sessionRegistry: fakeRegistry as any,
+      sessionId: 'mine',
+      harness: {
+        executeTool: async ({ execute }: any) => { executed = true; const r = await execute(); return { content: r.content, isError: false, retried: false } },
+      } as any,
+    })
+
+    const result = await executeToolUse(
+      { id: 'tu-takeover', name: 'write_file', input: { file_path: 'foo.ts', content: 'x' } },
+      deps,
+      { ...noopCallbacks, onApprovalRequired: async () => true } as any,
+      1,
+      false,
+    )
+
+    assert.notEqual((result.toolResult as any).is_error, true, `接管获准后应放行，got: ${(result.toolResult as any).content}`)
+    assert.equal(executed, true, '接管获准后必须真的执行写入')
+    assert.deepEqual(released[0], ['peer-1234abcd', 'foo.ts'], '必须先释放对方认领再抢')
+  })
+
+  it('R2 显式接管：用户拒绝 → 保持阻断（fail-closed 不放松）', async () => {
+    let executed = false
+    const fakeRegistry = {
+      acquireClaim: () => false,
+      checkClaim: (filePath: string) => ({ sessionId: 'peer-1234abcd', claimType: 'exclusive', filePath }),
+      releaseClaim: () => {},
+    }
+    const deps = makeDeps({
+      sessionRegistry: fakeRegistry as any,
+      sessionId: 'mine',
+      harness: {
+        executeTool: async ({ execute }: any) => { executed = true; const r = await execute(); return { content: r.content, isError: false, retried: false } },
+      } as any,
+    })
+
+    const result = await executeToolUse(
+      { id: 'tu-decline', name: 'write_file', input: { file_path: 'foo.ts', content: 'x' } },
+      deps,
+      { ...noopCallbacks, onApprovalRequired: async () => false } as any,
+      1,
+      false,
+    )
+
+    assert.equal((result.toolResult as any).is_error, true)
+    assert.equal(executed, false, '拒绝接管时不得执行写入')
+    assert.match((result.toolResult as any).content as string, /另一个会话/)
+  })
+
+  // v2（认领即租约）：有证据时**自动接管**，不再依赖「有人能答批准」（headless 也能解）。
+  // 无证据（陈旧但脏 / 新鲜 / shared_read）仍走上面的显式接管与 fail-closed 阻断。
+  function makeClaimRegistry(liveness: Record<string, unknown>) {
+    const released: Array<[string, string]> = []
+    let taken = false
+    return {
+      released,
+      registry: {
+        acquireClaim: () => taken,
+        checkClaim: (filePath: string) => ({ sessionId: liveness.ownerSessionId as string, claimType: 'exclusive', filePath }),
+        claimLiveness: () => liveness,
+        releaseClaim: (sid: string, path: string) => { released.push([sid, path]); taken = true },
+      },
+    }
+  }
+
+  it('R2 自动接管 L1：持有方进程已死 → 无需批准即放行并点名', async () => {
+    let executed = false
+    let approvalAsked = false
+    const { registry, released } = makeClaimRegistry({
+      ownerSessionId: 'peer-dead-0001', ownerPid: 99999, ownerAlive: false,
+      claimType: 'exclusive', acquiredAt: '2026-01-01T00:00:00.000Z', lastTouchedAt: '2026-01-01T00:00:00.000Z',
+    })
+    const deps = makeDeps({
+      sessionRegistry: registry as any, sessionId: 'mine', isPathClean: async () => true,
+      harness: { executeTool: async ({ execute }: any) => { executed = true; const r = await execute(); return { content: r.content, isError: false, retried: false } } } as any,
+    })
+    const result = await executeToolUse(
+      { id: 'tu-auto-l1', name: 'write_file', input: { file_path: 'foo.ts', content: 'x' } },
+      deps,
+      { ...noopCallbacks, onApprovalRequired: async () => { approvalAsked = true; return false } } as any,
+      1, false,
+    )
+    assert.notEqual((result.toolResult as any).is_error, true, `L1 应自动放行，got: ${(result.toolResult as any).content}`)
+    assert.equal(executed, true, 'L1 自动接管后必须执行写入')
+    assert.equal(approvalAsked, false, 'L1 自动接管不应再问用户')
+    assert.deepEqual(released[0], ['peer-dead-0001', 'foo.ts'], '必须先释放死持有方的认领')
+  })
+
+  it('R2 自动接管 L2：持有方 5h 未触碰该文件 ∧ 工作区干净 → 自动放行（动机案例）', async () => {
+    let executed = false
+    let approvalAsked = false
+    const { registry } = makeClaimRegistry({
+      ownerSessionId: 'peer-idle-0002', ownerPid: process.pid, ownerAlive: true,
+      claimType: 'exclusive', acquiredAt: new Date(Date.now() - 5 * 3600_000).toISOString(),
+      lastTouchedAt: new Date(Date.now() - 5 * 3600_000).toISOString(),
+    })
+    const deps = makeDeps({
+      sessionRegistry: registry as any, sessionId: 'mine', isPathClean: async () => true,
+      harness: { executeTool: async ({ execute }: any) => { executed = true; const r = await execute(); return { content: r.content, isError: false, retried: false } } } as any,
+    })
+    const result = await executeToolUse(
+      { id: 'tu-auto-l2', name: 'write_file', input: { file_path: 'foo.ts', content: 'x' } },
+      deps,
+      { ...noopCallbacks, onApprovalRequired: async () => { approvalAsked = true; return false } } as any,
+      1, false,
+    )
+    assert.notEqual((result.toolResult as any).is_error, true, `L2 应自动放行，got: ${(result.toolResult as any).content}`)
+    assert.equal(executed, true, 'L2 自动接管后必须执行写入')
+    assert.equal(approvalAsked, false, 'L2 自动接管不应再问用户')
+    // 静默接管是禁止的：结果尾部必须点名（判据 + 被接管会话）
+    assert.match((result.toolResult as any).content as string, /\[claim-takeover\]/)
+    assert.match((result.toolResult as any).content as string, /peer-idl/)
+  })
+
+  it('R2 不自动接管 L3：陈旧但工作区有未提交改动 → 仍要问（拒绝则阻断）', async () => {
+    let executed = false
+    const { registry } = makeClaimRegistry({
+      ownerSessionId: 'peer-dirty-0003', ownerPid: process.pid, ownerAlive: true,
+      claimType: 'exclusive', acquiredAt: new Date(Date.now() - 5 * 3600_000).toISOString(),
+      lastTouchedAt: new Date(Date.now() - 5 * 3600_000).toISOString(),
+    })
+    const deps = makeDeps({
+      sessionRegistry: registry as any, sessionId: 'mine', isPathClean: async () => false,
+      harness: { executeTool: async ({ execute }: any) => { executed = true; const r = await execute(); return { content: r.content, isError: false, retried: false } } } as any,
+    })
+    const result = await executeToolUse(
+      { id: 'tu-l3', name: 'write_file', input: { file_path: 'foo.ts', content: 'x' } },
+      deps,
+      { ...noopCallbacks, onApprovalRequired: async () => false } as any,
+      1, false,
+    )
+    assert.equal((result.toolResult as any).is_error, true, 'L3 不自动接管：拒绝后必须阻断')
+    assert.equal(executed, false, 'L3 被拒时不得执行写入')
+  })
+
+  it('R2 不自动接管 L4：持有方刚触碰过（真并发）→ 仍要问', async () => {
+    let executed = false
+    const { registry } = makeClaimRegistry({
+      ownerSessionId: 'peer-live-0004', ownerPid: process.pid, ownerAlive: true,
+      claimType: 'exclusive', acquiredAt: new Date(Date.now() - 10_000).toISOString(),
+      lastTouchedAt: new Date(Date.now() - 10_000).toISOString(),
+    })
+    const deps = makeDeps({
+      sessionRegistry: registry as any, sessionId: 'mine', isPathClean: async () => true,
+      harness: { executeTool: async ({ execute }: any) => { executed = true; const r = await execute(); return { content: r.content, isError: false, retried: false } } } as any,
+    })
+    const result = await executeToolUse(
+      { id: 'tu-l4', name: 'write_file', input: { file_path: 'foo.ts', content: 'x' } },
+      deps,
+      { ...noopCallbacks, onApprovalRequired: async () => false } as any,
+      1, false,
+    )
+    assert.equal((result.toolResult as any).is_error, true, 'L4 新鲜认领不得自动夺走')
+    assert.equal(executed, false)
   })
 
   it('R2: allows write_file when the claim is uncontended (acquireClaim true)', async () => {

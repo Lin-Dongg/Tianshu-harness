@@ -77,7 +77,10 @@ export function isPrivateIP(ip: string): boolean {
   const family = isIP(ip)
   if (family === 4) return RESERVED_IPS.check(ip, 'ipv4')
   if (family === 6) return RESERVED_IPS.check(ip, 'ipv6')
-  return false
+  // fail-closed（2026-10-07 审计 Finding 6）：不可解析的输入没有「公网可达」证据，
+  // 按不可信拒绝——全项目唯一 fail-open 的收口。消费点全部是「true=拦截」语义
+  //（buildPinnedLookup / resolveAndAssertPublic / web-fetch re-export），无放行侧。
+  return true
 }
 
 export class SSRFError extends Error {
