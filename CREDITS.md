@@ -399,3 +399,4 @@ contributions for this graph`；`including commit co-authors` 仅 GHES 版本成
 - #360 docs: 新增 tianshu-mcp 操作文档（三步图解快速上手）（CLOSED）
 - #371 fix(delivery): 修复非 git 工作区归属误判与交付门虚假 GREEN (#369)（CLOSED）
 - #370 fix(galaxy): 拦截丢弃型聚合策略防止维度丢失与虚假通过 (#368)（CLOSED）
+- #364 fix(git): support external file diff in changes tab and stabilize Windows test harness（CLOSED）
