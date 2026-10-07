@@ -397,3 +397,4 @@ contributions for this graph`；`including commit co-authors` 仅 GHES 版本成
 - #362 fix(headless): mcpTools 未减内建工具——消除每次启动的「工具注册覆盖」误报（CLOSED）
 - #367 fix(tools): esbuild 平台包缺失时不再误报低风险语法提示（CLOSED）
 - #360 docs: 新增 tianshu-mcp 操作文档（三步图解快速上手）（CLOSED）
+- #371 fix(delivery): 修复非 git 工作区归属误判与交付门虚假 GREEN (#369)（CLOSED）
