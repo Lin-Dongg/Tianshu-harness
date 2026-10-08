@@ -31,8 +31,16 @@ export function killAllSync(
   runTaskkill?: RunTaskkill,
 ): void {
   for (const child of activeProcesses) {
-    killProcessTree(child, 'SIGTERM', process.kill, platform, runTaskkill)
-    if (platform !== 'win32') {
+    if (platform === 'win32') {
+      // 退出/注销路径零 spawn（issue #398）：Windows 注销阶段会话拆除中，新进程
+      // DLL 初始化大量失败（0xC0000142），spawnSync('taskkill') 的加载器弹系统
+      // 硬错误框（NtRaiseHardError → CSRSS，windowsHide 压不住）阻塞关机甚至中止
+      // 关机。改为进程内直杀（child.kill = TerminateProcess，不 spawn）。
+      // 树杀兜底：经 job-launch.exe 的壳由 Job Object KILL_ON_JOB_CLOSE 收树（#144），
+      // 注销场景由会话拆除收余；runTaskkill 缝保留给 unix 分支与调用方兼容。
+      try { child.kill('SIGKILL') } catch { /* best-effort */ }
+    } else {
+      killProcessTree(child, 'SIGTERM', process.kill, platform, runTaskkill)
       killProcessTree(child, 'SIGKILL', process.kill, platform, runTaskkill)
     }
   }
