@@ -135,3 +135,16 @@ describe('星域评测题库（domain bank）', () => {
     }
   })
 })
+
+// A synthetic unit fixture checks validated filtering without inventing real runs.
+it('pilot suite selects only the requested validated task identity', () => {
+  const sample = domainBankSchema.parse(loadRaw()).tasks[0]!
+  const bank = domainBankSchema.parse({ version: 1, tasks: [
+    { ...sample, id: 'unit-candidate', status: 'candidate', validatedRuns: [] },
+    { ...sample, id: 'unit-validated', status: 'validated', validatedRuns: [
+      { variant: 'unit-fixture', model: 'fictional', verdict: 'pass' },
+    ] },
+  ] })
+  assert.deepEqual(toPilotSuite(bank, { status: 'validated' }).tasks.map(t => t.id), ['unit-validated'])
+  assert.deepEqual(toPilotSuite(bank, { ids: ['unit-candidate'] }).tasks.map(t => t.id), ['unit-candidate'])
+})

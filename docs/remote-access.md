@@ -2,9 +2,9 @@
 
 > P1 Mobile Remote（2026-09-05）：让 `rivet serve` 可以从局域网/手机访问。
 > 配套调研：`docs/research/mobile-remote-2026-09.md`（本地归档）。
-> 面向使用者的逐步操作手册见 [手机端操作手册](guides/mobile-guide.md)——含开启监听（Windows/macOS）、扫码连接、外网 Tailscale 与常见问题。
+> 面向使用者的逐步操作手册见 [手机端操作手册](guides/mobile-guide.md)——含 HTTPS 隧道、扫码连接与常见问题。
 
-`rivet serve` 默认只监听 `127.0.0.1`（本机回环），Token 门控。要把它暴露给同一局域网内的手机/其他设备，需要显式开放监听地址。**默认行为不变**——不设置任何东西时与旧版完全一致。
+`rivet serve` 默认只监听 `127.0.0.1`（本机回环），Token 门控。桌面内置 sidecar 显式固定为回环地址；手机通过 Tailscale Serve 等 HTTPS 隧道访问。独立 CLI 可以显式开放监听地址，但非回环监听必须提供 TLS 证书和私钥。
 
 ## 启用远程监听
 
@@ -12,23 +12,20 @@
 
 ```bash
 # CLI 参数
-rivet serve --host 0.0.0.0 --port 3100
+rivet serve --host 0.0.0.0 --port 3100 --tls-cert server.crt --tls-key server.key
 
-# 环境变量（桌面端/进程管理器场景：env 由父进程继承，无需改启动参数）
-RIVET_SERVE_HOST=0.0.0.0 rivet serve --port 3100
+# 独立 CLI 的环境变量
+RIVET_SERVE_HOST=0.0.0.0 rivet serve --port 3100 --tls-cert server.crt --tls-key server.key
 ```
 
 - `--host 0.0.0.0` 监听所有网卡接口；也可以给具体局域网 IP（`--host 192.168.1.5`）。
-- 桌面端（Tauri app 内置 sidecar）：在**启动桌面的进程环境**里设 `RIVET_SERVE_HOST=0.0.0.0`
-  即可生效——sidecar 继承父进程环境变量。macOS 从终端启动：
-  `RIVET_SERVE_HOST=0.0.0.0 open -a 天枢`；或 `launchctl setenv RIVET_SERVE_HOST 0.0.0.0`
-  后重新启动应用（重启后如需清除：`launchctl unsetenv RIVET_SERVE_HOST`）。
+- 桌面端覆盖子进程的 `RIVET_SERVE_HOST` 并传入 `--host 127.0.0.1`，旧版文档中的桌面环境变量启用方式已停止使用。设置 → 远程访问会提供指向当前动态端口的 Tailscale Serve 命令；保存 HTTPS 地址后可显示手机连接二维码。
 
 验证是否已对外监听：桌面端 **设置 → Network → Remote Access** 区块会显示模式徽章
 （Loopback only / LAN reachable）、局域网访问地址、访问令牌与二维码；或直接请求：
 
 ```bash
-curl -H "Authorization: Bearer <token>" http://127.0.0.1:3100/remote/info
+curl --cacert server.crt -H "Authorization: Bearer <token>" https://<证书对应的主机名>:3100/remote/info
 # → {"mode":"lan","listenHost":"0.0.0.0","lanUrls":[{"name":"en0","address":"192.168.1.5"}, ...]}
 ```
 
@@ -37,14 +34,14 @@ curl -H "Authorization: Bearer <token>" http://127.0.0.1:3100/remote/info
 `RIVET_SERVE_HOSTS_ALLOW`（逗号分隔，不带端口）配置后，非回环 Host 只放行白名单内的值：
 
 ```bash
-RIVET_SERVE_HOSTS_ALLOW=192.168.1.5,my-host.local rivet serve --host 0.0.0.0
+RIVET_SERVE_HOSTS_ALLOW=192.168.1.5,my-host.local rivet serve --host 0.0.0.0 --tls-cert server.crt --tls-key server.key
 ```
 
 语义（三分支，按序判定）：
 
 1. 无 `Host` 头（HTTP/1.0 客户端）与回环形态（`127.0.0.1` / `localhost` / `[::1]`，带或不带端口）恒放行——默认行为；
 2. 显式配置了 allowlist：非回环 Host 必须与白名单项精确匹配（比较时忽略端口）；
-3. 未配置 allowlist 且监听地址非回环（LAN 模式）：放行任意 Host——此时 **Bearer Token 是唯一凭证**。
+3. 未配置 allowlist 且监听地址非回环（LAN 模式）：默认允许本机网卡地址及明确的监听地址，未知 Host 拒绝。
 
 ## /mobile 手机监控+审批页（P2）
 
@@ -60,11 +57,11 @@ manifest（`build.manifest`）取 mobile.html 入站的资源闭包，落盘到
 URL 形态（桌面端「设置 → Network → Remote Access」二维码载荷）：
 
 ```
-http://<lan-ip>:<port>/mobile/?token=<access-token>
+https://<隧道地址>/mobile/#token=<access-token>
 ```
 
-- 扫码直达：页面读取 URL `?token=` → 同源建连（`location.origin`，零 CORS）→
-  `history.replaceState` 立即清掉地址栏 token（防止截图/历史记录泄漏）。无 `?token=`
+- 扫码直达：页面读取 URL `#token=` → 同源建连（`location.origin`，零 CORS）→
+  `history.replaceState` 立即清掉地址栏 token（防止截图/历史记录泄漏）。无 `#token=`
   时回退 localStorage `rivet:mobile:conn`，都无则显示连接配置页（手输 base+token）。
 - 页面能力：会话列表（4s 轮询，pendingApprovals>0 置顶高亮）→ 单会话只读时间线
   （复用 `session-event-hub` 折叠/断线重连语义 + SSE 传输注入）+ 审批三卡
@@ -77,7 +74,7 @@ http://<lan-ip>:<port>/mobile/?token=<access-token>
   未随桌面启动时用 CLI：
 
 ```bash
-RIVET_MOBILE_DIR=<desktop/dist> rivet serve --host 0.0.0.0 --port 3100
+RIVET_MOBILE_DIR=<desktop/dist> rivet serve --host 127.0.0.1 --port 3100
 curl -s http://127.0.0.1:3100/mobile/ | head -1   # → <!doctype html>
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3100/sessions  # 无 token → 401（API 门禁不变）
 ```
@@ -131,9 +128,7 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3100/sessions  # 无 t
 > 形态；`desktop/public/wallpapers` 不在 resources 内，若 mobile 将来引用
 > `--app-wallpaper` 会 404；serve 的 `MOBILE_MIME` 缺 `.woff/.ttf/.wasm`。
 
-- **LAN 模式默认放行任意 Host** 是有意的取舍：DNS-rebinding 防护（限制 Host 头）在
-  「局域网 + Bearer 强制」前提下放宽。**Token 泄露 = 完全控制**——请像密码一样保管，
-  不要截图、不要写进公开配置。要恢复 Host 层防护就配置 `RIVET_SERVE_HOSTS_ALLOW`。
+- **非回环监听要求 TLS，Host 校验与 Bearer 门禁同时生效**。桌面内置 HTTP 保持本机回环，远程访问由 HTTPS 隧道承接。令牌仍应像密码一样保管，不要截图或写进公开配置。
 - **只监听可信网络**。外网访问请走隧道（Tailscale / SSH -L），不要把 3100 端口直接
   映射到公网；本项目不做云中继、无账号体系，端口暴露的公网服务没有额外防护层。
 - CORS 不开放跨源：浏览器侧的跨站读取仍被三个已知本地源白名单挡住

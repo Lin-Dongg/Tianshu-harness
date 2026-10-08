@@ -73,6 +73,9 @@ jobs:
       - name: Windows bash smoke test
         run: node --import tsx --test src/tools/__tests__/bash-windows-smoke.test.ts
 
+      - name: Windows private storage without audit privileges
+        run: node --import tsx --test src/platform/__tests__/private-path.test.ts src/server/__tests__/server-info-protection.test.ts
+
       - name: Windows path-expression tests
         # 路径表达式缺陷的 Windows 靶子：`new URL(...).pathname` 在 Windows 上带前导斜杠
         # （`/D:/repo/...`），经 join/readdir/mkdir 成 `D:\D:\...` → ENOENT。scripts 层

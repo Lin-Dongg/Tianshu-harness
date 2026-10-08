@@ -6,7 +6,7 @@ import { assertCompleteAttachments } from './attachment-integrity.js'
 import { UsageSettlement } from './usage-settlement.js'
 import type { StreamClient, WireDivergence } from './stream-client.js'
 import type { StreamCallbacks } from './stream-client.js'
-import { normalizeOaiMessage, oaiMessagesHaveImageParts, stripOaiImageParts } from './oai-types.js'
+import { normalizeOaiMessage, oaiMessagesHaveImageParts, stripOaiImageParts, stripOaiProviderMetadata } from './oai-types.js'
 import type { OaiChatRequest, OaiMessage } from './oai-types.js'
 import { proRegistry } from './pro-registry.js'
 import { estimateOaiTokens } from '../compact/micro.js'
@@ -73,6 +73,11 @@ export class IncompleteStreamError extends Error {
     this.name = 'IncompleteStreamError'
   }
 }
+
+// OpenAI 协议终态 finish_reason。收到其一即证明本轮已完成——部分上游
+// （MiniMax-M3 大上下文会话）合法结束时不发 `data: [DONE]`。安全边界：仅终态
+// finish_reason 可触发宽容；只有部分 content 而无 finish_reason 仍是真·断流。
+const TERMINAL_FINISH_REASONS = new Set(['stop', 'tool_calls', 'length', 'content_filter', 'function_call'])
 
 
 function tryParseToolArguments(raw: string): Record<string, unknown> | null {
@@ -502,7 +507,7 @@ export class OpenAIClient implements StreamClient {
       && opts?.suppressStickyPreserve !== true
     const isPreservedThinking = this.config.thinking === 'enabled'
       && (stickyPreserved || opts?.preserveReasoning === true)
-    return messages.map(m => {
+    return messages.map(stripOaiProviderMetadata).map(m => {
       if (m.role !== 'assistant') return m
       const hasToolCalls = Array.isArray((m as any).tool_calls) && (m as any).tool_calls.length > 0
       // DeepSeek preserved-thinking: tool-call turns must echo reasoning_content.
@@ -1196,6 +1201,8 @@ export class OpenAIClient implements StreamClient {
     let textReceived = false
     let promotionFired = false
     let toolProgressReceived = false
+    // wire 上最后见到的终态 finish_reason；EOF 无 [DONE] 时它是唯一的完成证明（null ⇒ 严格抛错）。
+    let terminalFinishReason: string | null = null
     const repetitionGuard = this.config.providerName === 'deepseek'
       ? new ReasoningRepetitionGuard() : undefined
     const processPayload = (payload: string): void => {
@@ -1207,6 +1214,8 @@ export class OpenAIClient implements StreamClient {
       if (metadata.model) identity.responseModel = metadata.model
       if (metadata.system_fingerprint) identity.systemFingerprint = metadata.system_fingerprint
       if (parsed.choices?.[0]?.finish_reason) identity.finishReason = parsed.choices[0].finish_reason
+      const finishReason = parsed.choices?.[0]?.finish_reason
+      if (finishReason && TERMINAL_FINISH_REASONS.has(finishReason)) terminalFinishReason = finishReason
       const delta = parsed?.choices?.[0]?.delta
       if (parsed.choices?.[0] && !delta && !parsed.choices[0].finish_reason && !parsed.usage) return
       // Completed calls leave toolCallBuffer when flushed. Progress remains
@@ -1390,12 +1399,21 @@ export class OpenAIClient implements StreamClient {
       // read/done path, and hard-cap abort can land between reads as well.
       if (signal?.aborted) throw new DOMException('Aborted', 'AbortError')
       throwIfHardCapAborted()
-      // A missing terminal marker means the socket/stream ended mid-flight
-      // (proxy idle close, connection reset, provider bug). Settling this as
-      // `complete` loses the abort breadcrumb and lets a partial turn pass as a
-      // finished answer. `error-classifier` maps it to stream_parse so retry and
-      // FallbackStreamClient provider switching both apply.
-      if (!doneMarkerReceived) throw new IncompleteStreamError()
+      // EOF 无 `data: [DONE]` 两种情况：
+      // 1. 已收到终态 finish_reason——本轮可证完成（部分上游如 MiniMax-M3 大上下文会话
+      //    省略该标记），记 warning 后宽容收尾；finish_reason 只在一轮结束时发出，
+      //    纯 content 不构成完成证明。
+      // 2. 无 finish_reason——真·中途断流（代理空闲断连/连接重置/上游 bug），保持抛
+      //    IncompleteStreamError（分类 stream_parse，重试与 FallbackStreamClient 切换照常），
+      //    不让半截回答冒充完整回答。
+      if (!doneMarkerReceived) {
+        if (terminalFinishReason === null) throw new IncompleteStreamError()
+        debugLog(
+          '[openai-client] SSE stream ended without [DONE] marker but a terminal finish_reason was received —'
+          + ` settling tolerantly (provider=${this.config.providerName ?? 'openai'}`
+          + ` model=${identity.responseModel ?? this.config.model} finish_reason=${terminalFinishReason})`,
+        )
+      }
 
       this.flushToolCalls(callbacks, { final: true })
       // 网#1: DeepSeek tool-JSON-in-content fallback

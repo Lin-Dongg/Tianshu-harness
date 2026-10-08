@@ -45,6 +45,9 @@ jobs:
         working-directory: .
         run: npm run build
 
+      - name: Verify storage ACLs without audit privileges
+        run: node --import tsx --test src/platform/__tests__/private-path.test.ts desktop/scripts/__tests__/windows-storage-permissions.test.ts desktop/scripts/__tests__/security-audit-contract.test.ts src/server/__tests__/server-info-protection.test.ts
+
       - name: Install desktop frontend deps
         working-directory: desktop
         run: npm ci

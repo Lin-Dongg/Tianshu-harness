@@ -1,0 +1,165 @@
+{
+  "version": 1,
+  "note": "星域评测题库。题=真实任务；环境=修复前一提交；判分=真实修复自带的参考测试转绿。同一题换星域/提示词重跑，比能力与轨迹。schema 见 src/benchmark/domain-bank.ts；机读守卫见 src/benchmark/__tests__/domain-bank.test.ts。",
+  "tasks": [
+    {
+      "id": "real-theta-no-fresh-verdict",
+      "title": "诊断并修复：Theta 检查几乎总返回 no-fresh-verdict",
+      "status": "validated",
+      "taskType": "diagnosis",
+      "difficulty": "hard",
+      "symptom": "Theta 检查（给 agent 用的实时类型安全网）现在几乎总是返回 no-fresh-verdict——实测 99%+ 的检查拿到的是过期判决而不是新鲜结论，这个机制实际上已经失效了。\n\n请诊断根因并修复，让 Theta 在正常开发节奏下能重新给出新鲜判决，同时不破坏既有行为。\n\n线索：仓库里有两份当前失败的测试，描述了期望行为——src/agent/__tests__/theta-hybrid.test.ts 与 src/agent/__tests__/theta-smart-trigger.test.ts。把它们跑绿即算修复完成（不要修改这两份测试文件本身，也不要靠跳过或删除测试来让它变绿）。",
+      "environment": {
+        "kind": "git-revert",
+        "baseRef": "7a533add9^",
+        "oracleCommit": "7a533add9"
+      },
+      "grader": {
+        "command": "npx tsx --test src/agent/__tests__/theta-hybrid.test.ts src/agent/__tests__/theta-smart-trigger.test.ts",
+        "referenceTests": [
+          "src/agent/__tests__/theta-hybrid.test.ts",
+          "src/agent/__tests__/theta-smart-trigger.test.ts"
+        ],
+        "expected": "green",
+        "mustNotTouch": [
+          "src/agent/__tests__/theta-hybrid.test.ts",
+          "src/agent/__tests__/theta-smart-trigger.test.ts"
+        ]
+      },
+      "contractGiven": true,
+      "timeoutMs": 1500000,
+      "tags": ["real-task", "theta", "diagnosis", "multi-file"],
+      "provenance": {
+        "source": "real-fix",
+        "evidence": [
+          "docs/experiments/2026-10-07-theta-realfix-report.md",
+          "docs/experiments/2026-10-07-theta-realfix-runs.jsonl",
+          "⚠️ oracle 有毒（2026-10-07 审查发现）：7a533add9 自带编译缺陷——它改了 ThetaTelemetryState/ThetaRunner 契约但未同步消费方 loop.ts 的镜像类型与 theta-rate-limit.test.ts 的 stub，该提交上 npm run typecheck = exit 2（基线 exit 0）。用作判分会把「复刻这个缺陷」也算过关；要当干净 ground truth 需先补 loop.ts + stub 同步。见 docs/analysis/2026-10-07-opus-commits-review.md"
+        ],
+        "oracleCommitMessage": "feat(theta): implement hybrid strategy with smart triggering"
+      },
+      "validatedRuns": [
+        { "variant": "A(完整686字)", "model": "deepseek-flash", "verdict": "pass", "stats": "77 turns / 94 tools / 1063s / 参考测试 10/10 + 全家桶 37/37" },
+        { "variant": "C(精简281字)", "model": "deepseek-flash", "verdict": "timeout", "stats": "48 turns / 75 tools / 撞 25min 护栏；评分仍 PASS 10/10 + 37/37" }
+      ]
+    },
+    {
+      "id": "real-galaxy-dimension-discarding-policy",
+      "title": "修复：galaxy 多维分析时接受了会丢弃维度的聚合策略",
+      "status": "validated",
+      "taskType": "guard",
+      "difficulty": "medium",
+      "symptom": "用 galaxy（星河）做多维分析时，如果给聚合策略 policy 传 'weighted_confidence'，它不报错就派发了，但最终只保留一个维度的结果、把其余维度全丢掉——报告看起来是聚合结论，实际是误导（维度数与请求不符、独立见解丢失）。\n\n请修好这个行为：让这类会丢弃维度的聚合策略被明确拒绝并给出清晰提示，且不影响合法策略。\n\n线索：仓库 src/tools/__tests__/galaxy.test.ts 里有描述期望行为的失败用例。以它们转绿为准（不要修改该测试文件，也不要靠跳过或删除测试来让它变绿）。",
+      "environment": {
+        "kind": "git-revert",
+        "baseRef": "5ad112035^",
+        "oracleCommit": "5ad112035"
+      },
+      "grader": {
+        "command": "npx tsx --test src/tools/__tests__/galaxy.test.ts",
+        "referenceTests": ["src/tools/__tests__/galaxy.test.ts"],
+        "expected": "green",
+        "mustNotTouch": ["src/tools/__tests__/galaxy.test.ts"]
+      },
+      "contractGiven": true,
+      "timeoutMs": 900000,
+      "tags": ["real-task", "galaxy", "guard", "single-file"],
+      "provenance": {
+        "source": "real-fix",
+        "evidence": [
+          "docs/experiments/2026-10-07-realtask-comparison.md",
+          "docs/experiments/2026-10-07-galaxy-realfix-runs.jsonl"
+        ],
+        "oracleCommitMessage": "fix(galaxy): reject weighted_confidence policy for multi-dimensional analysis"
+      },
+      "validatedRuns": [
+        { "variant": "A(完整686字)", "model": "deepseek-flash", "verdict": "pass", "stats": "33 turns / 34 tools / 153s / 42/42" },
+        { "variant": "C(精简281字)", "model": "deepseek-flash", "verdict": "pass", "stats": "24 turns / 28 tools / 225s / 42/42" }
+      ]
+    },
+    {
+      "id": "real-typecheck-xprocess-lock-serialization",
+      "title": "修复：同工作树内并发全量 tsc 互相饿死",
+      "status": "validated",
+      "taskType": "guard",
+      "difficulty": "medium",
+      "symptom": "同一工作树里并发跑全量类型检查（tsc --noEmit）时会互相饿死：实测开十来个并发 tsc 抢同一批核心，最后没有一个取得 exit code，整批超时。多个会话或 worker 同时走 bash 工具跑 tsc 就会触发。\n\n请修好：让这类 ad-hoc 全量类型检查相互串行（不要阻断检查本身，也不要影响普通命令），且 tsc --watch 这类长跑形态不受影响。\n\n线索：仓库 src/lsp/__tests__/typecheck-cache.test.ts 里有描述期望行为的失败用例（当前整个文件因缺导出而加载失败）。以它们转绿为准（不要修改该测试文件）。",
+      "environment": { "kind": "git-revert", "baseRef": "338e8aa80^", "oracleCommit": "338e8aa80" },
+      "grader": {
+        "command": "npx tsx --test src/lsp/__tests__/typecheck-cache.test.ts",
+        "referenceTests": ["src/lsp/__tests__/typecheck-cache.test.ts"],
+        "expected": "green",
+        "mustNotTouch": ["src/lsp/__tests__/typecheck-cache.test.ts"]
+      },
+      "contractGiven": true,
+      "timeoutMs": 900000,
+      "tags": ["real-task", "lsp", "guard", "concurrency"],
+      "provenance": {
+        "source": "real-fix",
+        "evidence": [
+          "RED 基线已确认（2026-10-07）：在 338e8aa80^ 上跑 grader → SyntaxError: does not provide an export named 'isTypecheckCommand'（整文件加载失败）。复现见 benchmark/domains/README.md",
+          "docs/experiments/2026-10-07-typecheck-realfix-runs.jsonl"
+        ],
+        "oracleCommitMessage": "feat(lsp): ad-hoc tsc 经跨进程锁串行——galaxy 并发 tsc 饥饿事故的根修"
+      },
+      "validatedRuns": [
+        { "variant": "A(完整686字)", "model": "deepseek-flash", "verdict": "pass", "stats": "77 turns / 92 tools(只读17) / 533s / 参考测试 35/35；自有改动 5 文件 +390/−3（含自补测试）" },
+        { "variant": "C(精简281字)", "model": "deepseek-flash", "verdict": "pass", "stats": "72 turns / 84 tools(只读12) / 884s / 参考测试 35/35；自有改动 3 文件 +248/−4（含自补测试）" }
+      ]
+    },
+    {
+      "id": "cand-typecheck-cache-hit-rate",
+      "title": "（候选）提升 typecheck 结果缓存的命中率",
+      "status": "candidate",
+      "taskType": "perf",
+      "difficulty": "medium",
+      "symptom": "typecheck 结果缓存（src/lsp/typecheck-cache.ts）在真实会话里命中率偏低，导致 Theta 反复走真跑。请分析其容量、淘汰与查找策略，定位偏低的原因并改进，用可复核的数据说明改进前后差异。\n\n（核查结论 2026-10-07：查了该文件全部 12 条提交历史——真实修复都是「锁/预算/闸门/容量」类，**没有专治「命中率」的提交**。这条题面与真实修复对不上，无法补 oracle → 暂留 candidate。同一文件里能成真实题的见 real-typecheck-xprocess-lock-serialization。）",
+      "environment": { "kind": "git-revert", "baseRef": "TBD" },
+      "grader": { "command": "TBD", "referenceTests": [], "expected": "green", "mustNotTouch": [] },
+      "contractGiven": true,
+      "timeoutMs": 900000,
+      "tags": ["candidate", "cache", "perf"],
+      "provenance": {
+        "source": "doc-candidate",
+        "evidence": ["docs/experiments/2026-10-07-star-domain-prompt-optimization.md"]
+      },
+      "validatedRuns": []
+    },
+    {
+      "id": "cand-star-domain-fuzzy-match",
+      "title": "（候选）星域关键词路由的模糊匹配",
+      "status": "candidate",
+      "taskType": "feature",
+      "difficulty": "medium",
+      "symptom": "星域关键词路由（src/agent/star-domain-registry.ts 的 matchDomain）目前是子串精确匹配，已知锐边：'fix' 会命中 'fixture'/'prefix' 造成误路由。请为其增加更稳的匹配能力（模糊/词边界），并保证既有路由不回归。\n\n（候选题：尚未确定对应的真实修复提交与判分测试，需先补齐 environment.baseRef / oracleCommit / grader 才能进 validated。）",
+      "environment": { "kind": "git-revert", "baseRef": "TBD" },
+      "grader": { "command": "TBD", "referenceTests": [], "expected": "green", "mustNotTouch": [] },
+      "contractGiven": true,
+      "timeoutMs": 900000,
+      "tags": ["candidate", "routing", "feature"],
+      "provenance": {
+        "source": "doc-candidate",
+        "evidence": ["docs/experiments/2026-10-07-star-domain-prompt-optimization.md"]
+      },
+      "validatedRuns": []
+    },
+    {
+      "id": "cand-theta-boundary-tests",
+      "title": "（候选）为 Theta 智能触发补边界测试",
+      "status": "candidate",
+      "taskType": "test",
+      "difficulty": "easy",
+      "symptom": "Theta 的智能触发逻辑（连续 N 次 no-fresh-verdict 或会话接近上限时触发真跑）目前只覆盖了主路径。请找出未覆盖的边界场景（计数重置、上限临界、并发触发、负缓存交互），补测试并说明每个用例能抓住什么回归。\n\n（候选题：这类「补测试」题需先把判分方式定成「新测试必须能在旧实现上变红」，否则无法判对错。）",
+      "environment": { "kind": "git-revert", "baseRef": "TBD" },
+      "grader": { "command": "TBD", "referenceTests": [], "expected": "green", "mustNotTouch": [] },
+      "contractGiven": true,
+      "timeoutMs": 900000,
+      "tags": ["candidate", "theta", "test"],
+      "provenance": {
+        "source": "doc-candidate",
+        "evidence": ["docs/experiments/2026-10-07-star-domain-prompt-optimization.md"]
+      },
+      "validatedRuns": []
+    }
+  ]
+}

@@ -619,7 +619,7 @@ const TUI_SLASH_COMMANDS: readonly TuiSlashCommandDef[] = [
 
       // micro compact (default)
       pushStatic(createLogEntry({ type: 'system', content: 'Micro-compacting conversation...' }))
-      const { messages: compacted, truncated } = microCompactOai(msgs, ctx.maxTokens, beforeTokens)
+      const { messages: compacted, truncated } = microCompactOai(msgs, ctx.maxTokens, beforeTokens, new Map())
       ctx.session.replaceMessages(compacted)
       // 轻量测试替身没有 config.promptEngine——没有引擎也没有 appendix 基线可
       // 重置，跳过即等价（与 320bdd0ee 同款替身容忍；生产装配 promptEngine 恒在）。

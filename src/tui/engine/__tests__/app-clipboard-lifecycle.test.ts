@@ -105,6 +105,9 @@ test('terminal restoration cancels its native writer and queued copies', async (
   syncBuiltinESMExports()
   const oldPlatform = process.platform
   Object.defineProperty(process, 'platform', { value: 'darwin' })
+  const sshEnv = ['SSH_CONNECTION', 'SSH_CLIENT', 'SSH_TTY']
+  const savedEnv = new Map(sshEnv.map(name => [name, process.env[name]]))
+  for (const name of sshEnv) delete process.env[name]
   try {
     ;(app as any).frontend.copySelection = () => 'selected text'
     assert.equal((app as any).copyFrontendSelection(), true)
@@ -121,6 +124,10 @@ test('terminal restoration cancels its native writer and queued copies', async (
     childProcess.spawn = originalSpawn
     syncBuiltinESMExports()
     Object.defineProperty(process, 'platform', { value: oldPlatform })
+    for (const [name, value] of savedEnv) {
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    }
     app.dispose()
   }
 })

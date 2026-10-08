@@ -102,7 +102,8 @@ import type { ProviderListItem } from './config-provider-contract.js'
 import { allPresetKeys, resolvePreset, resolvePresetBaseUrl, resolvePresetDefaultModel, resolvePresetLabel, resolvePresetProtocol } from '../api/pro-registry.js'
 import { buildOAuthRoutes, oauthListFields } from './config-routes-oauth.js'
 import { modelConfigSchema, providerCapabilitiesSchema, PROVIDER_PROTOCOL_VALUES, type ModelConfig, type ProviderCapabilitiesConfig, type ProviderProtocol } from '../config/schema.js'
-import { queryDeepSeekBalance, type BalanceResult } from '../api/balance-client.js'
+import { queryDeepSeekBalance } from '../api/balance-client.js'
+import { resolveAccountCredential, type AccountCredential } from './account-credential.js'
 import { discoverVisionModels, validateVisionModel } from '../api/vision-model-onboarding.js'
 import { generateImage } from '../api/image-gen-client.js'
 import {
@@ -180,6 +181,12 @@ function withAuth(handler: RouteHandler, apiToken?: string): RouteHandler {
     }
     return handler(body, params, headers, res)
   }
+}
+
+/** 账户身份回显（issue #392，收编 PR #395 的响应形态）：调用方据此确认
+ *  「哪个 key 的账户在回答」——缺省查询命中池回退时尤其需要。 */
+function accountEcho(cred: AccountCredential): { keyId?: string; label?: string } {
+  return cred.keyId ? { keyId: cred.keyId, ...(cred.label ? { label: cred.label } : {}) } : {}
 }
 
 /** /config/providers/test-key 与 /config/providers/test 共用的 key+baseUrl
@@ -1309,36 +1316,33 @@ export function buildConfigRoutes(apiToken?: string, hooks?: ConfigRouteHooks): 
       }
     }, apiToken),
 
-    'GET /config/balance': withAuth(async () => {
+    'GET /config/balance': withAuth(async (_body, params) => {
       // 查 DeepSeek 官方账户余额。仅 DeepSeek 官方端点支持（其他 provider 返回 null）。
-      const cfg = loadConfig()
-      const provider = cfg.provider.providers[cfg.provider.default]
-      if (!provider) return { status: 200, body: { balance: null as BalanceResult | null } }
-      const apiKey = provider.apiKey ?? (provider.apiKeyEnv ? process.env[provider.apiKeyEnv] : undefined)
-      const balance = await queryDeepSeekBalance(apiKey, provider.baseUrl)
-      return { status: 200, body: { balance } }
+      // ?provider=&keyId= 指定账户（issue #392 多 key 池）；缺省 = 默认 provider 主 key。
+      const cred = resolveAccountCredential(loadConfig(), params?.provider, params?.keyId)
+      if ('error' in cred) return { status: 400, body: { error: cred.error } }
+      const balance = await queryDeepSeekBalance(cred.apiKey, cred.provider?.baseUrl)
+      return { status: 200, body: { balance, ...accountEcho(cred) } }
     }, apiToken),
 
     // DeepSeek 平台账户摘要：当天/当月花费、余额、Flash/Pro 用量。
-    'GET /config/deepseek/summary': withAuth(async () => {
-      const cfg = loadConfig()
-      const provider = cfg.provider.providers[cfg.provider.default]
-      const apiKey = provider?.apiKey ?? (provider?.apiKeyEnv ? process.env[provider.apiKeyEnv] : undefined)
+    'GET /config/deepseek/summary': withAuth(async (_body, params) => {
+      const cred = resolveAccountCredential(loadConfig(), params?.provider, params?.keyId)
+      if ('error' in cred) return { status: 400, body: { error: cred.error } }
       // failure/message 透出，桌面端才能区分「未登录」与「网络错」。
-      const result = await getDeepSeekUserSummary(apiKey, provider?.baseUrl)
-      return { status: 200, body: { summary: result.data, failure: result.failure, message: result.message } }
+      const result = await getDeepSeekUserSummary(cred.apiKey, cred.provider?.baseUrl)
+      return { status: 200, body: { summary: result.data, failure: result.failure, message: result.message, ...accountEcho(cred) } }
     }, apiToken),
 
     // DeepSeek 平台成本明细：按模型按天的 token/cost。month=1-12, year=YYYY。
     'GET /config/deepseek/cost': withAuth(async (_body, params) => {
-      const cfg = loadConfig()
-      const provider = cfg.provider.providers[cfg.provider.default]
-      const apiKey = provider?.apiKey ?? (provider?.apiKeyEnv ? process.env[provider.apiKeyEnv] : undefined)
+      const cred = resolveAccountCredential(loadConfig(), params?.provider, params?.keyId)
+      if ('error' in cred) return { status: 400, body: { error: cred.error } }
       const now = new Date()
       const month = Number(params?.month ?? now.getMonth() + 1)
       const year = Number(params?.year ?? now.getFullYear())
-      const result = await getDeepSeekCostReport(apiKey, provider?.baseUrl, month, year)
-      return { status: 200, body: { cost: result.data, failure: result.failure, message: result.message } }
+      const result = await getDeepSeekCostReport(cred.apiKey, cred.provider?.baseUrl, month, year)
+      return { status: 200, body: { cost: result.data, failure: result.failure, message: result.message, ...accountEcho(cred) } }
     }, apiToken),
 
     // ── DeepSeek 平台网页登录（token + cookie 持久化） ────────────
