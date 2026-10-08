@@ -35,6 +35,9 @@ export function isSafeFileName(name: string): boolean {
   if (name.includes('/') || name.includes('\\') || name.includes('\0')) return false
   if (name.startsWith('.')) return false
   if (name.includes('..')) return false
+  // Windows 保留设备名（收编 PR #396）：CON.txt 等形态在 Win32 打开设备而非建
+  // 文件，同名写入无声挂起或"成功"却无落盘——与 orderFileKey 拦冒号（ADS）同族。
+  if (isWindowsDeviceName(name)) return false
   return true
 }
 

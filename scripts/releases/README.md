@@ -13,6 +13,17 @@ node scripts/releases/publish-routing.mjs                # review metadata publi
 node scripts/releases/publish-routing.mjs --publish --website ../tianshu-website
 ```
 
+**Or run the whole close-out through the fail-closed wrapper** (pre-checks + post-verify with retry):
+
+```sh
+bash scripts/releases/publish-release-catalog.sh             # dry run (read-only pre-checks)
+bash scripts/releases/publish-release-catalog.sh --publish   # publish
+#   --with-atomgit              also run the AtomGit stage (requires the tag already mirrored)
+#   --atomgit-acceptance FILE   real multi-network acceptance, to enable the source
+```
+
+If `github.com` is unreachable from your network, Node's built-in fetch times out even when `git`/`gh` still work through `git config http.proxy` — Node ignores env proxies unless told otherwise. Prefix with `HTTPS_PROXY=<proxy> NODE_USE_ENV_PROXY=1` in that case.
+
 AtomGit requires the version tag to be mirrored beforehand. The publisher consumes `ATOMGIT_ACCESS_TOKEN` or the system Git credential helper without displaying either. It uses the official upload-address API and PUT headers, then checks the stable anonymous download entry, full SHA-256, size, HEAD and Range. No signed temporary URL is persisted. Missing credentials, login requirements, conflicting existing attachments or failed package checks stop publication. Provider quota and multi-network acceptance still need real measurements; this script does not certify unlimited bandwidth.
 
 Anonymous byte verification alone leaves the source disabled. `--acceptance` must identify `schemaVersion: 1`, the exact `version`, `platform` and `sha256`, plus true `tauriRedirectVerified`, `stableEntryVerified`, `disconnectRetryVerified`, a nonempty `limitsObserved` record and at least two distinct `networks` observations (`name`, `checkedAt`, `passed: true`). Populate these only from actual tests. Without that record, the public package/signature/checksum/standard manifest may be uploaded, but an enabled routing catalog is not published. After qualification, retrying preserves proof timestamps and revision instead of rewriting immutable metadata.
