@@ -402,3 +402,4 @@ contributions for this graph`；`including commit co-authors` 仅 GHES 版本成
 - #364 fix(git): support external file diff in changes tab and stabilize Windows test harness（CLOSED）
 - #381 fix(config): synchronize DeepSeek connect models with key pools（CLOSED）
 - #387 docs: refresh model versions, descriptions and setup examples（OPEN）
+- #384 fix(cli): synchronize connect and model across providers and gateways（OPEN）
