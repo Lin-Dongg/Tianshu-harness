@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "version": "3.29.2",
+  "date": "2026-10-08",
+  "fullNotesUrl": "https://github.com/huiliyi37/Tianshu-harness/releases/tag/v3.29.2",
+  "locales": {
+    "zh": {
+      "title": "社区收编：流式容错与国内网络",
+      "highlights": [
+        "上游结束流不发 [DONE] 但已带终态 finish_reason 的响应现在正常收尾——此前这类会话每轮必败、重试同点失败，升级后表现为「突然能用了」。",
+        "CLI/TUI 更新检查改走 ghproxy 前缀代理与直连并发竞速（5s HEAD 探测）并记住本次胜出通道，裸连 api.github.com 国内超时不再静默失败。",
+        "多 API Key 用户可在 Insights 的 DeepSeek 账户卡按 key 查看各自余额与月成本；本版同时根修桌面端公式排版错乱（KaTeX 类名撞车）并把消息导航改为右侧浮岛列表。"
+      ],
+      "notice": "账户查询三条路由（/config/balance 等）在池形态下新增 keyId/label 字段——纯增量，旧客户端不受影响；平台网页登录态下仍以登录账户为准。SSE 容错放宽后，此前因缺 [DONE] 失败的会话改为正常结束。"
+    },
+    "en": {
+      "title": "Community PRs: stream tolerance and China network",
+      "highlights": [
+        "Streams that end without [DONE] but carry a terminal finish_reason now close cleanly—sessions that failed on every turn before will simply work after upgrading.",
+        "CLI/TUI update checks race a ghproxy prefix against a direct connection (5s HEAD probe) and remember the winner, so bare api.github.com timeouts in China no longer fail silently.",
+        "Multi-key users can view each DeepSeek key's balance and monthly cost in the Insights account card; this release also root-fixes broken math layout (KaTeX class collision) and moves message navigation to a right-side floating list."
+      ],
+      "notice": "The three account routes (/config/balance and friends) add keyId/label fields in pool form—a pure addition that leaves old clients unaffected; with a web login the logged-in account still takes precedence. With the relaxed SSE tolerance, sessions that previously failed on a missing [DONE] now end normally."
+    }
+  }
+}
