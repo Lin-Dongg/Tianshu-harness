@@ -16,7 +16,7 @@
  * 迁移 B → A 幂等按 id（正则观察产物 source='auto' 默认不迁——那是噪声）。
  */
 
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
 import { memoryDir } from '../config/paths.js'

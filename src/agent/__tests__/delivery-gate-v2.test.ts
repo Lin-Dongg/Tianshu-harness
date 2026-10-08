@@ -555,11 +555,35 @@ describe('8784b64b8 审查 P2 — 覆盖义务不受聚合归因影响', () => {
     assert.deepEqual(result.uncoveredImpactedTests, coverageInput())
   })
 
-  it('unattributed_failure + 失败的 impacted test 降级 YELLOW（外部阻塞→scoped 对齐，2026-10-07）', () => {
+  it('unattributed_failure + 失败的 impacted test + 确有外部在途改动 → 降级 YELLOW（外部阻塞→scoped 对齐，2026-10-07；判据收紧 2026-10-08）', () => {
     // 与上一条的区别：受影响测试本身在**失败清单**里（有失败证据），而非仅缺证据。
-    // 全量失败无法归因到本会话改动（unattributed_failure）——共享工作区里其他会话的
-    // 在途改动会污染全量 run_tests 造假红。此支降级 YELLOW（可交付 + 仍逐条列出），
-    // 覆盖义务本身不豁免（守卫 8784b64b8 不变）；本会话回归仍走 owned_failure 硬 RED。
+    // 全量失败无法归因到本会话改动（unattributed_failure），且工作区确有其他会话的
+    // 在途改动（external dirty）——共享工作区污染理据有正向证据，全量 run_tests
+    // 的假红成立。此支降级 YELLOW（可交付 + 仍逐条列出），覆盖义务本身不豁免
+    // （守卫 8784b64b8 不变）；本会话回归仍走 owned_failure 硬 RED。
+    const { gate, ledger } = makeGate(['src/tools/git.ts'], ['src/other-session.ts'])
+    const failedCoverage: TestCompletionCoverage = {
+      version: 1, runId: 'fixture', runner: 'node-test', cwd: '/repo', repositoryRoot: '/repo',
+      complete: true, filtered: false,
+      files: [{ path: coverageInput()[0]!, outcome: 'failed', tests: 1, skipped: 0, cancelled: 0 }],
+    }
+    ledger.record({ type: 'verification', command: 'npm test', status: 'failed', meta: { scope: 'full', kind: 'test', failed: 1, exitCode: 1, coverage: failedCoverage } })
+
+    const result = gate.assess([], undefined, undefined, { impactedTests: coverageInput(), testExists: () => true })
+
+    assert.equal(result.state, 'YELLOW', '确有外部在途改动时可降级 scoped 交付')
+    assert.equal(result.canDeliver, true)
+    assert.deepEqual(result.uncoveredImpactedTests, coverageInput(), '失败的受影响测试仍逐条列出供裁决')
+    assert.match(result.reason ?? '', /外部在途改动（1 个）/, '降级文案须点名作为证据的外部在途改动')
+  })
+
+  it('unattributed_failure + 失败的 impacted test + 无外部在途证据 → 保持 RED（判据收紧，2026-10-08）', () => {
+    // 审查发现 4146b08d5 的降级判据宽于理据：任何 full-scope 失败在归因器里恒为
+    // unattributed_failure（owned_failure 只来自 targeted owned 失败），单会话干净
+    // 工作区「自己改坏 impacted test、只跑了全量」也会命中降级，真失败在报告层
+    // 搭便车成 YELLOW（canDeliver=true，而 commit 通路 W1 仍硬拦，语义停在中间态）。
+    // 收紧后：无外部在途改动、无隔离单跑配对 → 外部污染理据不成立，保持 RED，
+    // 文案指引隔离单跑配对（→ integration_conflict → W1 绕过）的正确出路。
     const { gate, ledger } = makeGate(['src/tools/git.ts'])
     const failedCoverage: TestCompletionCoverage = {
       version: 1, runId: 'fixture', runner: 'node-test', cwd: '/repo', repositoryRoot: '/repo',
@@ -570,9 +594,66 @@ describe('8784b64b8 审查 P2 — 覆盖义务不受聚合归因影响', () => {
 
     const result = gate.assess([], undefined, undefined, { impactedTests: coverageInput(), testExists: () => true })
 
-    assert.equal(result.state, 'YELLOW', '外部/未归因的全量失败不得硬 RED')
+    assert.equal(result.state, 'RED', '无外部在途证据时全量失败不得降级——真失败不能搭便车成 YELLOW')
+    assert.equal(result.canDeliver, false)
+    assert.equal(result.isBlocked, true)
+    assert.equal(result.attributionClass, 'module_unverified')
+    assert.deepEqual(result.uncoveredImpactedTests, coverageInput(), '失败的受影响测试仍逐条列出')
+    assert.match(result.reason ?? '', /按真失败处理/)
+    assert.match(result.reason ?? '', /隔离单跑配对/, 'RED 文案应指引隔离单跑配对的取证出路')
+    assert.ok(result.blockingReason, 'RED 臂须补 blockingReason——commit 路径的 Recovery 段只打印它')
+  })
+
+  it('unattributed_failure + 失败的 impacted test + 隔离单跑配对证据 → 降级 YELLOW（判据收紧，2026-10-08）', () => {
+    // 无外部在途改动，但存在隔离单跑配对（isolated 通过 + integration 失败、同
+    // comparisonId/snapshotRef）——owned diff 隔离可过而集成失败，失败指向外部
+    // 集成差异，同样构成「失败非本会话造成」的正向证据。注意配对自己的失败文件
+    // 不计入 coverage.failed（assessImpactedTestCoverage 排除）；此处的失败清单
+    // 来自另一次无配对的全量失败。
+    const { gate, ledger } = makeGate(['src/tools/git.ts'])
+    const pairCoverage = (outcome: 'passed' | 'failed'): TestCompletionCoverage => ({
+      version: 1, runId: 'fixture', runner: 'node-test', cwd: '/repo', repositoryRoot: '/repo',
+      complete: outcome === 'passed', executionComplete: true, filtered: false,
+      files: [{ path: 'src/x.test.ts', outcome, tests: 1, skipped: 0, cancelled: 0 }],
+    })
+    ledger.record({ type: 'verification', command: 'npm test', status: 'passed', meta: { scope: 'full', kind: 'test', exitCode: 0, passed: 1, verificationPhase: 'isolated', comparisonId: 'pair-1', snapshotRef: 'snap-1', coverage: pairCoverage('passed') } })
+    ledger.record({ type: 'verification', command: 'npm test', status: 'failed', meta: { scope: 'full', kind: 'test', exitCode: 1, failed: 1, verificationPhase: 'integration', comparisonId: 'pair-1', snapshotRef: 'snap-1', coverage: pairCoverage('failed') } })
+    const failedCoverage: TestCompletionCoverage = {
+      version: 1, runId: 'fixture', runner: 'node-test', cwd: '/repo', repositoryRoot: '/repo',
+      complete: true, filtered: false,
+      files: [{ path: coverageInput()[0]!, outcome: 'failed', tests: 1, skipped: 0, cancelled: 0 }],
+    }
+    ledger.record({ type: 'verification', command: 'npm run test:all', status: 'failed', meta: { scope: 'full', kind: 'test', failed: 1, exitCode: 1, coverage: failedCoverage } })
+
+    const result = gate.assess([], undefined, undefined, { impactedTests: coverageInput(), testExists: () => true })
+
+    assert.equal(result.state, 'YELLOW', '隔离单跑配对证明 owned diff 隔离通过，失败指向外部集成差异')
     assert.equal(result.canDeliver, true)
-    assert.deepEqual(result.uncoveredImpactedTests, coverageInput(), '失败的受影响测试仍逐条列出供裁决')
+    assert.deepEqual(result.uncoveredImpactedTests, coverageInput())
+    assert.match(result.reason ?? '', /隔离单跑配对/)
+  })
+
+  it('verification_timeout 聚合压过 unattributed_failure 时保持 RED（RED 臂，即便有外部在途改动）', () => {
+    // RED 臂用例（:364-369 此前可达但无用例）：超时与全量失败并存时聚合优先级
+    // verification_timeout > unattributed_failure——超时意味着对代码一无所知
+    // （底层进程可能仍在写工作区），不享受外部污染降级，即便工作区确有外部在途
+    // 改动（证据检查在归因检查之后，归因不匹配时证据不改变结论）。
+    const { gate, ledger } = makeGate(['src/tools/git.ts'], ['src/other-session.ts'])
+    const failedCoverage: TestCompletionCoverage = {
+      version: 1, runId: 'fixture', runner: 'node-test', cwd: '/repo', repositoryRoot: '/repo',
+      complete: true, filtered: false,
+      files: [{ path: coverageInput()[0]!, outcome: 'failed', tests: 1, skipped: 0, cancelled: 0 }],
+    }
+    ledger.record({ type: 'verification', command: 'npm test', status: 'failed', meta: { scope: 'full', kind: 'test', failed: 1, exitCode: 1, coverage: failedCoverage } })
+    ledger.record({ type: 'verification', command: 'npm run typecheck', status: 'failed', meta: { scope: 'full', exitCode: 1, passed: 0, failed: 0, skipped: 0, errorClass: 'timeout', timedOut: true } })
+
+    const result = gate.assess([], undefined, undefined, { impactedTests: coverageInput(), testExists: () => true })
+
+    assert.equal(result.state, 'RED', '超时压过未归因失败时不降级——超时对代码一无所知')
+    assert.equal(result.canDeliver, false)
+    assert.equal(result.isBlocked, true)
+    assert.equal(result.attributionClass, 'module_unverified')
+    assert.deepEqual(result.uncoveredImpactedTests, coverageInput())
   })
 
   it('no_test_infra does not waive coverage for existing impacted tests', () => {
@@ -646,5 +727,73 @@ describe('runner boundaries preserve impacted-test obligations', () => {
     const result = gate.assess([], undefined, undefined, { impactedTests: paths, testExists: () => true })
     assert.equal(result.state, 'GREEN')
     assert.equal(result.uncoveredImpactedTests, undefined)
+  })
+})
+
+describe('delivery-gate-v2 — L4 越界指纹指引（outOfRootFingerprintPaths，4251eea67 审查 P2）', () => {
+  // 词法判定即可：'/fake/repo' 不存在时 canonicalRoot 回落 resolve，classifyFingerprintPath
+  // 不碰文件系统——仓内用相对路径、越界用绝对路径，两类的归类都是确定的。
+  const ROOT = '/fake/repo'
+
+  function makeRootedGate(ownedFiles: string[], repoRoot?: string) {
+    const baseline = createWorktreeBaseline({
+      branch: 'feat/b1',
+      head: 'abc',
+      preExistingDirty: [],
+      preExistingUntracked: [],
+      capturedAt: Date.now(),
+    })
+    const ledger = createTaskLedger({ taskId: 'l4-rooted' })
+    for (const f of ownedFiles) ledger.record({ type: 'file_write', path: f })
+    const ownership = createOwnershipLedger({ baseline, taskLedger: ledger })
+    ownership.autoOwnFromLedger()
+    return {
+      gate: createDeliveryGateV2({
+        taskLedger: ledger,
+        ownership,
+        attribution: createVerificationAttribution({ ownership }),
+        ...(repoRoot ? { repoRoot } : {}),
+      }),
+      ledger,
+    }
+  }
+
+  it('stale 判废 + 越界 owned 路径并存 → 报告输出越界清单', () => {
+    const { gate, ledger } = makeRootedGate(['src/a.ts', '/tmp/l4-out-fixture.ts'], ROOT)
+    ledger.record({ type: 'verification', command: 'npm test', status: 'passed', meta: { scope: 'full', stale: true } })
+
+    const result = gate.assess([])
+    assert.equal(result.staleFingerprintDropped, 1)
+    assert.deepEqual(result.outOfRootFingerprintPaths, ['/tmp/l4-out-fixture.ts'], '越界路径要点名，供指引引用')
+
+    const report = gate.getReport([])
+    assert.deepEqual(report.outOfRootFingerprintPaths, ['/tmp/l4-out-fixture.ts'], 'DeliveryReport 透传同一字段')
+  })
+
+  it('stale 判废但路径全部仓内 → 字段缺席（仓内再编辑是良性多数，不给越界指引）', () => {
+    const { gate, ledger } = makeRootedGate(['src/a.ts'], ROOT)
+    ledger.record({ type: 'verification', command: 'npm test', status: 'passed', meta: { scope: 'full', stale: true } })
+
+    const result = gate.assess([])
+    assert.equal(result.staleFingerprintDropped, 1, '计数不受影响——所有 stale 丢弃都计入')
+    assert.equal(result.outOfRootFingerprintPaths, undefined)
+  })
+
+  it('越界路径但无 stale 判废 → 字段缺席（无判废即无指引）', () => {
+    const { gate, ledger } = makeRootedGate(['src/a.ts', '/tmp/l4-out-fixture.ts'], ROOT)
+    ledger.record({ type: 'verification', command: 'npm test', status: 'passed', meta: { scope: 'full' } })
+
+    const result = gate.assess([])
+    assert.equal(result.staleFingerprintDropped, 0)
+    assert.equal(result.outOfRootFingerprintPaths, undefined)
+  })
+
+  it('未提供 repoRoot → 字段缺席（越界判定需要根；旧装配/测试调用方不受影响）', () => {
+    const { gate, ledger } = makeRootedGate(['src/a.ts', '/tmp/l4-out-fixture.ts'])
+    ledger.record({ type: 'verification', command: 'npm test', status: 'passed', meta: { scope: 'full', stale: true } })
+
+    const result = gate.assess([])
+    assert.equal(result.staleFingerprintDropped, 1)
+    assert.equal(result.outOfRootFingerprintPaths, undefined)
   })
 })

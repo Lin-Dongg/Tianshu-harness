@@ -22,20 +22,64 @@ function rootOf(cwd: string): string {
   try { return realpathSync(cwd) } catch { return resolve(cwd) }
 }
 
-/** 敏感路径（不得读取/哈希其内容）——与 fingerprint 的 fail-closed 同源。 */
-const SENSITIVE_PATH_RE = /(?:^|\/)(?:\.env|credentials\.)|private.*key|token|secret/i
+/**
+ * 敏感路径（不得读取/哈希其内容）——与 fingerprint 的 fail-closed 同源。
+ *
+ * 判据语义：凭据/密钥材料，词元级匹配（4251eea67 附带观察修复）。旧实现
+ * `/(?:^|\/)(?:\.env|credentials\.)|private.*key|token|secret/i` 是子串匹配，
+ * tokenizer.ts / secretary.ts / .environment.ts / private-keyboard.ts 及仓内
+ * token-store.ts、secrets-store.ts、tokens.css 等 29 个正常文件全部命中——
+ * 任一写入即指纹 return null，本会话全部验证 stale，交付门结构性 RED 且无自愈路径。
+ *
+ * 失效方向（仓纪律「修复要写下失效方向」）：本判据**漏判**只让文件参与指纹哈希
+ * （内容仅存 SHA-256 摘要），**误判**是结构性 RED——两侧不对称，故处处选收窄：
+ * token/secret 须为完整词元（`_`/`.` 分隔）且落凭据形态（整段恰为该词元，或数据
+ * 容器扩展名白名单——白名单缺扩展名只漏判、方向安全；源码/文档扩展名永不中）。
+ * 与 tools/sensitive-file-detector 不共用实现：工具层误伤只是拦一次读取（可授权
+ * 恢复），指纹层误伤作废全部验证，代价不对称，此处判据刻意更窄（且 detector 的
+ * token/secret 形态要求段首+限定扩展名，api_token.txt 类反而漏判）。
+ */
+const DATA_CONTAINER_EXT_RE = /\.(?:json|ya?ml|ini|conf(?:ig)?|env|txt|xml|properties|toml|csv)$/i
+
+function isSensitivePath(rel: string): boolean {
+  // 按段判定，兼容 Windows 分隔符（fingerprint() 的 rel 未经 \ → / 归一化）。
+  for (const seg of rel.split(/[\\/]/)) {
+    if (!seg) continue
+    // .env 家族：.env / .env.local / .env.production…（.environment.ts 的 env 非完整
+    // 词元不中）；模板 .env.example/.template/.sample 无真实凭据，放行（同 detector 白名单）。
+    if (/^\.env(?:\.|$)/i.test(seg) && !/^\.env\.(?:example|template|sample)$/i.test(seg)) return true
+    // credentials：无扩展名精确形态（~/.cargo/credentials 类）+ 凭据扩展名白名单
+    // （credentials.ts 是源码，不中——收窄方向）。
+    if (/^credentials$/i.test(seg) || /^credentials\.(?:json|ya?ml|xml|ini|conf)$/i.test(seg)) return true
+    // 私钥材料：SSH 命名 id_rsa/id_ed25519/id_ecdsa/id_dsa（前缀，含 id_rsa.pub）、
+    // *_rsa 结尾、TLS 扩展名 .pem/.key、无扩展名的 private_key/private-key 词元组合
+    // （private-keyboard.ts 的 key 非完整词元，不中；旧 private.*key 子串会误伤它）。
+    if (/^id_(?:rsa|ed25519|ecdsa|dsa)/i.test(seg)) return true
+    if (/[^a-z0-9]rsa$/i.test(seg)) return true
+    if (/\.(?:pem|key)$/i.test(seg)) return true
+    const tokens = seg.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean)
+    if (!seg.includes('.') && tokens.includes('private') && tokens.includes('key')) return true
+    // token/secret 完整词元 + 凭据形态：整段恰为该词元（.token/_token/secrets）或数据
+    // 容器扩展名（token.json/api_token.txt）；tokenizer.ts/secretary.ts/token-store.ts
+    // 的 token 是标识符不是凭据，不中。
+    if (tokens.some(t => t === 'token' || t === 'tokens' || t === 'secret' || t === 'secrets')
+      && (/^[._-]*(?:tokens?|secrets?)$/i.test(seg) || DATA_CONTAINER_EXT_RE.test(seg))) return true
+  }
+  return false
+}
 
 /**
  * 交付指纹的路径归类。交付是 repo-scoped 概念：
  * - `out-of-project`：解析到 root 之外的路径**不可交付**（git 提交不了它），不参与
  *   指纹——否则往 /tmp 或兄弟目录写一个 fixture 就使本会话所有验证被判 stale、
  *   交付门结构性 RED，且本会话无工具摘除该事件（与 plan 草稿排除同一机制）。
- * - `sensitive`：不得读取/哈希其内容（fail-closed 保留，行为不变）。
+ * - `sensitive`：不得读取/哈希其内容（fail-closed 保留；判据见 isSensitivePath 头注，
+ *   词元级收窄——正常源码文件误判作废全部验证，漏判仅参与哈希，故宁漏勿误）。
  */
 export function classifyFingerprintPath(root: string, file: string): 'in-project' | 'out-of-project' | 'sensitive' {
   const rel = relative(root, resolve(root, file)).replace(/\\/g, '/')
   if (isAbsolute(rel) || rel.startsWith('..')) return 'out-of-project'
-  if (SENSITIVE_PATH_RE.test(rel)) return 'sensitive'
+  if (isSensitivePath(rel)) return 'sensitive'
   return 'in-project'
 }
 
@@ -50,7 +94,7 @@ function fingerprint(root: string, files: string[], isolated = false): string | 
     const path = resolve(root, file), rel = relative(root, path)
     // 越界路径 = 不可交付：跳过而非作废（原实现与敏感路径共用 `return null`，是本缺陷根源）。
     if (classifyFingerprintPath(root, file) === 'out-of-project') continue
-    if (SENSITIVE_PATH_RE.test(rel)) return null
+    if (isSensitivePath(rel)) return null
     hash.update(file)
     try {
       const actual = realpathSync(path), inside = relative(root, actual)
@@ -124,7 +168,11 @@ export function createPersistentTaskState(cwd: string, sessionId: string, fallba
   }
   const record = taskLedger.record
   taskLedger.record = event => {
-    if (event.type === 'file_write' && !isTransientPlanDraftPath(event.path, root)) {
+    // 越界写入（/tmp、兄弟目录）不可交付、本就不参与指纹（fingerprintPaths 同款排除），
+    // 不得作废既往验证——「先验后写」顺序与「先写后验」同根，缺一即结构性 RED。
+    // sensitive 保持判废（fail-closed）。
+    if (event.type === 'file_write' && !isTransientPlanDraftPath(event.path, root)
+      && (!event.path || classifyFingerprintPath(root, event.path) !== 'out-of-project')) {
       for (const previous of taskLedger.getVerifications()) previous.meta = { ...previous.meta, stale: true }
     }
     if (event.type === 'verification') {

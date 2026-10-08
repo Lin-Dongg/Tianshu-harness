@@ -33,14 +33,6 @@ function isReadOnly(task: TeamTask): boolean {
     || (task.profile === 'reviewer' && task.kind === 'review')
 }
 
-/** Check if two write tasks share any file (partial overlap). */
-function hasFileOverlap(a: TeamTask, b: TeamTask): boolean {
-  const aFiles = new Set(touchFiles(a))
-  const bFiles = touchFiles(b)
-  if (aFiles.size === 0 || bFiles.length === 0) return false
-  return bFiles.some(f => aFiles.has(f))
-}
-
 /** Topological sort of tasks by dependsOn. Returns ordered task IDs. */
 function topologicalSort(tasks: TeamTask[]): string[] {
   const taskMap = new Map(tasks.map(t => [t.id, t]))

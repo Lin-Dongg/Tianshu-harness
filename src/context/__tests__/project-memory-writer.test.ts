@@ -46,6 +46,8 @@ describe('project-memory-writer', () => {
 
   it('routes commit facts to the sidecar, keeping the 200-entry main quota clean', () => {
     const dir = mkdtempSync(join(tmpdir(), 'rivet-memory-writer-'))
+    const prevTrust = process.env.RIVET_TRUST_PROJECT
+    process.env.RIVET_TRUST_PROJECT = '1' // readCommitFacts 带信任门，fixture 显式授信
     try {
       appendProjectMemory(dir, {
         id: 'commit-1',
@@ -64,12 +66,16 @@ describe('project-memory-writer', () => {
       assert.equal(sidecar[0]!.id, 'commit-1')
       assert.deepEqual(sidecar[0]!.tags, ['tool', 'commit_fact'])
     } finally {
+      if (prevTrust === undefined) delete process.env.RIVET_TRUST_PROJECT
+      else process.env.RIVET_TRUST_PROJECT = prevTrust
       rmSync(dir, { recursive: true, force: true })
     }
   })
 
   it('commit-fact sidecar enforces FIFO cap independent of main store', () => {
     const dir = mkdtempSync(join(tmpdir(), 'rivet-memory-writer-'))
+    const prevTrust = process.env.RIVET_TRUST_PROJECT
+    process.env.RIVET_TRUST_PROJECT = '1' // readCommitFacts 带信任门，fixture 显式授信
     try {
       for (let i = 0; i < 305; i++) {
         appendProjectMemory(dir, {
@@ -86,6 +92,8 @@ describe('project-memory-writer', () => {
       assert.equal(sidecar[0]!.id, 'commit-5', 'oldest entries evicted FIFO')
       assert.equal(sidecar[299]!.id, 'commit-304')
     } finally {
+      if (prevTrust === undefined) delete process.env.RIVET_TRUST_PROJECT
+      else process.env.RIVET_TRUST_PROJECT = prevTrust
       rmSync(dir, { recursive: true, force: true })
     }
   })

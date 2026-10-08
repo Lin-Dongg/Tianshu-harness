@@ -17,6 +17,7 @@ import {
   isTypecheckCommand,
   resolveTypecheckLockRoot,
   runAdhocTypecheckShared,
+  STALE_LOCK_MS,
   type TscRunOutcome,
   type TypecheckShareEvent,
 } from '../typecheck-cache.js'
@@ -176,6 +177,21 @@ describe('互斥锁', () => {
     assert.ok(tryAcquireLock(dir, 'fp', { isProcessAlive: () => true, now: () => later }))
   })
 
+  it('被超龄接管后，旧持有者的 release 不误删新持有者的锁', () => {
+    const original = tryAcquireLock(dir, 'fp')
+    assert.ok(original)
+    // 与等待循环 takeover 同一判据：持有者存活但超龄 → 锁被夺走。
+    // 同一测试进程内两次获取 pid 相同，靠 startedAt 区分主次——startedAt
+    // 参与比对不是冗余，是本用例能成立的前提。
+    const later = Date.now() + 11 * 60_000
+    const successor = tryAcquireLock(dir, 'fp', { isProcessAlive: () => true, now: () => later })
+    assert.ok(successor)
+    original.release()
+    assert.equal(isLockHeld(dir), true, '锁已易主，旧持有者收尾不得误删——否则并发重新失控')
+    successor.release()
+    assert.equal(isLockHeld(dir), false)
+  })
+
   it('持锁者存活且未超时则夺不走', () => {
     assert.ok(tryAcquireLock(dir, 'fp'))
     assert.equal(tryAcquireLock(dir, 'fp', { isProcessAlive: () => true }), undefined)
@@ -318,6 +334,41 @@ describe('runTypecheckShared 编排', () => {
       Date.now() - startedAt < 10_000,
       '持锁者没了就等不到结果，此时耗满 60s 预算纯属浪费',
     )
+  })
+
+  it('持锁者存活但持有超龄则立即接管，不白等满预算——锁大概率已泄漏', async () => {
+    const blocker = tryAcquireLock(cacheDir, 'other-session')
+    assert.ok(blocker)
+    // 初次抢锁时持有者必须「存活且未超龄」，否则锁级 tryAcquireLock 直接夺走
+    //（互斥锁 describe 的「超过墙钟上限也算陈旧」已覆盖），走不到等待循环。
+    // 所以等 waiting 事件（等待循环已启动的信号）之后再把注入时钟拨过 STALE_LOCK_MS。
+    let offset = 0
+    const now = () => Date.now() + offset
+    const events: TypecheckShareEvent[] = []
+
+    let runs = 0
+    const startedAt = Date.now()
+    const outcome = await runTypecheckShared({
+      cwd: repo,
+      cacheDir,
+      waitBudgetMs: 60_000,
+      now,
+      isProcessAlive: () => true, // 持有者始终存活——能放手的唯一理由是超龄
+      onEvent: e => {
+        events.push(e)
+        if (e.kind === 'waiting') offset = STALE_LOCK_MS + 60_000
+      },
+      run: async () => { runs++; return ok('self') },
+    })
+    blocker.release()
+    assert.equal(runs, 1, '超龄锁大概率不会再产出结果，必须自己跑而不是继续等')
+    assert.equal(outcome.stdout, 'self')
+    assert.ok(
+      Date.now() - startedAt < 10_000,
+      '持有者已超龄还等满 60s 预算，等于把锁泄漏的代价转嫁给每个后来者',
+    )
+    assert.equal(events.some(e => e.kind === 'wait-timeout'), false)
+    assert.equal(events.some(e => e.kind === 'stale-lock-cleared'), true)
   })
 
   it('持锁者仍在推进时不提前放弃——等它比自己重跑一遍更快', async () => {

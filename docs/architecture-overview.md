@@ -1,9 +1,9 @@
 # 天枢 Architecture Overview
 
-> v3.8.0 · Node.js 24+ / TypeScript strict / 纯 ANSI TUI（`src/tui/engine/`）+ Tauri 桌面端 / node:test / ESM
+> v3.27.0 · Node.js 24+ / TypeScript strict / 纯 ANSI TUI（`src/tui/engine/`）+ Tauri 桌面端 / node:test / ESM
 >
-> 规模：CLI 源码 2,042 文件 / 31.7 万行，测试 2,196 文件 / 33.3 万行（16,471 用例静态声明），72 个 hook 模块。
-> 逐期数据与迭代里程碑见 [`engineering-metrics.md`](./engineering-metrics.md)（数据截至 2026-10-07）。
+> 规模：CLI 源码约 1,256 文件 / 30 万行，测试约 1,592 文件 / 31 万行（19,462 用例静态声明），75 个 hook 模块。
+> 逐期数据与迭代里程碑见 [`engineering-metrics.md`](./engineering-metrics.md)（数据截至 2026-09-30）。
 >
 > 开发代号曾用 **Rivet**；CLI 命令仍为 `rivet`。Agent 导航索引见根目录 [`AGENTS.md`](../AGENTS.md)。
 

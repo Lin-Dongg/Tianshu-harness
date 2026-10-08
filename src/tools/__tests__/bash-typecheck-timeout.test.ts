@@ -72,7 +72,7 @@ test('普通命令保持默认预算；测试运行拿到有界专用预算（20
   // CPU 竞争下必被超时杀掉 → 结果被超时占位替换 → 无 exitCode、无输出计数 →
   // verification 恒 blocked → 交付门禁的 full-scope 覆盖义务不可满足。
   // 它拿到的是**有界**的 TEST_RUNNER_CALLER_BUDGET_MS（5 分钟），不是 typecheck 的
-  // 13 分钟闸门预算——「不因修复被放大」这条原则仍成立，只是边界从「只有 typecheck」
+  // 8 分钟闸门预算——「不因修复被放大」这条原则仍成立，只是边界从「只有 typecheck」
   // 收窄为「typecheck + 测试运行，且测试那一档显著更小」。
   for (const cmd of ['ls -la', 'npm run build', 'git status']) {
     assert.equal(timeoutFor(cmd), 120_000, `${cmd} 不该拿到闸门长预算`)
@@ -225,7 +225,7 @@ test('测试运行形态走有界专用预算：抬升但显著小于 typecheck�
   )
   assert.ok(
     TEST_RUNNER_CALLER_BUDGET_MS < TYPECHECK_CALLER_BUDGET_MS,
-    '测试预算有界——不套用 typecheck 的 13 分钟（那档是为等跨进程共享锁而设）',
+    '测试预算有界——不套用 typecheck 的 8 分钟（那档是为等跨进程共享锁而设）',
   )
   const explicit = TEST_RUNNER_CALLER_BUDGET_MS + 60_000
   assert.equal(resolveCallerTimeoutBudget('npm test', explicit, 120_000), explicit, '调用方给更大值时不压')

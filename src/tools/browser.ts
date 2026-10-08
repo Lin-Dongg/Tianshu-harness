@@ -55,7 +55,7 @@ export interface BrowserToolOptions {
 // 导航/截图结果前缀已抽至 output-markers.ts（零依赖叶子，桌面端共享）；
 // 此处 re-export 保持内核调用方不变。
 export { BROWSER_NAVIGATED_PREFIX, BROWSER_SCREENSHOT_OF_PREFIX } from './output-markers.js'
-import { BROWSER_NAVIGATED_PREFIX, BROWSER_SCREENSHOT_OF_PREFIX } from './output-markers.js'
+import { BROWSER_SCREENSHOT_OF_PREFIX } from './output-markers.js'
 import { launchHeadlessChromium } from './net/playwright-driver.js'
 
 /** Default allowlist: comma-separated hosts in RIVET_BROWSER_ALLOWLIST. */

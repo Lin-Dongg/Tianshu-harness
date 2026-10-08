@@ -135,7 +135,7 @@ import { truncateToDisplayWidth, displayWidth, ambiguousWideEnabled } from '../w
 import { boxCharsFor, boxInnerWidth } from '../box-chars.js'
 import { useAsciiGlyphs } from '../term-caps.js'
 import { appendHistoryAsync, nextHistoryAfterSubmit } from '../history.js'
-import { renderPager, renderStarmap, renderCommandPalette, followListWindow, renderChronicle, renderTasks, renderDomainPicker, renderDomainGenesisCard, genesisCardMaxScroll, renderModelPicker, renderThemePicker, renderChoicePanel, renderPlanPicker, renderConnect, renderInitFlow, MODEL_PICKER_EFFORT_LEVELS, stepModelPickerEffort, type ModelPickerEffort } from '../format/overlay.js'
+import { renderPager, renderStarmap, renderCommandPalette, followListWindow, renderChronicle, renderTasks, renderDomainPicker, renderDomainGenesisCard, genesisCardMaxScroll, renderModelPicker, renderThemePicker, renderChoicePanel, renderPlanPicker, renderConnect, renderInitFlow, MODEL_PICKER_EFFORT_LEVELS, stepModelPickerEffort, normalizeModelPickerEffort, type ModelPickerEffort } from '../format/overlay.js'
 import type { PagerData, StarmapData, PaletteData, ChronicleData, TasksData, TasksGroup, TasksWorkerRow, DomainPickerData, ModelPickerData, ThemePickerData, ChoicePanelData, PlanPickerData, ChoiceEntry, ConnectOverlayData, InitOverlayData } from '../format/overlay.js'
 import { ConnectFlow, DIY_PENDING_KEY_REF, type ConnectCommit, type ConnectProviderRef, type ConnectStepResult } from '../connect-flow.js'
 import { VisionOnboardingFlow, type VisionCandidate, type VisionOnboardingRequest, type VisionOnboardingResult } from '../vision-onboarding-flow.js'
@@ -2016,7 +2016,7 @@ export class TuiApp {
     // Commit user message to scrollback（steer 已单独 commit 时跳过）
     if (trimmed) {
       if (!steerMerged) {
-        await this.awaitUserCommit(submitText.trim(), images, questionRequestId)
+        await this.awaitUserCommit(submitText.trim(), images, questionRequestId, true)
       }
       // 新 run 启动前丢弃上一 run 未 finalize 的流式残留：blockWriter 缓冲
       // 与 streamRenderer pending 若不清，会把上一轮文字追加进新轮输出。
@@ -2038,7 +2038,12 @@ export class TuiApp {
       ? [...this.deferredImages, ...(images ?? [])]
       : images
     if (this.deferredImages.length > 0) this.deferredImages = []
-    try { await this.onSubmitCallback?.(submitText, outgoingImages, decision ? { origin: 'human', literalText: true } : undefined) }
+    try {
+      await this.onSubmitCallback?.(submitText, outgoingImages, decision ? { origin: 'human', literalText: true } : undefined)
+      // 投递成功才归档「已提交回答」：失败时提问卡仍是挂起态（面板保留错误可重试），
+      // 由重试成功/发言/退出/切会话归档——历史里绝不留下从未送达却标记已回答的卡。
+      if (questionRequestId) this.archiveAskCards(questionRequestId, 'answered')
+    }
     catch (error) { this.rejectSubmit(); throw error }
   }
 
@@ -2275,7 +2280,10 @@ export class TuiApp {
    * 再调 setGitBranch()。
    */
   setCwd(cwd: string): void {
-    if (this.sessionCwd !== cwd) this.decisions.clear()
+    // cwd 变化 = 旧目录的会话面结束：挂着的提问卡先归档再清面板（与
+    // setUIHistorySession/dispose 同手法）——只清面板不归档的话，提问在会话内
+    // 彻底不可见，直到 dispose 才以「未作答」入历史。
+    if (this.sessionCwd !== cwd) { this.archiveAskCards(); this.decisions.clear() }
     this.sessionCwd = cwd
   }
 
@@ -2433,14 +2441,18 @@ export class TuiApp {
       }
       case 'model-picker': {
         this.overlayController.resetNav()
-        const entries = this.overlayController.getData()?.modelPickerData?.().entries ?? []
+        const data = this.overlayController.getData()?.modelPickerData?.()
+        const entries = data?.entries ?? []
         const curIdx = entries.findIndex(e => e.current)
         if (curIdx >= 0) this.overlayController.nav().modelPickerIndex = curIdx
+        const selectedIndex = curIdx >= 0 ? curIdx : 0
+        const selectedEntry = entries[selectedIndex]
         // effort draft 初始化为当前生效档（CC 对标：面板内 </> 调整，提交才生效）
-        const cur = this.metricsGlanceController.reasoningEffortProvider?.()
+        const cur = data?.effort?.value ?? this.metricsGlanceController.reasoningEffortProvider?.()
         const init = (MODEL_PICKER_EFFORT_LEVELS as readonly string[]).includes(cur ?? '') ? cur as ModelPickerEffort : 'auto'
-        this.modelPickerEffortDraft = init
-        this.modelPickerEffortInitial = init
+        const normalized = normalizeModelPickerEffort(init, selectedEntry)
+        this.modelPickerEffortDraft = normalized
+        this.modelPickerEffortInitial = normalized
         return this.overlay.activate(id)
       }
       case 'theme-picker': {
@@ -3850,38 +3862,60 @@ export class TuiApp {
       const count = data?.entries.length ?? 0
       const cur = this.overlayController.nav().modelPickerIndex
       if (key.name === 'down') {
-        if (count > 0) { this.overlayController.nav().modelPickerIndex = (cur + 1) % count; this.overlay.rerender() }
+        if (count > 0) {
+          const next = (cur + 1) % count
+          this.overlayController.nav().modelPickerIndex = next
+          const nextEntry = data?.entries[next]
+          if (this.modelPickerEffortDraft) {
+            this.modelPickerEffortDraft = normalizeModelPickerEffort(this.modelPickerEffortDraft, nextEntry)
+          }
+          this.overlay.rerender()
+        }
         return true
       }
       if (key.name === 'up') {
-        if (count > 0) { this.overlayController.nav().modelPickerIndex = (cur - 1 + count) % count; this.overlay.rerender() }
+        if (count > 0) {
+          const next = (cur - 1 + count) % count
+          this.overlayController.nav().modelPickerIndex = next
+          const nextEntry = data?.entries[next]
+          if (this.modelPickerEffortDraft) {
+            this.modelPickerEffortDraft = normalizeModelPickerEffort(this.modelPickerEffortDraft, nextEntry)
+          }
+          this.overlay.rerender()
+        }
         return true
       }
+      const curEntry = count > 0 ? data?.entries[cur] : undefined
+      const isCurEffortSupported = curEntry ? curEntry.effortSupported !== false : false
       // </> effort 步进（CC 对标）：循环切换档位 draft；选中模型不支持时不响应
       // （渲染层 supported 判定按当前选中条目——翻到不支持模型后 effort 行自然灰化）。
-      if ((c === '<' || c === '>') && data?.effort?.supported !== false) {
-        this.modelPickerEffortDraft = stepModelPickerEffort(this.modelPickerEffortDraft ?? 'auto', c)
+      if ((c === '<' || c === '>') && isCurEffortSupported) {
+        this.modelPickerEffortDraft = stepModelPickerEffort(
+          this.modelPickerEffortDraft ?? 'auto',
+          c,
+          curEntry?.effortLevels,
+        )
         this.overlay.rerender()
         return true
       }
-      // 提交语义（CC 对标）：Enter=设为默认（持久化）、s=仅本会话。
+      // 提交语义（CC 对标）：Enter=仅本会话、s=设为默认（持久化）。
       // effort 只在有显式改动（draft ≠ 打开时初值）时随提交传递。
-      const effortChange = this.modelPickerEffortDraft !== undefined
-        && this.modelPickerEffortDraft !== this.modelPickerEffortInitial
-        ? this.modelPickerEffortDraft
+      const isDifferentModel = curEntry ? curEntry.current === false : false
+      const effortChange = isCurEffortSupported
+        ? (isDifferentModel
+            ? this.modelPickerEffortDraft
+            : (this.modelPickerEffortDraft !== this.modelPickerEffortInitial ? this.modelPickerEffortDraft : undefined))
         : undefined
       if (key.name === 'return') {
-        const entry = count > 0 ? data?.entries[cur] : undefined
-        if (entry && this.overlayController.getModelPickerExec()) {
-          this.overlayController.getModelPickerExec()?.(entry.provider, entry.id, effortChange)
+        if (curEntry && this.overlayController.getModelPickerExec()) {
+          this.overlayController.getModelPickerExec()?.(curEntry.provider, curEntry.id, effortChange)
         }
         this.deactivateOverlay()
         return true
       }
       if (c === 's') {
-        const entry = count > 0 ? data?.entries[cur] : undefined
-        if (entry && this.overlayController.getModelPickerSaveDefaultExec()) {
-          this.overlayController.getModelPickerSaveDefaultExec()?.(entry.provider, entry.id, effortChange)
+        if (curEntry && this.overlayController.getModelPickerSaveDefaultExec()) {
+          this.overlayController.getModelPickerSaveDefaultExec()?.(curEntry.provider, curEntry.id, effortChange)
         }
         this.deactivateOverlay()
         return true
@@ -4082,6 +4116,15 @@ export class TuiApp {
       this.askCards.delete(id)
       this.commitAskCard(card, state)
     }
+  }
+
+  /**
+   * decision-session 的投递守卫丢弃面板时的兜底归档（挂起卡 → 「未作答」落历史）。
+   * 失效方向：宁可历史里立刻多一张未答卡，不可让提问挂到退出才凭空出现。
+   * 卡不存在（错误结果/已被切会话归档）时静默无操作。
+   */
+  archiveDroppedAskCard(requestId: string): void {
+    this.archiveAskCards(requestId, 'unanswered')
   }
 
   commitStatic(text: string, opts?: { isError?: boolean }): void {
@@ -4374,10 +4417,13 @@ export class TuiApp {
    * 所属用户气泡下方、先于 assistant 输出」；该 Promise resolve 的值
    * 表示写入是否成功。
    */
-  private commitUserPrompt(content: string, images?: string[], questionRequestId?: string): Promise<boolean> | null {
+  private commitUserPrompt(content: string, images?: string[], questionRequestId?: string, deferAnsweredArchive = false): Promise<boolean> | null {
     // 只归档这次作答/讨论对应的提问；全部归档会把后续排队的活动卡提前落历史。
+    // deferAnsweredArchive（idle 直投路径）：「已提交回答」的归档推迟到投递成功后由
+    // handleInputSubmit 补归——投递失败时提问仍是挂起态，历史里不留一张从未送达
+    // 却标记已回答的卡。discussion（用户绕过面板发言）与投递结果无关，照常即时刻。
     const requestId = questionRequestId ?? this.decisions.question?.id
-    if (requestId) this.archiveAskCards(requestId, questionRequestId ? 'answered' : 'discussion')
+    if (requestId && !(deferAnsweredArchive && questionRequestId)) this.archiveAskCards(requestId, questionRequestId ? 'answered' : 'discussion')
     if (!this.isAgentActive()) { this.currentTaskTitle = content.split('\n')[0]!.slice(0, 80); this.mainTaskFailed = false; this.mainTaskStopped = false; this.mainTaskEnded = undefined }
     this.frontend.record({ kind: 'user', text: content + (images?.length ? `\n[${images.length}张图片附件]` : '') })
     const protocol = imageProtocol()
@@ -4422,8 +4468,8 @@ export class TuiApp {
   }
 
   /** Await a queued user commit and surface a display failure without blocking delivery. */
-  private async awaitUserCommit(content: string, images?: string[], questionRequestId?: string): Promise<boolean> {
-    const pending = this.commitUserPrompt(content, images, questionRequestId)
+  private async awaitUserCommit(content: string, images?: string[], questionRequestId?: string, deferAnsweredArchive = false): Promise<boolean> {
+    const pending = this.commitUserPrompt(content, images, questionRequestId, deferAnsweredArchive)
     const written = pending ? await pending : true
     if (!written) {
       try {
@@ -7146,7 +7192,7 @@ export class TuiApp {
     themePickerData?: () => ThemePickerData
     choicePanelData?: () => ChoicePanelData
     planPickerData?: () => PlanPickerData
-  }, paletteExec?: (index: number) => void, rewindExec?: (messageIndex: number, mode: RewindMode) => void, chronicleExec?: (id: string) => void, domainPickerExec?: (key: string) => void, modelPickerExec?: (provider: string, modelId: string) => void, domainPickerSaveDefaultExec?: (key: string) => void, modelPickerSaveDefaultExec?: (provider: string, modelId: string) => void, themePickerExec?: (key: string) => void, themePickerSaveDefaultExec?: (key: string) => void, choicePanelExec?: (id: string) => void, connectExec?: (commit: ConnectCommit, summary: string) => boolean | void, planPickerExec?: (slug: string) => void, initExec?: (commit: InitCommit, summary: string) => void): void {
+  }, paletteExec?: (index: number) => void, rewindExec?: (messageIndex: number, mode: RewindMode) => void, chronicleExec?: (id: string) => void, domainPickerExec?: (key: string) => void, modelPickerExec?: (provider: string, modelId: string, effort?: string) => void, domainPickerSaveDefaultExec?: (key: string) => void, modelPickerSaveDefaultExec?: (provider: string, modelId: string, effort?: string) => void, themePickerExec?: (key: string) => void, themePickerSaveDefaultExec?: (key: string) => void, choicePanelExec?: (id: string) => void, connectExec?: (commit: ConnectCommit, summary: string) => boolean | void, planPickerExec?: (slug: string) => void, initExec?: (commit: InitCommit, summary: string) => void): void {
     this.overlayController.setData(overlayData)
     this.overlayController.setPaletteExec(paletteExec)
     this.overlayController.setRewindExec(rewindExec)

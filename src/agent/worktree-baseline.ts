@@ -34,6 +34,10 @@ export interface WorktreeBaseline {
   /** 基线是否完整建立（git 可用且成功捕获）。不完整时 isExternal 恒真、无法区分
    *  外部性——调用方据此不要把「本会话 ledger 写过」的铁证降级为 co-owned（issue #369）。 */
   isComplete(): boolean
+  /** 原地替换快照（会话中途 git init 的恢复入口，交付硬门现场重采用）。
+   *  只换数据不换对象——ownership-ledger / task-state 持久化持有的引用随即按
+   *  新基线判定，persist() 的 toSnapshot() 也落新基线（resume 不再继承 incomplete）。 */
+  replaceSnapshot(next: BaselineSnapshot): void
   /** All external files (dirty + untracked), deduplicated and sorted */
   getExternalFiles(): string[]
   getExternalDirtyCount(): number
@@ -43,8 +47,9 @@ export interface WorktreeBaseline {
   toSnapshot(): BaselineSnapshot
 }
 
-export function createWorktreeBaseline(snapshot: BaselineSnapshot): WorktreeBaseline {
-  const externalSet = new Set([
+export function createWorktreeBaseline(initial: BaselineSnapshot): WorktreeBaseline {
+  let snapshot = initial
+  let externalSet = new Set([
     ...snapshot.preExistingDirty,
     ...snapshot.preExistingUntracked,
   ])
@@ -78,6 +83,15 @@ export function createWorktreeBaseline(snapshot: BaselineSnapshot): WorktreeBase
 
   function isComplete(): boolean {
     return snapshot.complete !== false
+  }
+
+  function replaceSnapshot(next: BaselineSnapshot): void {
+    snapshot = next
+    externalSet = new Set([
+      ...next.preExistingDirty,
+      ...next.preExistingUntracked,
+    ])
+    _baselineHash = null
   }
 
   function getExternalFiles(): string[] {
@@ -116,6 +130,7 @@ export function createWorktreeBaseline(snapshot: BaselineSnapshot): WorktreeBase
     getHead,
     isExternal,
     isComplete,
+    replaceSnapshot,
     getExternalFiles,
     getExternalDirtyCount,
     getExternalUntrackedCount,

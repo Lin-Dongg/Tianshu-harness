@@ -140,7 +140,7 @@ const JSX_TAG_RE = /<([A-Z][A-Za-z0-9_]*)[\s/>]/g
  * components, and are ignored.
  */
 export function extractJsxChildren(
-  filePath: string,
+  _filePath: string,
   source: string,
   fileSymbols: MeridianSymbol[],
   knownSymbols: MeridianSymbol[],

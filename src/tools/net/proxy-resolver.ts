@@ -16,6 +16,7 @@ export interface ProxyResolverOptions {
 }
 
 import { execSync } from 'node:child_process'
+import { normalizeHttpProxyUrl } from './proxy-url.js'
 
 function envCaseInsensitive(key: string): string | undefined {
   return process.env[key] ?? process.env[key.toLowerCase()]
@@ -181,6 +182,11 @@ export function shouldBypassProxy(hostname: string, noProxy?: string): boolean {
  * NO_PROXY 命中时一律返回 undefined，无论 proxy 来源。
  */
 export function resolveProxyForUrl(url: string, opts?: ProxyResolverOptions): string | undefined {
+  const proxy = resolveRawProxyForUrl(url, opts)
+  return proxy ? normalizeHttpProxyUrl(proxy) : undefined
+}
+
+function resolveRawProxyForUrl(url: string, opts?: ProxyResolverOptions): string | undefined {
   let parsed: URL
   try {
     parsed = new URL(url)

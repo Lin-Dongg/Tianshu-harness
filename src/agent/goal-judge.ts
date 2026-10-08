@@ -155,7 +155,7 @@ function tryParseVerdict(slice: string): GoalJudgeVerdict | null {
 }
 
 /** Pull verdict text candidates out of a coordinator run (artifacts then summaries). */
-function verdictFromRun(run: CoordinatorRun, criteria: string[]): GoalJudgeVerdict | null {
+function verdictFromRun(run: CoordinatorRun, _criteria: string[]): GoalJudgeVerdict | null {
   for (const result of run.results) {
     for (const artifact of result.artifacts) {
       const v = extractVerdictJson(artifact.content)

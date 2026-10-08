@@ -12,7 +12,7 @@
 import type { ChildProcess } from 'node:child_process'
 import { spawnHidden } from '../tools/spawn-hidden.js'
 import {
-  resolveNpmCliCommand,
+  resolveNodeStdioCommand,
   buildStdioEnvWithNodePath,
   type ResolveNodeCliDeps,
 } from '../platform/resolve-node-cli.js'
@@ -53,7 +53,11 @@ type LspSpawnFn = (cmd: string, args: string[], opts: Record<string, unknown>) =
 /**
  * Default spawn for LSP servers: rewrites bare npx/npm to node+cli.js so
  * Windows GUI / bundled-node launches don't ENOENT on npx.cmd when shell is
- * forced off (spawnHidden). Non-npx commands pass through unchanged.
+ * forced off (spawnHidden), and resolves bare `node` aliases through the
+ * renamed Windows desktop runtime (resolveNodeStdioCommand, 与 MCP stdio 同一
+ * 解析器——桌面 GUI PATH 无用户 shell PATH 时 bare node 不再 ENOENT）。
+ * POSIX 逐字节等价：resolveNodeStdioCommand 非 win32 直接透传 resolveNpmCliCommand。
+ * Non-npx commands pass through unchanged.
  *
  * `resolveDeps` / `spawnFn` are injectable so tests can simulate the desktop
  * bundled node-runtime layout without depending on the host Node install.
@@ -64,7 +68,7 @@ export function defaultLspSpawn(
   spawnFn: LspSpawnFn = spawnHidden as LspSpawnFn,
   resolveDeps: ResolveNodeCliDeps = {},
 ): ChildProcess {
-  const resolved = resolveNpmCliCommand(def.command, def.args ?? [], resolveDeps)
+  const resolved = resolveNodeStdioCommand(def.command, def.args ?? [], resolveDeps)
   const env = buildStdioEnvWithNodePath(undefined, {
     ...resolveDeps,
     getDefaultEnvironment: () => ({ ...process.env } as Record<string, string>),

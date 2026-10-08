@@ -30,7 +30,6 @@ export function analyzeImpact(
   const direct = new Set<string>()
   const transitive = new Set<string>()
   const tests = new Set<string>()
-  const changedSet = new Set(changedFiles)
 
   // Collect tests for changed files
   for (const file of changedFiles) {

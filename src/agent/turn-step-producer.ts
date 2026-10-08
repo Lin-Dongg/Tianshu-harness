@@ -1159,7 +1159,6 @@ export class TurnStepProducer {
     this.self._lastEligibility = eligibility
 
     if (this.self.taskContract && contractStatus) {
-      const prevStatus = this.self.taskContract.status
       this.self.taskContract = advanceContractStatus(this.self.taskContract, contractStatus, this.self.session.getTurnCount())
 
       // TDD Gate: check on every executing turn — keeps reminding until

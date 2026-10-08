@@ -426,6 +426,55 @@ describe('provider config mutations', () => {
     assert.throws(() => setModelSupportsVision('deepseek', 'ghost-model', true), /Model "ghost-model" not found/)
   })
 
+  // keys 池是契约层事实源：只在顶层找模型会让池形态 provider 的手动补标报
+  // 「模型不存在」，或写中顶层而池不变（勾上去了、识图候选照旧为空）。
+  it('setModelSupportsVision reaches a model that only lives in a key pool', () => {
+    writeFileSync(process.env.RIVET_CONFIG_PATH!, JSON.stringify({
+      provider: {
+        default: 'mimo',
+        providers: {
+          mimo: {
+            name: 'mimo',
+            baseUrl: 'https://token-plan-cn.xiaomimimo.com/v1',
+            protocol: 'openai',
+            apiKey: 'sk-test',
+            userSaved: true,
+            models: [{ id: 'mimo-house-model', contextWindow: 1_000_000, maxTokens: 128_000 }],
+            keys: [{
+              id: 'default',
+              models: [{ id: 'mimo-house-model', contextWindow: 1_000_000, maxTokens: 128_000 }],
+            }],
+          },
+        },
+      },
+    }))
+    setModelSupportsVision('mimo', 'mimo-house-model', true)
+    assert.equal(
+      loadConfig().provider.providers.mimo!.keys![0]!.models[0]?.supportsVision,
+      true,
+      '池里的卡必须被写上——消费方读的是池',
+    )
+  })
+
+  it('setModelSupportsVision still rejects a model present in no pool', () => {
+    writeFileSync(process.env.RIVET_CONFIG_PATH!, JSON.stringify({
+      provider: {
+        providers: {
+          mimo: {
+            name: 'mimo',
+            baseUrl: 'https://token-plan-cn.xiaomimimo.com/v1',
+            protocol: 'openai',
+            apiKey: 'sk-test',
+            userSaved: true,
+            models: [],
+            keys: [{ id: 'default', models: [{ id: 'mimo-house-model', contextWindow: 1_000_000, maxTokens: 128_000 }] }],
+          },
+        },
+      },
+    }))
+    assert.throws(() => setModelSupportsVision('mimo', 'ghost-model', true), /Model "ghost-model" not found/)
+  })
+
   // userSaved —— 模型切换器只显示用户真正保存过的 provider，出厂预设舰队不进列表。
   it('built-in preset names start without userSaved', () => {
     const providers = loadConfig().provider.providers

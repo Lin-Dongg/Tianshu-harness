@@ -1,5 +1,4 @@
 import type { PreTurnRuntimeHook } from '../runtime-hooks.js'
-import type { PheromoneRef } from '../sensorium.js'
 import { compressDeadEnds, formatDeadEndRules } from '../../context/dead-end-rules.js'
 import type { DeadEndEntry } from '../../context/dead-end-rules.js'
 import type { AdvisoryBus } from '../advisory-bus.js'

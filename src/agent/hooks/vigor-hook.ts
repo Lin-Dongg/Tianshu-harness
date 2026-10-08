@@ -3,7 +3,6 @@ import type { PredictionAccumulator } from '../prediction-error.js'
 import {
   createVigorState,
   modulateStrategyByVigor,
-  shouldTriggerElmRelease,
   updateVigor,
 } from '../vigor.js'
 

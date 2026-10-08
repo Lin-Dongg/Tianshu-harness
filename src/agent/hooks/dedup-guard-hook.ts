@@ -55,7 +55,7 @@ export function createDedupGuardHook(deps: DedupGuardHookDeps): PostTurnRuntimeH
   return {
     phase: 'postTurn',
     name: 'dedup-guard',
-    run(ctx: RuntimeHookContext) {
+    run(_ctx: RuntimeHookContext) {
       const currentText = deps.getStreamedText()
       const prevText = deps.getPrevStreamedText()
 

@@ -97,8 +97,17 @@ export function providerKeysFileMode(base?: string): number | undefined {
  * 必须在 `migrateProviderToKeys` **之后**调用：那个函数在 config.json 无 keys 时
  * 只合成 keys[0]（池退化为单条），靠文件覆盖才能恢复完整池。
  * 原地修改 providers；写盘失败静默降级（读路径不因写失败中断）。
+ *
+ * `options.agent`：退役迁移的悬空引用守卫要复查的硬引用位点（defaultModel /
+ * visionModel）。外部池形态下 config.json 无 keys，注入前那遍守卫只能修顶层快照
+ * （契约层不读），必须以注入后的真实池为准重跑——不传 agent 时重跑只有
+ * `{ provider }`，守卫无引用可查、永不触发（2026-10-08 实证：池=[v4-pro] +
+ * defaultModel=deepseek-flash 时 flash 只被补进无人读的顶层快照，悬空持续）。
  */
-export function injectProviderKeys(providers: Record<string, ProviderConfig>): void {
+export function injectProviderKeys(
+  providers: Record<string, ProviderConfig>,
+  options?: { agent?: unknown },
+): void {
   const file = readProviderKeysFile()
   const toPersist: ProviderKeysFile = { version: PROVIDER_KEYS_FILE_VERSION, providers: {} }
   let stale = false
@@ -110,7 +119,10 @@ export function injectProviderKeys(providers: Record<string, ProviderConfig>): v
   // 视野内，于是「设置页剪过的池 / 老 provider-keys.json」会把退役档复活，而选择器
   // 与请求端读的正是 keys[].models。这里对事实源再跑一遍退役与预设元数据回填，
   // 结果幂等落盘（stale → 写文件；重新加载得到同一份文件）。
-  const raw = { provider: { providers } } as unknown as Record<string, unknown>
+  const raw = {
+    provider: { providers },
+    ...(options?.agent !== undefined ? { agent: options.agent } : {}),
+  } as unknown as Record<string, unknown>
   if (migrateDeepseekVisionExpRetirement(raw)) stale = true
   if (migrateDeepseekV4FlashRetirement(raw)) stale = true
   for (const [name, provider] of Object.entries(providers)) {

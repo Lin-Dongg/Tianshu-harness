@@ -1,10 +1,10 @@
 import { after, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { spawnSync } from 'node:child_process'
-import { createPersistentTaskState } from '../task-state-persist.js'
+import { createPersistentTaskState, classifyFingerprintPath } from '../task-state-persist.js'
 import { getEffectiveVerifications } from '../verification-attribution.js'
 
 /**
@@ -201,4 +201,110 @@ it('W2-1 边界：敏感路径（.env）保持 fail-closed——本次语义不�
     getEffectiveVerifications(state.taskLedger.getEvents()).effective.length, 0,
     '敏感路径不得被哈希（指纹不可用）→ 验证不作为有效证据（计划非目标：不放松该 fail-closed）',
   )
+})
+
+/**
+ * W2-1 反序：先验后写——record 包装器的「任意 file_write 判废全部既往验证」
+ * 曾不做越界排除：跑完验证后往 /tmp 写个 fixture，既往全部验证被 sticky 标 stale。
+ * 与「先写后验」（W2-1）同根、缺一即结构性 RED；stale 不可逆，此顺序无自愈路径。
+ */
+it('W2-1 反序：先验后写——仓库外写入同样不得作废既往验证', () => {
+  const { cwd, baseline } = fixture(), state = createPersistentTaskState(cwd, 'out-of-root-late', baseline)
+  writeFileSync(join(cwd, 'owned.ts'), 'modified')
+  state.taskLedger.record({ type: 'file_write', path: 'owned.ts' })
+  state.taskLedger.record({ type: 'verification', command: 'npm test', status: 'passed', meta: { scope: 'full' } })
+  assert.equal(getEffectiveVerifications(state.taskLedger.getEvents()).effective.length, 1, '前置：验证有效')
+
+  state.taskLedger.record({ type: 'file_write', path: join(tmpdir(), 'task-state-outsider-late.js') })
+  assert.equal(
+    getEffectiveVerifications(state.taskLedger.getEvents()).effective.length, 1,
+    '越界写入不可交付也不参与指纹，不得作废既往验证（与先写后验同根）',
+  )
+})
+
+it('W2-1 反序对照：先验后写敏感路径仍作废既往验证——判废不得被排除修成恒不敏感', () => {
+  const { cwd, baseline } = fixture(), state = createPersistentTaskState(cwd, 'sensitive-late', baseline)
+  writeFileSync(join(cwd, 'owned.ts'), 'modified')
+  state.taskLedger.record({ type: 'file_write', path: 'owned.ts' })
+  state.taskLedger.record({ type: 'verification', command: 'npm test', status: 'passed', meta: { scope: 'full' } })
+
+  state.taskLedger.record({ type: 'file_write', path: '.env' })
+  assert.equal(
+    getEffectiveVerifications(state.taskLedger.getEvents()).effective.length, 0,
+    '敏感路径保持 fail-closed 判废（指纹不可用方向），越界排除不得连带放松',
+  )
+})
+
+/**
+ * W2-2 敏感判据收窄（4251eea67 审查附带观察）：子串匹配误毒化正常文件。
+ *
+ * 缺陷：旧 SENSITIVE_PATH_RE 的 token|secret|private.*key 是子串匹配——
+ * src/tokenizer.ts、src/secretary.ts、.environment.ts、private-keyboard.ts 乃至
+ * 仓内 token-store.ts / secrets-store.ts / tokens.css 等 29 个正常文件全部命中
+ * sensitive → 指纹 return null → 写入任一即本会话全部验证 stale、交付门结构性 RED
+ * （与越界毒化同形，且更常见：这些都是日常会被编辑的源码）。
+ * 修法：词元级判据（token/secret 须为完整词元且落凭据形态：整段恰为该词元或数据
+ * 容器扩展名白名单）；失效方向选收窄——漏判仅让文件参与哈希，误判即结构性 RED。
+ */
+it('W2-2：敏感判据词边界对照表——凭据形态判 sensitive、正常源码/文档/模板放行', () => {
+  const { cwd } = fixture()
+  const sensitive = [
+    '.env', '.env.local', '.env.production', 'config/.env',
+    'credentials.json', 'dir/credentials.yaml', 'credentials',
+    'id_rsa', '.ssh/id_rsa', 'id_rsa.pub', 'my_rsa',
+    'server.pem', 'certs/tls.key', 'private.key', 'private_key', 'private-key',
+    'api_token.txt', 'token.json', '.token', '_token', 'secrets.json',
+    'auth/secrets.yaml', 'my-secret.conf', 'tokens.csv',
+  ]
+  const inProject = [
+    // 旧子串判据的误伤形态（审查点名的三个 + private.*key 误伤）
+    'src/tokenizer.ts', 'src/secretary.ts', '.environment.ts', 'src/private-keyboard.ts',
+    // 仓内真实文件：token/secret 是标识符不是凭据（源码/样式/文档扩展名永不中）
+    'src/auth/token-store.ts', 'src/config/secrets-store.ts', 'src/context/image-tokens.ts',
+    'license-server/src/token.ts', 'desktop/src/styles/tokens.css',
+    'desktop/src/components/TokenActivityCard.tsx', 'scripts/analyze-output-tokens.ts',
+    'docs/output-token-instrumentation.md', 'docs/known-issues/token-explosion-2c25c34e.md',
+    // .env 模板无真实凭据（与 tools/sensitive-file-detector 白名单一致）
+    '.env.example', '.env.template', 'chat-gateway/.env.sample',
+    // 词边界反例：credentials.ts 是源码；keys/ 目录不是 .key 扩展名
+    'credentials.ts', 'src/keys/index.ts',
+  ]
+  for (const p of sensitive) {
+    assert.equal(classifyFingerprintPath(cwd, p), 'sensitive', `${p} 必须判 sensitive（fail-closed 不得放松）`)
+  }
+  for (const p of inProject) {
+    assert.equal(classifyFingerprintPath(cwd, p), 'in-project', `${p} 不得误判 sensitive（误判即结构性 RED）`)
+  }
+})
+
+it('W2-2：旧误伤形态（tokenizer/secretary/.environment）参与指纹——验证有效且可持久化恢复', () => {
+  const { cwd, baseline } = fixture(), state = createPersistentTaskState(cwd, 'sensitive-narrowed', baseline)
+  mkdirSync(join(cwd, 'src'), { recursive: true })
+  for (const file of ['src/tokenizer.ts', 'src/secretary.ts', '.environment.ts']) {
+    writeFileSync(join(cwd, file), `// ${file}`)
+    state.taskLedger.record({ type: 'file_write', path: file })
+  }
+  state.taskLedger.record({ type: 'verification', command: 'npm test', status: 'passed', meta: { scope: 'full' } })
+  assert.equal(
+    getEffectiveVerifications(state.taskLedger.getEvents()).effective.length, 1,
+    '正常源码文件必须参与指纹而非作废它（旧子串判据在此全灭）',
+  )
+
+  // 持久化往返：指纹非 null 且可复算，恢复判 restored（persist 侧的 fingerprint 调用同步覆盖）。
+  const second = createPersistentTaskState(cwd, 'sensitive-narrowed', baseline)
+  assert.equal(second.recovery, 'restored', '误伤形态参与指纹后，持久化往返不得退化为 verification_stale')
+  assert.equal(second.taskLedger.getVerificationStatus(), 'verified')
+})
+
+it('W2-2 对照：真实凭据形态仍 fail-closed——上面的绿不是判据整体失灵', () => {
+  for (const path of ['.env.local', 'credentials.json', 'id_rsa', 'private.key', 'api_token.txt', 'secrets.json']) {
+    const { cwd, baseline } = fixture(), state = createPersistentTaskState(cwd, 'sensitive-kept', baseline)
+    state.taskLedger.record({ type: 'file_write', path: 'owned.ts' })
+    state.taskLedger.record({ type: 'file_write', path })
+    state.taskLedger.record({ type: 'verification', command: 'npm test', status: 'passed', meta: { scope: 'full' } })
+    assert.equal(
+      getEffectiveVerifications(state.taskLedger.getEvents()).effective.length, 0,
+      `${path} 是凭据材料：指纹不可用、验证不作为有效证据（收窄不得连带放行真实敏感形态）`,
+    )
+  }
 })

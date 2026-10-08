@@ -222,13 +222,22 @@ export function defaultKeyOf(provider: ProviderConfig): ProviderKeyConfig | unde
 
 /** 写顶层凭据槽**并同步默认 key**——池形态下请求端读的是后者，只写顶层等于没写
  *  （2026-10-08 收编公开仓 PR #381：重连后「看起来存上了、实际仍走旧的」）。
- *  patch 二者择一：providerName=内联密钥，apiKeyEnv=环境变量引用。 */
+ *  patch 二者择一：providerName=内联密钥，apiKeyEnv=环境变量引用。
+ *
+ *  Returns 被本次改写从槽位上**摘除**的 keyRef（可能有重复）。本层是纯函数层、
+ *  不碰 secrets.json——调用方须按 keyRefReferrers 判据回收孤儿 secret（惯例见
+ *  本文件 keyRefReferrers 头注：manager.setApiKeyEnv 与 provider-key-store.
+ *  updateProviderKeyCredential 共用）。不返回的话，默认 key 从 keyRef 切
+ *  apiKeyEnv 后旧 secret 永久滞留 secrets.json（2026-10-08 审查实证）。 */
 export function applyProviderCredential(
   provider: ProviderConfig,
   patch: { providerName?: string; apiKeyEnv?: string },
-): void {
+): string[] {
+  const detached: string[] = []
   const key = defaultKeyOf(provider)
   if (patch.providerName !== undefined) {
+    if (provider.keyRef && provider.keyRef !== patch.providerName) detached.push(provider.keyRef)
+    if (key?.keyRef && key.keyRef !== patch.providerName) detached.push(key.keyRef)
     provider.keyRef = patch.providerName
     ;(provider as unknown as { apiKey?: string | null }).apiKey = null
     ;(provider as unknown as { apiKeyEnv?: string | null }).apiKeyEnv = null
@@ -239,6 +248,8 @@ export function applyProviderCredential(
     }
   }
   if (patch.apiKeyEnv !== undefined) {
+    if (provider.keyRef) detached.push(provider.keyRef)
+    if (key?.keyRef) detached.push(key.keyRef)
     provider.apiKeyEnv = patch.apiKeyEnv
     ;(provider as unknown as { apiKey?: string | null }).apiKey = null
     ;(provider as unknown as { keyRef?: string | null }).keyRef = null
@@ -248,10 +259,13 @@ export function applyProviderCredential(
       key.apiKey = undefined
     }
   }
+  return detached
 }
 
 /** 模型改动**以默认 key 的池为基准**（消除顶层快照与池的历史漂移），改完用
- *  `writeModelsToDefaultKey` 同步回去——成对使用，见 setupProvider。 */
+ *  `writeModelsToDefaultKey` 同步回去——成对使用，见 setupProvider。
+ *  注意覆盖范围只有默认池：次级 key 持有的模型经这对通道往返会被复制进默认
+ *  key（路由归属被改写）——单模型编辑须先判 owner key（见 setupProvider）。 */
 export function alignModelsWithDefaultKey(provider: ProviderConfig): void {
   const key = defaultKeyOf(provider)
   if (key) provider.models = structuredClone(key.models)

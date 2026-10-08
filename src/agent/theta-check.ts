@@ -3,7 +3,6 @@ import {
   readCachedTypecheck,
   defaultCacheDir,
   isLockHeld,
-  runTypecheckShared,
   type TscRunOutcome,
   TYPECHECK_CALLER_BUDGET_MS,
 } from '../lsp/typecheck-cache.js'
@@ -143,7 +142,7 @@ export async function runThetaCheck(options: string | ThetaCheckOptions): Promis
     ? { cwd: options, timeoutMs: 15_000 }
     : options
 
-  const { cwd, triggerOnMiss = false, triggerReason } = opts
+  const { cwd, triggerOnMiss = false } = opts
 
   try {
     // 阶段 1：尝试只读消费

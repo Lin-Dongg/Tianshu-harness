@@ -585,4 +585,39 @@ describe('isPathClean — v2 claim-lease 的工作区干净判据', () => {
     assert.equal(await isPathClean(dir, 'a.txt'), true)
     assert.equal(await isPathClean(dir, 'b.txt'), false)
   })
+
+  // ignored 盲区（2026-10-08 审查实证）：.gitignore 命中的文件（.env、.rivet/plans/*）
+  // 旧探测（无 --ignored）恒返回空 → 判干净 → 对方 10 分钟未触碰即被 L2 自动接管并
+  // 覆盖，且 checkpoint 快照同盲区、无回滚兜底。ignored 文件天然无 git 保护，存在
+  // 即「对方未入版本库的内容」，失效方向选「多问少夺」：命中 `!!` 即不 clean。
+  it('ignored 文件（.gitignore 命中且已存在）→ false', async () => {
+    initRepo()
+    writeFileSync(join(dir, '.gitignore'), '.env\nplans/\n')
+    writeFileSync(join(dir, 'a.txt'), 'hello')
+    execSync('git add . && git commit -m init', { cwd: dir })
+    writeFileSync(join(dir, '.env'), 'KEY=1')
+    mkdirSync(join(dir, 'plans'), { recursive: true })
+    writeFileSync(join(dir, 'plans', 'p.md'), 'plan')
+
+    assert.equal(await isPathClean(dir, '.env'), false)
+    assert.equal(await isPathClean(dir, 'plans/p.md'), false, 'ignored 目录内的文件同样算不干净')
+    // 不误伤：未被 ignore 的干净路径、以及根本不存在于工作区的 ignored 路径仍判干净
+    assert.equal(await isPathClean(dir, 'a.txt'), true)
+    assert.equal(await isPathClean(dir, 'plans/missing.md'), true)
+  })
+
+  // Windows 反斜杠盲区（2026-10-08 审查实证）：preWriteClaimPaths 的 norm 只剥 cwd
+  // 前缀、保留入参分隔符，Windows 上认领键是 `sub\a.txt` 形；反斜杠在 git 眼里是
+  // 转义/字面字符，pathspec 恒不匹配 → 静默恒干净。POSIX 宿主上用词法同形的键
+  // 复现：不归一就探测不到真实脏文件。
+  it('Windows 反斜杠认领键 → 归一为 POSIX pathspec 后正确探测', async () => {
+    initRepo()
+    mkdirSync(join(dir, 'sub'), { recursive: true })
+    writeFileSync(join(dir, 'sub', 'a.txt'), 'hello')
+    execSync('git add . && git commit -m init', { cwd: dir })
+    writeFileSync(join(dir, 'sub', 'a.txt'), 'changed')
+
+    assert.equal(await isPathClean(dir, 'sub\\a.txt'), false, '反斜杠键形必须命中真实脏文件')
+    assert.equal(await isPathClean(dir, 'sub\\missing.txt'), true)
+  })
 })

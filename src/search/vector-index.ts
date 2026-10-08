@@ -65,6 +65,13 @@ export class VectorIndex {
     }
   }
 
+  /** Remove every vector whose id fails `keep` (rebuild-time liveness pruning). */
+  prune(keep: (id: string) => boolean): void {
+    for (const id of this.vectors.keys()) {
+      if (!keep(id)) this.vectors.delete(id)
+    }
+  }
+
   clear(): void {
     this.vectors.clear()
   }

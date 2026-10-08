@@ -48,16 +48,42 @@ export function backfillModelFromPreset(providerName: string, model: ModelConfig
   return (out as ModelConfig | undefined) ?? model
 }
 
-/** Refill every model of one provider. Same object back when unchanged. */
+/**
+ * Refill every model of one provider — **顶层快照与每个 key 池都要走一遍**。
+ *
+ * 池是契约层的事实源（contractModels 只认 keys 并集，不回退顶层），只补顶层时
+ * 池里的卡永远拿不到 preset 后来声明的能力位：用户「从接口列表添加」时建的卡
+ * （如 MiMo V2.6）就进不了识图候选——CLI settings-persist 与桌面端
+ * /config/providers 投影读的都是池。同一数组被顶层与 keys[0] 共享时按引用复用
+ * 结果，保持那份共享（迁移那刻它们就是同一个数组，见 provider-keys.ts）。
+ *
+ * Same object back when unchanged.
+ */
 export function backfillProviderFromPreset(providerName: string, provider: ProviderConfig): ProviderConfig {
   if (!isProviderPresetKey(providerName)) return provider
   let changed = false
-  const models = provider.models.map(model => {
-    const next = backfillModelFromPreset(providerName, model)
-    if (next !== model) changed = true
-    return next
+  const repaired = new Map<ModelConfig[], ModelConfig[]>()
+  const repairPool = (pool: ModelConfig[]): ModelConfig[] => {
+    const cached = repaired.get(pool)
+    if (cached) return cached
+    let poolChanged = false
+    const next = pool.map(model => {
+      const filled = backfillModelFromPreset(providerName, model)
+      if (filled !== model) poolChanged = true
+      return filled
+    })
+    if (poolChanged) changed = true
+    const out = poolChanged ? next : pool
+    repaired.set(pool, out)
+    return out
+  }
+  const models = repairPool(provider.models)
+  const keys = provider.keys?.map(key => {
+    const pool = repairPool(key.models)
+    return pool === key.models ? key : { ...key, models: pool }
   })
-  return changed ? { ...provider, models } : provider
+  if (!changed) return provider
+  return { ...provider, models, ...(keys ? { keys } : {}) }
 }
 
 /**

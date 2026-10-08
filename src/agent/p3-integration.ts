@@ -14,7 +14,6 @@ import {
 } from './hooks/physarum-file-access-hook.js'
 import {
   computeEffortReward,
-  buildEffortContext,
   isBanditGateOpen,
   type RewardInput,
   type EffortShadowRecord,
@@ -73,17 +72,6 @@ export interface ImportGraphPredictionInput {
 function physarumScoreToProbability(score: number): number {
   if (!Number.isFinite(score) || score <= 0) return 0
   return Math.min(0.9, score / (score + 1))
-}
-
-function buildContext(params: {
-  taskComplexity: number
-  errorRate: number
-  turnDepth: number
-  fileCount: number
-  isRepeat: boolean
-  timeOfDay: number
-}): number[] {
-  return buildEffortContext(params)
 }
 
 export class P3Integration {

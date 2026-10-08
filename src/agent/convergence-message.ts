@@ -22,7 +22,7 @@ interface BuiltMessage { text: string; variant: MessageVariant }
 
 export function buildInjectedMessage(
   level: 2 | 3,
-  score: number,
+  _score: number,
   signals: ConvergenceSignals,
   phaseClass: PhaseClass,
   tier: WindowTier,

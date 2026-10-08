@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { RuntimeSessionManager, type ManagedAgent, type SessionRecord } from '../session-manager.js'
 import { buildSessionRoutes } from '../session-routes.js'
-import { createRouter } from '../index.js'
+import { createRouter, startServer } from '../index.js'
 import type { AgentCallbacks } from '../../agent/loop-types.js'
 
 class Agent implements ManagedAgent {
@@ -89,6 +89,34 @@ test('title-generation route is authenticated and protects a concurrent manual r
   assert.equal((await pending).status, 200)
   assert.equal(manager.getSession(rec.id)?.title, 'Manual choice')
   agent.finish?.(); await manager.shutdownAll()
+})
+
+test('title-generation route stays fail-open when the session agent cannot be built (cwd removed)', async t => {
+  // cwd 已删的遗留会话：懒建 agent 必抛。该特性其余路径全部 fail-open，路由不得
+  // 因此 500——钉住「200 + fallback 标题 + failed 态」的降级形态（真实 HTTP，
+  // 走 startServer 的异常兜底链）。
+  const rec: SessionRecord = { id: 'gone-cwd', cwd: '/removed', status: 'idle', createdAt: 1, updatedAt: 1, lastSeq: 1, pendingApprovals: 0, model: 'old:model', title: '', titleGenerationAttempts: 0 }
+  const saved: SessionRecord[] = [], completions: string[] = []
+  const manager = new RuntimeSessionManager({ defaultCwd: '/tmp', defaultModelId: 'default:model',
+    createAgent: () => Promise.reject(new Error('cwd no longer exists')),
+    // agent 从未建成 → 无 stores → 与生产一致地拿不到模型候选。
+    resolveGoalHandles: () => undefined,
+    titleCompletion: ref => { completions.push(ref); return async () => 'must not be used' },
+    persistence: { saveRecord: r => saved.push({ ...r }), appendEvent: () => {}, loadAll: () => [], loadRecords: () => [rec], loadEvents: () => [],
+      loadEventsAsync: async () => [{ seq: 1, ts: 1, type: 'user', data: { text: 'Original request' } }] },
+  })
+  const server = await startServer(0, buildSessionRoutes(manager, 'test-auth'), 'test-auth')
+  t.after(() => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())))
+  const res = await fetch(`http://127.0.0.1:${server.port}/sessions/${rec.id}/title-generation`, { method: 'POST', headers: { authorization: 'Bearer test-auth' } })
+  assert.equal(res.status, 200, 'cwd 失效的会话不得 500')
+  assert.deepEqual(await res.json(), { ok: true })
+  assert.deepEqual(completions, [], 'agent 建不起来时没有模型候选')
+  const final = manager.getSession(rec.id)
+  assert.equal(final?.title, 'Original request', '降级落 fallback 标题而不是报错')
+  assert.equal(final?.titleSource, 'fallback')
+  assert.equal(final?.titleGenerationState, 'failed', '如实标记失败，不静默吞掉')
+  assert.ok(saved.some(r => r.titleGenerationState === 'failed'))
+  await manager.shutdownAll()
 })
 
 

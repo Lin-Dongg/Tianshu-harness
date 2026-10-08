@@ -621,3 +621,55 @@ describe('gemini preset (Google Gemini 原生协议, issue #339)', () => {
     assert.ok(preset.provider.models.some(m => m.tier === 'strong'), '必须留有 strong 档落点')
   })
 })
+
+// ── issue #386：MiMo V2.6 Flash / Pro 进 fleet ──────────────────────────────
+// 官方模型列表（mimo.mi.com/docs/quick-start/summary/model，更新 2026-10-08）：
+// mimo-v2.6-pro / mimo-v2.6-flash = 文本生成 + 全模态理解（图像输入）+ 深度思考 /
+// 函数调用 / 结构化输出，1M 上下文 / 128K 输出；mimo-v2.5-pro、mimo-v2.5 将于
+// 北京时间 2026-10-21 10:00 下线。两个预设（Token Plan 与按量 API）都覆盖 V2.6。
+describe('mimo presets include V2.6 (issue #386)', () => {
+  it('Token Plan 与按量 API 两个预设都收录 V2.6 Flash / Pro（1M / 128K / 图像输入）', () => {
+    for (const key of ['mimo', 'mimo-api'] as const) {
+      const preset = PROVIDER_PRESETS[key]
+      for (const id of ['mimo-v2.6-pro', 'mimo-v2.6-flash']) {
+        const model = preset.provider.models.find(m => m.id === id)
+        assert.ok(model, `${key} 预设必须收录 ${id}`)
+        assert.equal(model.contextWindow, 1_000_000, `${id} 官方上下文 1M`)
+        assert.equal(model.maxTokens, 128_000, `${id} 官方最大输出 128K`)
+        assert.equal(model.supportsVision, true, `${id} 官方全模态：图像输入`)
+        assert.ok(model.tier !== undefined, `${id} 需要 tier（worker 分池）`)
+      }
+      // V2.5 条目保留（存量用户仍在用），但在 10-21 前要被 V2.6 取代
+      assert.ok(preset.provider.models.some(m => m.id === 'mimo-v2.6-pro'))
+      assert.match(preset.description, /V2\.6/, '预设描述必须让用户看到 V2.6 已可选')
+    }
+  })
+
+  it('官方定价（海外刊例价，USD/百万 tokens，2026-10-08）', () => {
+    const pro = PROVIDER_PRESETS.mimo.provider.models.find(m => m.id === 'mimo-v2.6-pro')!
+    assert.deepEqual(pro.pricing, { input: 0.435, output: 0.87, cacheRead: 0.0036, cacheWrite: 0.435 })
+    const flash = PROVIDER_PRESETS.mimo.provider.models.find(m => m.id === 'mimo-v2.6-flash')!
+    assert.deepEqual(flash.pricing, { input: 0.14, output: 0.28, cacheRead: 0.0028, cacheWrite: 0.14 })
+    assert.equal(pro.tier, 'strong')
+    assert.equal(flash.tier, 'cheap')
+  })
+
+  it('全模态声明随 fleet 进别名表：探测拉到的 V2.6 命中 supportsVision（不再漏勾）', () => {
+    for (const id of ['mimo-v2.6-pro', 'mimo-v2.6-flash']) {
+      const entry = MODEL_ALIAS_TABLE.find(e => e.canonicalId === id)
+      assert.ok(entry, `${id} 必须在别名表（fleet 是其来源）`)
+      assert.equal(entry.metadata.supportsVision, true)
+      assert.equal(entry.metadata.contextWindow, 1_000_000)
+      assert.equal(entry.metadata.maxTokens, 128_000)
+    }
+  })
+
+  it('刻意不声明 reasoningSplit（MiMo 预设未声明该能力，带上会让 openai-client 注入 reasoning_split）', () => {
+    for (const id of ['mimo-v2.6-pro', 'mimo-v2.6-flash']) {
+      for (const key of ['mimo', 'mimo-api'] as const) {
+        const model = PROVIDER_PRESETS[key].provider.models.find(m => m.id === id)!
+        assert.equal(model.capabilities?.reasoningSplit, undefined, `${key}/${id}`)
+      }
+    }
+  })
+})

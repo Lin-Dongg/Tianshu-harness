@@ -8,7 +8,7 @@
  * Uses a lag window (only evaluates results ≥ LAG steps old) to avoid
  * pruning content the model is still actively using.
  */
-import type { OaiMessage, OaiAssistantMessage, OaiToolCall } from '../api/oai-types.js'
+import type { OaiMessage, OaiAssistantMessage } from '../api/oai-types.js'
 import { CACHE_ANCHOR_MESSAGES } from './constants.js'
 import { parseOptionalInt, rangeContains } from './shared-range.js'
 

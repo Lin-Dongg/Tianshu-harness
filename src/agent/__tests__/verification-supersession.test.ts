@@ -276,4 +276,22 @@ describe('getEffectiveVerifications — deduplicate by (command, scope) key', ()
     assert.equal(result.staleFingerprintDropped, 1, '指纹不可用的丢弃必须计数（否则病因报成"没跑过测试"）')
     assert.equal(result.staleSnapshotDropped, 0, '与 snapshotRef 陈旧是不同病因，不得混计')
   })
+
+  it('W2-1b：staleFingerprintDropped 统计所有 stale 判废，不挑病因（计数语义锁定，4251eea67 审查 P2）', () => {
+    // 语义锁定：该计数 = 所有 meta.stale 丢弃。典型病因两类——① 仓内再编辑（正常
+    // 开发循环的良性多数，带 workspaceFingerprint 的判废）；② 指纹不可计算（无
+    // workspaceFingerprint 的判废）。两类都必须计入，否则注释里的"两类病因"是空话。
+    const events: TaskLedgerEvent[] = [
+      { type: 'file_write', timestamp: 500, path: 'src/a.ts' },
+      // 病因②：指纹不可计算形态（无 workspaceFingerprint）
+      makeVerificationEvent('npm test', 'passed', 'full', 1000, { stale: true }),
+      // 病因①：仓内再编辑形态（带 workspaceFingerprint 的判废）
+      makeVerificationEvent('npx tsx --test src/a.test.ts', 'passed', 'targeted', 1500, { stale: true, workspaceFingerprint: 'abc123' }),
+      makeVerificationEvent('npx tsc --noEmit', 'passed', 'full', 2000),
+    ]
+    const result = getEffectiveVerifications(events)
+    assert.equal(result.effective.length, 1, '两条 stale 验证都被丢弃')
+    assert.equal(result.staleFingerprintDropped, 2, '所有 stale 丢弃都计入，不挑病因')
+    assert.equal(result.staleSnapshotDropped, 0)
+  })
 })

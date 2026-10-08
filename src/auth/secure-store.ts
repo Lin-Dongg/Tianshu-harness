@@ -52,6 +52,7 @@ export interface SecretCipher {
   encrypt(plain: Buffer): Buffer
   /** 解密失败返回 null（密文被篡改 / 换了机器 / 密钥丢失），调用方按「无凭据」处理。 */
   decrypt(blob: Buffer): Buffer | null
+  decryptForBackend?(blob: Buffer, backend: SecretBackend): Buffer | null
 }
 
 const warned = new Set<string>()
@@ -114,7 +115,7 @@ function plaintextCipher(): SecretCipher {
 
 // ── 平台密钥库 ────────────────────────────────────────────────────────
 
-function keychainKey(): Buffer | null {
+function keychainKey(create: boolean): Buffer | null {
   const account = process.env.USER || process.env.USERNAME || userInfo().username || 'rivet'
   const args = ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-a', account, '-w']
   try {
@@ -124,18 +125,24 @@ function keychainKey(): Buffer | null {
   } catch {
     /* 未找到 → 下面创建 */
   }
+  if (!create) return null
   const fresh = randomBytes(32)
   try {
     execFileSync(
       'security',
-      ['add-generic-password', '-U', '-s', KEYCHAIN_SERVICE, '-a', account, '-w', fresh.toString('hex')],
+      ['add-generic-password', '-s', KEYCHAIN_SERVICE, '-a', account, '-w', fresh.toString('hex')],
       { encoding: 'utf8', timeout: 10_000, windowsHide: true }
     )
     return fresh
-  } catch (err) {
+  } catch {
+    // Another process may have created the item. Never replace an existing key.
+    try {
+      const key = Buffer.from(execFileSync('security', args, { encoding: 'utf8', timeout: 10_000, windowsHide: true }).trim(), 'hex')
+      if (key.length === 32) return key
+    } catch {}
     warnOnce(
       'keychain-unavailable',
-      `[secure-store] 钥匙串不可用（${(err as Error).message}），回退到本机密钥文件（仅混淆，不是安全边界）`
+      '[secure-store] 钥匙串不可用，保留已有密钥；新凭据回退到本机密钥文件（仅混淆，不是安全边界）'
     )
     return null
   }
@@ -158,44 +165,55 @@ function dpapiCall(data: Buffer, mode: 'Protect' | 'Unprotect'): Buffer {
   return Buffer.from(out.trim(), 'base64')
 }
 
-function dpapiKey(dir: string): Buffer | null {
+function dpapiKey(dir: string, create: boolean): Buffer | null {
   const path = join(dir, DPAPI_KEY_FILE)
   try {
     if (existsSync(path)) {
       const key = dpapiCall(Buffer.from(readFileSync(path, 'utf8').trim(), 'base64'), 'Unprotect')
       if (key.length === 32) return key
+      return null
     }
+    if (!create) return null
     const fresh = randomBytes(32)
     const sealed = dpapiCall(fresh, 'Protect')
     mkdirSync(dir, { recursive: true })
-    writeFileSync(path, sealed.toString('base64'), { mode: 0o600 })
+    writeFileSync(path, sealed.toString('base64'), { mode: 0o600, flag: 'wx' })
     return fresh
-  } catch (err) {
+  } catch {
     warnOnce(
       'dpapi-unavailable',
-      `[secure-store] DPAPI 不可用（${(err as Error).message}），回退到本机密钥文件（仅混淆，不是安全边界）`
+      '[secure-store] DPAPI 不可用，保留已有密钥；新凭据回退到本机密钥文件（仅混淆，不是安全边界）'
     )
     return null
   }
 }
 
-function localKey(dir: string): Buffer {
+function localKey(dir: string, create: boolean): Buffer | null {
   const path = join(dir, LOCAL_KEY_FILE)
   try {
-    if (existsSync(path)) {
-      const raw = readFileSync(path, 'utf8').trim()
-      // 老格式兜底：也接受 base64
-      const key = Buffer.from(raw, 'hex')
-      if (key.length === 32) return key
-      const b64 = Buffer.from(raw, 'base64')
-      if (b64.length === 32) return b64
+    const raw = readFileSync(path, 'utf8').trim()
+    // 老格式兜底：也接受 base64
+    const key = Buffer.from(raw, 'hex')
+    if (key.length === 32) return key
+    const b64 = Buffer.from(raw, 'base64')
+    if (b64.length === 32) return b64
+    if (create) throw new Error('Existing credential key is invalid; refusing to overwrite it')
+    return null
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      if (create) throw new Error('Existing credential key is unreadable; refusing to overwrite it')
+      return null
     }
-  } catch {
-    /* 重新生成 */
   }
+  if (!create) return null
   const fresh = randomBytes(32)
   mkdirSync(dir, { recursive: true })
-  writeFileSync(path, fresh.toString('hex'), { mode: 0o600 })
+  try {
+    writeFileSync(path, fresh.toString('hex'), { mode: 0o600, flag: 'wx' })
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return localKey(dir, false)
+    throw error
+  }
   try {
     chmodSync(path, 0o600)
   } catch {
@@ -211,8 +229,8 @@ const cipherCache = new Map<string, SecretCipher>()
 /**
  * 取（必要时创建）指定目录下的数据密钥并返回可用 cipher。
  * 同一进程内按目录缓存：避免每次读写 token 都 spawn 一次 security/powershell。
- * 密钥库不可用时**依次降级**，永远返回一个可用 cipher（绝不让鉴权功能因加密
- * 不可用而整体挂掉）——降级会打一条 warn 说明安全等级下降。
+ * 新凭据写入可降级；解密只读取既有密钥，不创建或替换。后端随信封解析，
+ * 既有密钥不可读时保留文件，等待密钥库恢复，不把暂时不可用变成永久丢失。
  */
 export function createSecretCipher(baseDir: string, backend: SecretBackend = resolveSecretBackend()): SecretCipher {
   const cacheKey = `${backend}\u0000${baseDir}`
@@ -232,18 +250,26 @@ export function createSecretCipher(baseDir: string, backend: SecretBackend = res
     // 有些目录（如只读的安装目录、别人的 home）连读都不该碰；早期版本在构造
     // 时就写密钥文件，直接让「只是查询凭据是否存在」的调用产生了副作用。
     let inner: SecretCipher | null = null
-    const ensure = (): SecretCipher => {
-      if (inner) return inner
+    let retryReadAfter = 0
+    const ensure = (create: boolean): SecretCipher | null => {
+      if (inner && (create || inner.backend === backend)) return inner
+      if (!create && Date.now() < retryReadAfter) return null
       let key: Buffer | null = null
       // 实际生效的后端：密钥库失败降级到本机密钥文件时必须如实反映，否则信封
       // 里的 `b` 字段会撒谎，排障时会误判安全等级。
       let actual: SecretBackend = backend
-      if (backend === 'keychain') key = keychainKey()
-      else if (backend === 'dpapi') key = dpapiKey(baseDir)
+      if (backend === 'keychain') key = keychainKey(create)
+      else if (backend === 'dpapi') key = dpapiKey(baseDir, create)
       if (!key) {
+        if (!create && backend !== 'local-key') {
+          // One locked vault must not spawn once for every configured model.
+          retryReadAfter = Date.now() + 5000
+          return null
+        }
         actual = 'local-key'
-        key = localKey(baseDir)
+        key = localKey(baseDir, create)
       }
+      if (!key) return null
       inner = aesGcmCipher(key, actual)
       return inner
     }
@@ -251,10 +277,15 @@ export function createSecretCipher(baseDir: string, backend: SecretBackend = res
       get backend(): SecretBackend {
         return inner ? inner.backend : backend
       },
-      encrypt: (plain) => ensure().encrypt(plain),
-      decrypt: (blob) => ensure().decrypt(blob),
+      encrypt: (plain) => {
+        const resolved = ensure(true)
+        if (!resolved) throw new Error('Credential key is unavailable')
+        return resolved.encrypt(plain)
+      },
+      decrypt: (blob) => ensure(false)?.decrypt(blob) ?? null,
     }
   }
+  cipher.decryptForBackend = (blob, storedBackend) => createSecretCipher(baseDir, storedBackend).decrypt(blob)
   cipherCache.set(cacheKey, cipher)
   return cipher
 }
@@ -300,7 +331,12 @@ export function decodeSecret(cipher: SecretCipher, raw: string): string | null {
     // 旧格式：明文 JSON 凭据。原样返回，下次 save 自动升级成密文。
     return raw
   }
-  const decrypted = cipher.decrypt(Buffer.from(env.d as string, 'base64'))
+  const blob = Buffer.from(env.d as string, 'base64')
+  const storedBackend = env.b
+  const knownBackend = storedBackend === 'keychain' || storedBackend === 'dpapi' || storedBackend === 'local-key'
+  const decrypted = knownBackend && cipher.decryptForBackend
+    ? cipher.decryptForBackend(blob, storedBackend)
+    : cipher.decrypt(blob)
   if (!decrypted) {
     warnOnce(
       `decrypt-failed:${cipher.backend}`,

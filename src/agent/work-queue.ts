@@ -1,6 +1,5 @@
 import type { WorkOrder } from './work-order.js'
 import { classifyProfile } from './coordination-policy.js'
-import type { AgentRole } from './coordination-policy.js'
 
 export interface QueueEntry {
   order: WorkOrder
@@ -59,7 +58,7 @@ export class WorkOrderQueue {
     // Per-role concurrency check: count in-flight workers by role
     let exploreInFlight = 0
     let writeInFlight = 0
-    for (const [id, order] of this.inFlightOrders) {
+    for (const [, order] of this.inFlightOrders) {
       const role = classifyProfile(order.profile)
       if (role === 'hands') writeInFlight++
       else exploreInFlight++

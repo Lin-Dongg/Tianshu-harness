@@ -6,7 +6,6 @@ type PlanStepLike = PlanStepInput | string
 import { correctPlan, injectReplanContext, type ReplanPalContext } from './replan-loop.js'
 import { chooseDiscriminator } from './problem-attack-loop.js'
 import type { ProblemAttackStore } from './problem-attack-loop.js'
-import { wrapSystemReminder } from '../prompt/system-reminder.js'
 import type { TaskDepthLayer } from '../context/task-contract.js'
 
 export interface PlanTraceCoordinatorDeps {

@@ -3,7 +3,7 @@ import { createHash } from 'crypto'
 import { relative } from 'node:path'
 import type { Tool, ToolCallParams } from './types.js'
 import { validatePath } from './path-validate.js'
-import { syntaxCheck, checkSyntax } from './syntax-check.js'
+import { checkSyntax } from './syntax-check.js'
 import { detectPointerPlaceholder, pointerPlaceholderError, resolveIdempotentPointer } from './pointer-guard.js'
 import { asBool } from './write-tool-helpers.js'
 import { getFileReadContentHash, noteFileObserved, recordSuccessfulEdit, incrementEditFailCount, resetEditFailCount } from './read-file.js'
@@ -57,16 +57,6 @@ export function buildFreshAnchors(newFileLines: string[], editStart0: number, ne
     parts.push(lineWithContent(editStart0 + newLineCount))
   }
   return parts.length > 0 ? `\n新鲜锚点（链式安全）：\n${parts.join('\n')}` : ''
-}
-
-/** Post-write syntax check that never throws — file is already on disk. */
-async function safeSyntaxCheck(filePath: string, content: string): Promise<string> {
-  try {
-    const result = await syntaxCheck(filePath, content)
-    return result ?? ''
-  } catch (e) {
-    return `(语法检查已跳过： ${(e as Error).message})`
-  }
 }
 
 /**

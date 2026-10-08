@@ -470,9 +470,6 @@ function computeAutoReviewBudget(change: ChangeSet): { maxTurns: number; timeout
   return { maxTurns: 36, timeoutMs: 480_000 }
 }
 
-const FALLBACK_MAX_TURNS = 28
-const FALLBACK_TIMEOUT_MS = 360_000
-
 /** 早收敛预算计划 — 按规模分级:
  *  小改动(≤15轮)强收敛——禁止扩散探索,强制半数轮次前产出草案;
  *  大改动宽松——保留分页约束和收尾期限。
@@ -498,24 +495,6 @@ function earlyConvergenceHint(maxTurns: number, timeoutMs: number): string {
     `3) 第 ${draftDeadline} 轮前产出结论草案;`,
     `4) 第 ${finalDeadline} 轮停止一切探索,输出 verdict JSON——未覆盖项显式标注,best-effort 结论优于无结论。`,
   ].join('\n')
-}
-
-function wiringReviewerRequest(change: ChangeSet, options: CoordinatorReviewDepsOptions): DelegationRequest {
-  const wiring = INSPECTORS.find(i => i.name === '接线审查')!
-  const budget = computeAutoReviewBudget(change)
-  return {
-    ...request({
-      change,
-      options,
-      kind: 'review',
-      profile: 'reviewer',
-      objective: [
-        inspectorObjective(wiring, change),
-        earlyConvergenceHint(budget.maxTurns, budget.timeoutMs),
-      ].join('\n'),
-    }),
-    budget,
-  }
 }
 
 export function createCoordinatorReviewDeps(

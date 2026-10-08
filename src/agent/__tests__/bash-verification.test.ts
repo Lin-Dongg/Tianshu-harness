@@ -164,6 +164,75 @@ describe('非 JavaScript 生态 runner（dotnet / maven / gradle）', () => {
     assert.equal(inferBashVerificationScope('gradlew.bat clean build').scope, 'full')
     assert.equal(inferBashVerificationScope('mvnw.cmd test').scope, 'full')
   })
+
+  it('Maven 反应堆选择器与测试跳过标志降级 unknown（#380 收尾：子集/零测试不得冒充全量）', () => {
+    // 失效方向：这些形态此前全部误判 {full, test}——多模块仓局部测试被记为全量
+    // 证据、跳过执行被记为测试覆盖，是交付门禁的过度举证（错误的一侧）。
+    for (const command of [
+      'mvn -pl module-a test',
+      'mvn -pl module-a -am test',
+      'mvn -pl module-a -amd test',
+      'mvn --projects module-a,module-b verify',
+      'mvn -pl :artifact-id test',
+      'mvn -rf module-b test',
+      'mvn --resume-from module-b test',
+      'mvn test -Dmaven.test.skip=true',
+      'mvn test -Dmaven.test.skip.exec=true',
+      'mvn test -DskipTests',
+      'mvn test -DskipTests=true',
+      'mvn verify -DskipITs',
+    ]) {
+      const inferred = inferBashVerificationScope(command)
+      assert.equal(inferred.kind, 'test', command)
+      assert.equal(inferred.scope, 'unknown', command)
+    }
+    // 不选择测试的全局选项不得被误降级：-P 是 profile 激活，--parallel 是并行开关
+    // （前缀含 -pl/-p 字样但不是选择器）。
+    assert.equal(inferBashVerificationScope('mvn clean test -Pproduction').scope, 'full')
+    assert.equal(inferBashVerificationScope('gradle --parallel test').scope, 'full')
+  })
+
+  it('模块任务路径与 plugin:goal 直调入账（#380 收尾：多模块最常见形态不再静默漏记）', () => {
+    // gradle 模块限定与 mvn -pl 同义——反应堆子集：入账（kind 正确）但 scope unknown
+    for (const [command, kind] of [
+      ['./gradlew :app:test', 'test'],
+      ['./gradlew :app:testDebugUnitTest', 'test'],
+      ['gradle :app:build', 'build'],
+      ['gradle :core:lib:check', 'check'],
+    ] as Array<[string, string]>) {
+      const inferred = inferBashVerificationScope(command)
+      assert.equal(isVerificationCommand(command), true, command)
+      assert.equal(inferred.kind, kind, command)
+      assert.equal(inferred.scope, 'unknown', command)
+    }
+    // maven plugin:goal 未限定反应堆 = 未过滤直调 → full
+    assert.deepEqual(inferBashVerificationScope('mvn surefire:test'), { scope: 'full', kind: 'test' })
+    assert.deepEqual(inferBashVerificationScope('mvn checkstyle:check'), { scope: 'full', kind: 'check' })
+    assert.deepEqual(inferBashVerificationScope('mvn compiler:compile'), { scope: 'full', kind: 'build' })
+    // 裸 gradle camelCase 任务未限定模块 = 全反应堆执行 → full
+    assert.deepEqual(inferBashVerificationScope('gradle testDebugUnitTest'), { scope: 'full', kind: 'test' })
+    // 模块限定 / plugin:goal 叠加既有选择、跳过标志仍降级
+    assert.equal(inferBashVerificationScope('./gradlew :app:test -DskipTests').scope, 'unknown')
+    assert.equal(inferBashVerificationScope('mvn surefire:test -Dtest=CacheTest').scope, 'unknown')
+    // 复合 shell 里的模块任务保留验证意图（管道拿不到逐文件证明 → unknown 而非消失）
+    assert.equal(isVerificationCommand('./gradlew :app:test | tail -5'), true)
+    assert.equal(inferBashVerificationScope('./gradlew :app:test | tail -5').scope, 'unknown')
+  })
+
+  it('冒号词法不误伤：Windows 盘符、-pl 参数值、只编译不跑的 goal、连字符 goal', () => {
+    // 盘符属性值不制造虚假验证记录（`C:test` 的冒号前是分隔符+单字母，不是任务语法）
+    assert.equal(isVerificationCommand('mvn -Dtest.dir=C:test'), false)
+    assert.equal(isVerificationCommand('gradle -Pdir=C:build'), false)
+    // 带盘符参数的真实全量调用识别不受影响
+    assert.deepEqual(inferBashVerificationScope('mvn -Dmaven.repo.local=C:\\m2\\repo test'), { scope: 'full', kind: 'test' })
+    // -pl 的参数值带冒号不算目标词（纯 `-pl a:b` 无 goal 本就不是验证）；`-pl` 本身降级
+    assert.equal(isVerificationCommand('mvn -pl a:b'), false)
+    assert.equal(inferBashVerificationScope('mvn -pl a:b test').scope, 'unknown')
+    // compiler:testCompile 只编译不跑测试——camelCase 续写不给 plugin:goal，不得伪造 test 覆盖
+    assert.equal(isVerificationCommand('mvn compiler:testCompile'), false)
+    // 连字符 goal（dependency:build-classpath）不是精确目标词，不误判为 build
+    assert.equal(isVerificationCommand('mvn dependency:build-classpath'), false)
+  })
 })
 
 it('批处理 runner 被管道/复合包裹时不致静默消失——保留验证意图（记 blocked 并给单条建议）', () => {

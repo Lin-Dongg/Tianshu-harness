@@ -104,7 +104,7 @@ export const TYPECHECK_CALLER_BUDGET_MS = STALE_LOCK_MS + 3 * 60_000
  * `RIVET_TYPECHECK_SHARE=0`（与共享锁同一逃生口）下闸门不生效，原样返回。
  */
 /** 测试运行的专用闸门预算。全量约 52s，5 分钟足以吸收冷启动与 CPU 竞争。
- *  **有界是刻意的**：不给它 `TYPECHECK_CALLER_BUDGET_MS` 那 13 分钟——后者长是因为
+ *  **有界是刻意的**：不给它 `TYPECHECK_CALLER_BUDGET_MS` 那 8 分钟——后者长是因为
  *  要等跨进程共享锁排队，测试不参与那把锁。 */
 export const TEST_RUNNER_CALLER_BUDGET_MS = 5 * 60_000
 
@@ -138,7 +138,7 @@ export const TYPECHECK_TIMEOUT_HINT =
  * 场景没生效（2026-09-25 二修）。
  *
  * 余量给内层「杀进程树（SIGTERM → 3s 后 SIGKILL）→ 整理输出 → 返回」留时间；
- * 30s 相对 13 分钟的总预算不到 4%，不会把兜底拖成实质失效。
+ * 30s 相对 8 分钟的总预算约 6%，不会把兜底拖成实质失效。
  */
 export const TYPECHECK_WATCHDOG_MARGIN_MS = 30_000
 
@@ -397,6 +397,13 @@ export function tryAcquireLock(
     return {
       release: () => {
         try {
+          // 锁可能已被超龄接管（等待循环的即时接管 / tryAcquireLock 的夺锁）：
+          // 目录还在但 owner 已换成新持有者，此时无条件 rm 会误删别人的锁，被
+          // 串行化的并发重新失控。只在能确认 owner 仍是本次获取（pid + startedAt
+          // 与写入时一致）时才清；owner 读不出（自己建立时写入失败的窄窗口）按
+          // 本持有者处理——反向误判会把自己的锁泄漏到超龄兜底。
+          const current = readLockOwner(cacheDir)
+          if (current && (current.pid !== owner.pid || current.startedAt !== owner.startedAt)) return
           rmSync(dir, { recursive: true, force: true })
         } catch {
           /* 清不掉就留给陈旧检测兜底 */

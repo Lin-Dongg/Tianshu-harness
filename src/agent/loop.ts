@@ -45,7 +45,7 @@ import { planConvergenceEmit } from './convergence-emit-gate.js'
 import { createFrameRecorder } from './frame-telemetry.js'
 import type { FrameRecorder } from './frame-telemetry.js'
 import { emitStopReason, stopReasonAbortTag, type StopReason } from './stop-reason.js'
-import type { PlanExecutionTrace, StepResult } from './plan-execution-trace.js'
+import type { PlanExecutionTrace } from './plan-execution-trace.js'
 import { buildGateConvergenceHint } from './delivery-gate-v2.js'
 import { RoutingMetricsCollector } from '../model/routing-metrics.js'
 import type { ImportGraph } from './import-graph.js'
@@ -101,7 +101,6 @@ import type { FsWatcherState } from '../context/fs-watcher.js'
 import { watchConfigForHooks } from '../config/config-watcher.js'
 import type { ConfigWatcherHandle } from '../config/config-watcher.js'
 import { type CognitivePhaseSnapshot } from '../context/cognitive-ledger.js'
-import { buildRuntimeSelfModel } from './runtime-self-model.js'
 import { CacheAdvisor } from '../cache/advisor.js'
 import type { RecallMetricsSummary } from '../cache/recall-metrics.js'
 import { createSycophancyTrap, type SycophancyTrap } from './sycophancy-trap.js'
@@ -125,7 +124,7 @@ import { dispatchUserImages } from './user-image-dispatch.js'
 import { drainSidePathUsage } from './side-path-usage-recorder.js'
 import { ImageRegistry } from './image-registry.js'
 import { createStanceTally } from './stance-tally.js'
-import { createVirtuePendingLedger, type VirtuePendingLedger, computeVirtueCredit } from './virtue-signals.js'
+import { createVirtuePendingLedger, computeVirtueCredit } from './virtue-signals.js'
 import { createFailureJournal, type FailureJournal } from './failure-journal.js'
 import type { Pheromone } from '../context/stigmergy.js'
 import type { PrefixFingerprint } from '../prompt/fingerprint.js'
@@ -1251,11 +1250,6 @@ export class AgentLoop {
     }
   }
 
-  /** U6: build a StepResult from the tool events recorded for a given turn. */
-  private buildStepResultFromTurn(turn: number): StepResult | null {
-    return this.planTraceCoordinator.buildStepResultFromTurn(turn)
-  }
-
   /**
    * S2 CCR 可达性：用户边界（新任务/用户干预）重置连续只读流水。
    * 由 turn-step-producer 的 user 消息入口调用——上一段排查的只读流水不是
@@ -1558,7 +1552,7 @@ export class AgentLoop {
     // 用户已显式选档（/effort max 等）→ 程序化调整（perception strategy、
     // autoReasoning 档位）不得覆盖，保护显式用户意图。
     if (source === 'programmatic' && this.userReasoningOverride) return
-    this.reasoningEffort.set(effort)
+    this.reasoningEffort.set(effort, source)
   }
 
   shadowEffortTelemetry(
@@ -2820,7 +2814,6 @@ export class AgentLoop {
     // self-verify 债龄计数共用），语义不变：验证失败过或未验证编辑 ≥3。
     // 不用「存在任何未验证编辑」——正常的编辑→验证节奏会瞬时经过该状态，
     // 拿它 hardTighten 等于取消 P1 对健康构建流的保护。
-    const gateState = this.evidence.getGateState()
     const hasVerificationDebt = this.evidence.hasVerificationDebt()
 
     return assembleCognitiveFrame({

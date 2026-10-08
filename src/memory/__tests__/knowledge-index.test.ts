@@ -11,6 +11,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { KnowledgeIndex, recencyBoost } from '../knowledge-index.js'
 import { appendMemoryEntry, supersedeMemoryEntry } from '../unified-memory.js'
+import type { EmbeddingProvider } from '../../search/embedding-provider.js'
 
 // 信任门族（2026-10-07 审计修复）：KnowledgeIndex 现带信任门——本文件验「授信项目
 // 的知识检索」正常语义（检索契约全覆盖）；未授信拒绝语义在
@@ -164,5 +165,65 @@ describe('knowledge-index', () => {
     const hits = await idx.search('pagination bounds', { excludeSessionIds: ['session-a'] })
     assert.ok(hits.length >= 1)
     assert.ok(hits.every(h => h.entry?.sessionId !== 'session-a'), '在线会话条目不得进入召回')
+  })
+})
+
+describe('knowledge-index 向量层存活对账（撤信/缩编后无陈旧 id 穿透）', () => {
+  let cwd: string
+
+  beforeEach(() => {
+    cwd = mkdtempSync(join(tmpdir(), 'rivet-kidx-vec-'))
+  })
+
+  /** 全正向量 embedder：任何 chunk 与 query 的 cosine 恒为 1——向量分支必然召回全部已建向量，
+   *  陈旧 id 一旦残留必穿透到命中映射（缺牙风险归零）。 */
+  const uniformEmbedder = (): EmbeddingProvider => ({
+    id: 'test-uniform',
+    isAvailable: () => true,
+    embed: async texts => texts.map(() => [1, 0]),
+  })
+
+  it('运行中撤信：向量层不残留，search 不抛错且返回空；复信后召回恢复', async () => {
+    const dir = join(cwd, '.rivet', 'knowledge')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'guide.md'), '# Guide\n\nzqxvector revocation probe chunk.\n')
+    appendMemoryEntry(cwd, {
+      text: 'zqxvector revocation probe entry',
+      kind: 'finding', confidence: 0.9, source: 'manual', status: 'verified', tags: [],
+    })
+
+    const idx = new KnowledgeIndex(cwd, uniformEmbedder())
+    const before = await idx.search('zqxvector')
+    assert.ok(before.length >= 1, '授信时向量层建好后应能召回')
+
+    // 运行中撤信（trust-api 的 untrustProject 同款效果：指纹 trust 位翻转 → rebuild → maps 清空）。
+    // 旧缺陷：vectors 刻意不清，陈旧 id 经 passesFilters 放行后在 mdChunksById.get(id)! 处 TypeError。
+    process.env.RIVET_TRUST_PROJECT = '0'
+    try {
+      const revoked = await idx.search('zqxvector')
+      assert.deepEqual(revoked, [], '撤信后 maps 全空，向量层不得有陈旧 id 穿透到命中映射')
+    } finally {
+      process.env.RIVET_TRUST_PROJECT = '1'
+    }
+
+    const restored = await idx.search('zqxvector')
+    assert.ok(restored.length >= 1, '复信后指纹翻转重建，召回恢复')
+  })
+
+  it('md 缩编：陈旧 chunk 向量被对账剔除（与撤信同族——挡住"只在撤信时清向量"的半截修复）', async () => {
+    const dir = join(cwd, '.rivet', 'knowledge')
+    mkdirSync(dir, { recursive: true })
+    const mdPath = join(dir, 'guide.md')
+    // 35 行 → 两个 chunk（MD_CHUNK_LINES=30）：kmd:guide.md:0 与 kmd:guide.md:30
+    writeFileSync(mdPath, Array.from({ length: 35 }, (_, i) => `zqxshrink line ${i}`).join('\n') + '\n')
+
+    const idx = new KnowledgeIndex(cwd, uniformEmbedder())
+    assert.ok((await idx.search('zqxshrink')).length >= 1)
+
+    // 缩编到一个 chunk：kmd:guide.md:30 的向量若残留，命中映射处同样 TypeError
+    writeFileSync(mdPath, 'zqxshrink only chunk\n')
+    const hits = await idx.search('zqxshrink')
+    assert.ok(hits.length >= 1)
+    assert.ok(hits.every(h => h.file === 'guide.md'))
   })
 })

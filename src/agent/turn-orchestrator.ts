@@ -336,7 +336,7 @@ export interface TurnOrchestratorDeps {
 export function wrapCallbacksWithHeartbeat(
   cb: AgentCallbacks,
   hb: TurnHeartbeat,
-  getSessionId?: () => string | undefined,
+  _getSessionId?: () => string | undefined,
 ): AgentCallbacks {
   // #334：静默恢复补报——心跳上报过静默后，首个可见事件补发 working 相位（防客户端静默显示粘滞到下次相位切换）。
   const resumeIfSilent = (): void => { if (hb.hasFiredSinceTick()) cb.onPhaseChange?.('working', { reason: 'resumed — activity detected' }) }
@@ -491,7 +491,7 @@ export class TurnOrchestrator {
    * preserved. All AgentLoop field accesses routed through deps.
    */
   async execute(userInput: string, callbacks: AgentCallbacks, images?: string[]): Promise<void> {
-    const { heartbeat, wrappedCallbacks, turnMode } = await this.deps.initializeRun(userInput, callbacks, images)
+    const { heartbeat, wrappedCallbacks } = await this.deps.initializeRun(userInput, callbacks, images)
     callbacks = wrappedCallbacks
 
     let checkpointCreatedThisTurn = false
@@ -1447,17 +1447,13 @@ export class TurnOrchestrator {
 
         const hasAnswer = this.deps.state.streamedText.trim().length > 0
           || collectedBlocks.some(b => b.type === 'text' && b.text.trim().length > 0)
-        if (!hasAnswer) {
-          this.emitStop({ source: 'no-answer', turn, voluntary: false }, callbacks)
-          await rejectOnAbort(
-            this.deps.completeTurn({ turn, isFinal: true, callbacks, stopReason: 'no_answer' }),
-            signal!,
-            'no-answer-complete',
-          )
-          finalTurnCompleted = true
-          this.deps.resetEvidence()
-          break
-        }
+        // GLM 独立推理模式（skipThinkingRetry）：纯思考轮是合法输出而非失败发声
+        //（post-turn-decision.ts skipThinkingRetry 注释），落 natural-finish 而非
+        // no_answer。白名单方向：仅本轮确有 thinking 产出才豁免——完全空响应
+        //（无 thinking 无文本）仍是故障，照报 no_answer。
+        const legitimateThinkingOnly = !hasAnswer
+          && this.deps.postTurnDecision.isThinkingRetryDisabled()
+          && (thinkingAccum.length > 0 || collectedBlocks.some(b => b.type === 'thinking'))
 
         // ── Goal continuation check ──
         // Delegated to GoalContinuationController — it handles tracker.check,
@@ -1465,6 +1461,9 @@ export class TurnOrchestrator {
         // continuation reminder injection internally. Wrapped in rejectOnAbort
         // so a watchdog abort during judgeGoalCompletion (LLM call) immediately
         // races instead of waiting for the next loop-iteration signal check.
+        // 位于 no-answer 闸门之前：goal 激活时空/纯思考轮先由续轮闸门吸收
+        //（自带迭代预算兜底，不会无限空转）；goal 不接（无 goal / 预算耗尽
+        // finalize）才轮到 no_answer 显形。
         const goalCheckResult = await rejectOnAbort(
           this.deps.goalContinuation.handleGoalCheck({
             streamedText: this.deps.state.streamedText,
@@ -1478,6 +1477,21 @@ export class TurnOrchestrator {
           'goal-check',
         )
         if (goalCheckResult.kind === 'continue') continue
+
+        // ── No-answer gate ──
+        // 故障显形：恢复手段（thinking retry / steer / goal 续轮）都接不住的空轮
+        // 报 no_answer 终结，不伪造答案。
+        if (!hasAnswer && !legitimateThinkingOnly) {
+          this.emitStop({ source: 'no-answer', turn, voluntary: false }, callbacks)
+          await rejectOnAbort(
+            this.deps.completeTurn({ turn, isFinal: true, callbacks, stopReason: 'no_answer' }),
+            signal!,
+            'no-answer-complete',
+          )
+          finalTurnCompleted = true
+          this.deps.resetEvidence()
+          break
+        }
 
         // ── Action-intent gate ──
         // Lightweight check: the model announced an action ("let me grep…",

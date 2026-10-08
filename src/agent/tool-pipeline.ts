@@ -1310,17 +1310,38 @@ async function executeToolUseInner(
           // 其余（陈旧但脏 L3 / 新鲜 L4 / shared_read / 时间不可解析）落回下面的显式
           // 接管与 fail-closed 阻断，授权语义不放松。
           const liveness = deps.sessionRegistry.claimLiveness?.(claimPath) ?? null
+          // ask 分支的人读判据随审批载荷下发——TUI/桌面审批卡据此渲染「是否陈旧」，
+          // 不必各自重算（判据口径只有 claim-liveness 一份）。
+          let askReason: string | undefined
           if (liveness) {
-            const fileClean = await (deps.isPathClean ?? isPathClean)(deps.cwd, claimPath)
-            const decision = evaluateClaimTakeover({ liveness, fileClean, nowMs: Date.now() })
+            // 探针惰性化（2026-10-08 审查 P2）：evaluateClaimTakeover 只在需要脏态的
+            // 分支（L1 注记 / L2·L3 判定）才调用它——L0 幽灵回收与 L4「问」不再白
+            // spawn 一次 git status（挂起时最坏 10s+3s）。
+            // 缺省全仓认领键（ast_edit 无路径 → '.'）恒不探测：`git status -- .` 是
+            // 全仓扫描，大仓开销且任何无关脏文件都会把判定推向 L3。按 'unknown' 直接
+            // 落 L3 问——失效方向选「少做」：宁可多问，不做全仓扫描、不臆断干净自动接管。
+            const probeFileClean: () => Promise<boolean | 'unknown'> = claimPath === '.'
+              ? async () => 'unknown'
+              : () => (deps.isPathClean ?? isPathClean)(deps.cwd, claimPath)
+            const decision = await evaluateClaimTakeover({ liveness, probeFileClean, nowMs: Date.now() })
             if (decision.action === 'take' || decision.action === 'reap') {
-              if (liveness.ownerSessionId) deps.sessionRegistry.releaseClaim(liveness.ownerSessionId, claimPath)
-              if (deps.sessionRegistry.acquireClaim(deps.sessionId, claimPath, 'exclusive')) {
+              // TOCTOU（2026-10-08 审查）：await isPathClean（spawn git，几十 ms~13s）
+              // 的窗口内，持有方可经自己的写路径（同会话 acquireClaim 分支）合法刷新
+              // last_touched_at——按判定时读到的凭据 CAS 释放；凭据已变 = 判定依据
+              // 失效，放弃自动接管并落回下面的显式「问」流程。无条件 releaseClaim
+              // 会删掉对方已刷新的行：双方各持锁、并发写同一文件。
+              const released = liveness.ownerSessionId
+                ? deps.sessionRegistry.releaseClaimIfUnchanged(liveness.ownerSessionId, claimPath, liveness.lastTouchedAt)
+                : true
+              if (released && deps.sessionRegistry.acquireClaim(deps.sessionId, claimPath, 'exclusive')) {
                 claimTakeovers.push({ claimPath, level: decision.level, reason: decision.reason, owner: liveness.ownerSessionId ?? null })
                 staked.push(claimPath)
                 continue
               }
             }
+            // 只带 ask 分支判据：take/reap 因 CAS 失配落回「问」时凭据已变，
+            // 旧判据（如「持有方已退出」）贴到审批卡上是误导，宁可不带。
+            if (decision.action === 'ask') askReason = decision.reason
           }
           // 显式接管（2026-10-07）：冲突不再直接拒——先问用户「是否接管该文件」。
           // 授权在用户手上；无人可答的环境（headless / 拒绝型 onApprovalRequired）
@@ -1329,14 +1350,30 @@ async function executeToolUseInner(
             ? await (async () => {
                 const r = await callbacks.onApprovalRequired(`${tu.id}:claim-takeover`, tu.name, {
                   ...tu.input,
-                  __claimConflict: { filePath: claimPath, ownerSessionId: owner.sessionId },
+                  // 消费方（TUI 审批卡 / sidecar approval_required 事件）经
+                  // readClaimConflict 读取并渲染接管语义；缺字段时降级为普通审批措辞。
+                  __claimConflict: {
+                    filePath: claimPath,
+                    ownerSessionId: owner.sessionId,
+                    ...(liveness ? { ownerAlive: liveness.ownerAlive, lastTouchedAt: liveness.lastTouchedAt } : {}),
+                    ...(askReason ? { reason: askReason } : {}),
+                  },
                 })
                 return typeof r === 'boolean' ? r : r.approved === true
               })()
             : false
           if (takeoverOk && owner?.sessionId) {
-            deps.sessionRegistry.releaseClaim(owner.sessionId, claimPath)
-            if (deps.sessionRegistry.acquireClaim(deps.sessionId, claimPath, 'exclusive')) {
+            // TOCTOU：审批等待是分钟级窗口，持有方可能已刷新租约凭据（合法写路径）
+            // 或认领已易手——批准所依据的是问的那一刻读到的状态，同样 CAS 释放；
+            // 凭据不符即放弃接管落回阻断（fail-closed，用户重试时会重读新状态）。
+            // liveness 为空（判定时该行已不在）：至今仍无人持有才无需释放，直接抢。
+            const expectedTouchedAt = liveness && liveness.ownerSessionId === owner.sessionId
+              ? liveness.lastTouchedAt
+              : null
+            const released = expectedTouchedAt !== null
+              ? deps.sessionRegistry.releaseClaimIfUnchanged(owner.sessionId, claimPath, expectedTouchedAt)
+              : !deps.sessionRegistry.checkClaim(claimPath)
+            if (released && deps.sessionRegistry.acquireClaim(deps.sessionId, claimPath, 'exclusive')) {
               staked.push(claimPath)
               continue
             }

@@ -92,7 +92,7 @@ export interface DetectEvidenceGateOptions {
  * target 的基础名提取（去 .test.ts 后缀）与后续写入的 target 做前缀匹配。
  */
 export function detectEvidenceGate(options: DetectEvidenceGateOptions): EvidenceGateResult {
-  const { recentHistory, currentTurn } = options
+  const { recentHistory } = options
   const windowTurns = options.windowTurns ?? 6
   const threshold = options.threshold ?? 0.5
 

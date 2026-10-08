@@ -195,6 +195,61 @@ describe('SessionRegistry', () => {
     })
   })
 
+  // TOCTOU（2026-10-08 审查）：接管路径的释放必须是 CAS——判定时读到的租约凭据
+  // 仍是当前值才删行；凭据已变（持有方在 await 窗口内合法刷新）则放弃接管，
+  // 对方的认领行必须原样保留。
+  describe('releaseClaimIfUnchanged（接管 CAS 释放）', () => {
+    it('deletes the row and returns true when the credential matches the decision-time read', () => {
+      registry.register('sess-1', '/project')
+      registry.acquireClaim('sess-1', 'src/foo.ts', 'exclusive')
+      const expected = registry.claimLiveness('src/foo.ts')!.lastTouchedAt
+      assert.equal(registry.releaseClaimIfUnchanged('sess-1', 'src/foo.ts', expected), true)
+      assert.equal(registry.checkClaim('src/foo.ts'), null)
+      registry.register('sess-2', '/project')
+      assert.equal(registry.acquireClaim('sess-2', 'src/foo.ts', 'exclusive'), true)
+    })
+
+    it('returns false and keeps the row when the owner refreshed last_touched_at after the read', async () => {
+      registry.register('sess-1', '/project')
+      registry.acquireClaim('sess-1', 'src/foo.ts', 'exclusive')
+      const expected = registry.claimLiveness('src/foo.ts')!.lastTouchedAt
+      // await 窗口内持有方经同会话写路径合法刷新凭据（acquireClaim 同会话分支）
+      await new Promise((r) => setTimeout(r, 5))
+      registry.acquireClaim('sess-1', 'src/foo.ts', 'exclusive')
+      assert.equal(registry.releaseClaimIfUnchanged('sess-1', 'src/foo.ts', expected), false, '凭据已变必须失配')
+      assert.equal(registry.checkClaim('src/foo.ts')?.sessionId, 'sess-1', '对方已刷新的认领行必须仍在')
+      registry.register('sess-2', '/project')
+      assert.equal(registry.acquireClaim('sess-2', 'src/foo.ts', 'exclusive'), false, '认领未被删——他人仍抢不到')
+    })
+
+    it('returns false when the claim changed hands (row owned by another session)', () => {
+      registry.register('sess-1', '/project')
+      registry.acquireClaim('sess-1', 'src/foo.ts', 'exclusive')
+      const expected = registry.claimLiveness('src/foo.ts')!.lastTouchedAt
+      registry.releaseClaim('sess-1', 'src/foo.ts')
+      registry.register('sess-2', '/project')
+      registry.acquireClaim('sess-2', 'src/foo.ts', 'exclusive')
+      assert.equal(registry.releaseClaimIfUnchanged('sess-1', 'src/foo.ts', expected), false)
+      assert.equal(registry.checkClaim('src/foo.ts')?.sessionId, 'sess-2', '新持有方的认领行不得被误删')
+    })
+
+    it('matches legacy NULL last_touched_at rows via the acquired_at fallback (claimLiveness 同口径)', async () => {
+      const { resolveBetterSqlite3 } = await import('../../repo/native-resolver.js')
+      const Database = resolveBetterSqlite3(import.meta.url)
+      if (!Database) return // 原生模块不可用 → 降级路径无此语义，跳过
+      registry.register('sess-1', '/project')
+      registry.acquireClaim('sess-1', 'src/foo.ts', 'exclusive')
+      const acquiredAt = registry.claimLiveness('src/foo.ts')!.acquiredAt
+      // 绕开类 API 造出迁移回填前的历史行形态（last_touched_at IS NULL）
+      const raw = new Database(join(dbDir, 'registry.db'))
+      raw.prepare('UPDATE claims SET last_touched_at = NULL WHERE session_id = ?').run('sess-1')
+      raw.close()
+      assert.equal(registry.claimLiveness('src/foo.ts')!.lastTouchedAt, acquiredAt, '读取口径先回落 acquired_at')
+      assert.equal(registry.releaseClaimIfUnchanged('sess-1', 'src/foo.ts', acquiredAt), true, '删除口径必须与读取口径一致')
+      assert.equal(registry.checkClaim('src/foo.ts'), null)
+    })
+  })
+
   describe('reapStaleClaims', () => {
     it('reclaims files held by dead sessions', () => {
       registry.register('dead-sess', '/project')

@@ -134,7 +134,7 @@ describe('defaultLspSpawn', () => {
     })
 
     assert.equal(captured.length, 1, 'spawnFn should be called once')
-    // Deleting resolveNpmCliCommand from defaultLspSpawn → command stays 'npx' → RED.
+    // Deleting the resolver from defaultLspSpawn → command stays 'npx' → RED.
     assert.equal(captured[0]!.command, execPath, 'command should be bundled node.exe, not bare npx')
     assert.equal(captured[0]!.args[0], cli)
     assert.deepEqual(captured[0]!.args.slice(1), ['-y', 'typescript-language-server', '--stdio'])
@@ -142,6 +142,86 @@ describe('defaultLspSpawn', () => {
       captured[0]!.env?.PATH?.startsWith('C:\\App\\resources\\node-runtime\\win-x64;'),
       `PATH should prepend bundled nodeDir, got ${captured[0]!.env?.PATH}`,
     )
+  })
+
+  it('resolves bare node through the renamed Windows desktop runtime', () => {
+    // 桌面 GUI PATH 没有用户 shell PATH：bare `node` 型 LSP server 旧解析器
+    // （resolveNpmCliCommand）原样透传 → spawn ENOENT。bf0482db1 只收了 MCP，
+    // 本用例锁 LSP 侧同走 resolveNodeStdioCommand——还原回旧解析器时 command
+    // 停在 'node'，断言变红。
+    const host = 'C:\\天枢 App\\node-runtime\\win-x64\\tianshu-runtime.exe'
+    const captured: Array<{ command: string; args: string[] }> = []
+    const spawnFn = (cmd: string, args: string[], _opts: Record<string, unknown>) => {
+      captured.push({ command: cmd, args })
+      return mockChild()
+    }
+    const nodeDef: LspServerDef = {
+      id: 'test-node',
+      extensions: ['.ts'],
+      command: 'node',
+      args: ['C:\\servers\\lang-server.js', '--stdio'],
+      languageId: 'typescript',
+      alwaysAvailable: true,
+    }
+
+    defaultLspSpawn(nodeDef, 'C:\\proj', spawnFn, {
+      execPath: host,
+      platform: 'win32',
+      existsSync: () => false,
+    })
+
+    assert.equal(captured.length, 1)
+    assert.equal(captured[0]!.command, host, 'bare node must resolve to the current host, not ENOENT on GUI PATH')
+    assert.deepEqual(captured[0]!.args, ['C:\\servers\\lang-server.js', '--stdio'])
+  })
+
+  it('migrates a missing legacy sibling node.exe next to the renamed host', () => {
+    const host = 'C:\\天枢 App\\node-runtime\\win-x64\\tianshu-runtime.exe'
+    const legacy = 'C:\\天枢 App\\node-runtime\\win-x64\\node.exe'
+    const captured: Array<{ command: string }> = []
+    const spawnFn = (cmd: string, _args: string[], _opts: Record<string, unknown>) => {
+      captured.push({ command: cmd })
+      return mockChild()
+    }
+    const legacyDef: LspServerDef = {
+      id: 'test-legacy',
+      extensions: ['.ts'],
+      command: legacy,
+      args: ['server.js'],
+      languageId: 'typescript',
+      alwaysAvailable: true,
+    }
+
+    defaultLspSpawn(legacyDef, 'C:\\proj', spawnFn, {
+      execPath: host,
+      platform: 'win32',
+      existsSync: () => false,
+    })
+
+    assert.equal(captured[0]!.command, host)
+  })
+
+  it('passes commands through byte-identical on POSIX (node stays node, gopls stays gopls)', () => {
+    const captured: Array<{ command: string; args: string[] }> = []
+    const spawnFn = (cmd: string, args: string[], _opts: Record<string, unknown>) => {
+      captured.push({ command: cmd, args })
+      return mockChild()
+    }
+    const deps = { execPath: '/opt/node/bin/node', platform: 'linux' as const, existsSync: () => false }
+
+    defaultLspSpawn(
+      { id: 'n', extensions: ['.x'], command: 'node', args: ['srv.js', '--stdio'], languageId: 'x' },
+      '/proj', spawnFn, deps,
+    )
+    defaultLspSpawn(
+      { id: 'g', extensions: ['.go'], command: 'gopls', args: [], languageId: 'go' },
+      '/proj', spawnFn, deps,
+    )
+
+    // resolveNodeStdioCommand 非 win32 直接透传 resolveNpmCliCommand——
+    // POSIX 行为必须与本修复前逐字节一致。
+    assert.deepEqual(captured[0], { command: 'node', args: ['srv.js', '--stdio'] })
+    assert.deepEqual(captured[1], { command: 'gopls', args: [] })
   })
 })
 

@@ -39,11 +39,17 @@ export interface EffectiveVerifications {
   /** Count of verifications dropped because their snapshotRef is stale
    *  (owned diff changed since the verification ran). */
   staleSnapshotDropped: number
-  /** Count of verifications dropped because their workspace fingerprint was
-   *  unavailable/mismatched (meta.stale === true) — e.g. the owned set contained a
-   *  path outside the repo root, so no comparable fingerprint could be computed.
-   *  Distinguishes "fingerprint unavailable" from "ran on outdated code"
-   *  ({@link staleSnapshotDropped}). */
+  /** Count of verifications dropped on the workspace-fingerprint dimension
+   *  (meta.stale === true). This counts ALL stale drops; typical causes fall
+   *  into two classes:
+   *  (a) 仓内再编辑 — an in-repo owned/written file changed after the verification
+   *      ran (file_write 判废或指纹比对失配)。正常开发循环里会频繁非零，是良性多数；
+   *  (b) 指纹不可计算 — no comparable fingerprint could be produced at all
+   *      (归属/写入集含敏感路径、非 git 工作区，或 4251eea67 之前台账里 owned 路径
+   *      在仓库根之外的旧毒化形态)。
+   *  Distinct from snapshotRef staleness ({@link staleSnapshotDropped}) — a
+   *  different evidence dimension. 越界类病因的修复指引锚点见
+   *  DeliveryGateResult.outOfRootFingerprintPaths。 */
   staleFingerprintDropped: number
 }
 
@@ -259,9 +265,11 @@ export function getEffectiveVerifications(
   // matches reality. Drop it. Verifications without a snapshotRef (in-place /
   // legacy runs) are never dropped, preserving existing behavior.
   let staleSnapshotDropped = 0
-  // 因指纹不可用（meta.stale=true）被丢弃的验证单列计数：病因是"本会话结构性拿不到
-  // 可比较的指纹"（如归属集含仓库外路径），与 snapshotRef 陈旧不同——不区分就会把
-  // 病因报成"没跑过测试"（本缺陷的原症状）。
+  // meta.stale=true 的丢弃单列计数。该计数覆盖**所有** stale 判废，不挑病因——
+  // 典型病因两类：① 仓内再编辑（验证后又改写仓内文件，正常开发循环里频繁非零，
+  // 良性多数）；② 指纹不可计算（敏感路径/非 git 工作区/4251eea67 前台账的越界
+  // owned 路径）。与 snapshotRef 陈旧是不同维度——不区分就会把病因报成"没跑过
+  // 测试"（本缺陷的原症状）。
   let staleFingerprintDropped = 0
   const currentEvents = allVerificationEvents.filter(e => {
     if (e.meta?.stale === true) { staleFingerprintDropped++; return false }

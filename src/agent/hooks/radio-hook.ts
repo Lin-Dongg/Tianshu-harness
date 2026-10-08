@@ -16,7 +16,6 @@ import { PHASE_CLASS_MAP } from '../phase-class.js'
  */
 
 import type { PostToolRuntimeHook, RuntimeHookContext, RuntimeToolEvent } from '../runtime-hooks.js'
-import type { Sensorium } from '../sensorium.js'
 import type { StarPhase } from '../star-event.js'
 import { mapSensoriumToPhase, PHASE_SHORT_LABELS } from '../star-event.js'
 import { extractTemplateVars, formatRadioMessage, formatHeartbeatMessage, type PhaseClass } from '../radio-templates.js'

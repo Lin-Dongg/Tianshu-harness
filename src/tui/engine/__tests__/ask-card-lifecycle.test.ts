@@ -76,9 +76,11 @@ for (const renderer of ['classic', 'fullscreen'] as const) {
       const cards = records.filter((r: { name?: string }) => r.name === 'ask_user_question')
       assert.deepEqual(cards.map((r: { toolId: string }) => r.toolId), ['first'])
       assert.match(cards[0].text, /已提交回答/)
+      // 「已提交回答」的归档绑定投递成功（handleInputSubmit 在 onSubmitCallback 返回后
+      // 补归），因此卡落在用户气泡**之后**——投递失败时历史里不会留下假的 answered 卡。
       const index = records.findIndex((r: { toolId?: string }) => r.toolId === 'first')
-      assert.equal(records[index + 1].kind, 'user')
-      assert.equal(records[index + 1].text, '范围 B')
+      assert.equal(records[index - 1].kind, 'user')
+      assert.equal(records[index - 1].text, '范围 B')
       assert.doesNotMatch(stripAnsi((app as any).commit.getContent()), /第二条问题/)
     } finally { app.dispose() }
   })
@@ -115,11 +117,15 @@ for (const renderer of ['classic', 'fullscreen'] as const) {
       await app.decisions.submitAnswers()
       assert.match(app.decisions.question!.error!, /暂时不可发送/)
       assert.equal(app.decisions.question?.id, 'first')
+      // 投递失败：提问仍是挂起态——历史里不得留下一张从未送达却标记已回答的卡。
+      const midway = (await (app as any).frontend.history.page(0)).filter((r: { name?: string }) => r.name === 'ask_user_question')
+      assert.deepEqual(midway.map((r: { toolId: string }) => r.toolId), [], '投递失败不得归档 answered 卡')
       await app.decisions.submitAnswers()
       assert.equal(attempts, 2)
       assert.equal(app.decisions.question?.id, 'second')
       const cards = (await (app as any).frontend.history.page(0)).filter((r: { name?: string }) => r.name === 'ask_user_question')
       assert.deepEqual(cards.map((r: { toolId: string }) => r.toolId), ['first'])
+      assert.match(cards[0].text, /已提交回答/)
     } finally { app.dispose() }
   })
 
@@ -173,5 +179,51 @@ test('session switch archives unanswered questions in the old history only', asy
     assert.match(cards[0]!.text, /未作答/)
     assert.equal((await UIHistory.open(newPath)).count, 0)
     assert.equal(app.decisions.count, 0)
+  } finally { app.dispose(); await rm(dir, { recursive: true, force: true }) }
+})
+
+test('/cd (setCwd) archives pending questions before clearing the panel', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ask-cwd-'))
+  const { app } = await makeApp()
+  try {
+    const path = join(dir, 'history.jsonl')
+    await app.setUIHistorySession(path)
+    const agent = { cwd: dir } as AgentLoop
+    attachDecisionSession(app, () => agent)
+    await ask(app, agent, 'cwd', '切目录前的问题')
+    assert.equal(app.decisions.count, 1, '面板持有该提问')
+    app.setCwd(join(dir, 'other'))
+    assert.equal(app.decisions.count, 0, '/cd 清面板')
+    const cards = (await (await UIHistory.open(path)).page(0)).filter(r => r.name === 'ask_user_question')
+    assert.equal(cards.length, 1, '提问必须随 /cd 归档，不得挂到退出才出现')
+    assert.match(cards[0]!.text, /切目录前的问题/)
+    assert.match(cards[0]!.text, /未作答/)
+  } finally { app.dispose(); await rm(dir, { recursive: true, force: true }) }
+})
+
+test('abort between question request and panel delivery archives the card unanswered instead of losing it', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ask-abort-'))
+  const { app } = await makeApp()
+  try {
+    const path = join(dir, 'history.jsonl')
+    await app.setUIHistorySession(path)
+    const agent = { cwd: dir } as AgentLoop
+    attachDecisionSession(app, () => agent)
+    // 与生产同序：工具执行期间面板投递被 setImmediate 延迟，Esc 在面板起来前
+    // 改了 runGen——世代守卫丢弃投递，但卡已被 handleToolResult 挂起。
+    const result = await ASK_USER_QUESTION_TOOL.execute({ cwd: dir, toolUseId: 'abort-q',
+      input: { question: '中断前的问题', options: [
+        { label: '范围 A', recommended: true, recommendation_reason: '符合当前目标' }, { label: '范围 B' },
+      ] },
+      onAskUserQuestion: info => agent.onAskUserQuestionRequested?.(info) })
+    assert.equal(result.isError, undefined, `工具必须接受该提问，got: ${result.content}`)
+    ;(app as any).handleAbort()
+    app.callbacks.onToolResult('abort-q', 'ask_user_question', result.content, false, undefined, result.uiContent)
+    await tick()
+    assert.equal(app.decisions.question, undefined, '世代守卫丢弃了面板投递')
+    const cards = (await (await UIHistory.open(path)).page(0)).filter(r => r.name === 'ask_user_question')
+    assert.equal(cards.length, 1, '提问不得随面板一起丢失、挂到退出才出现')
+    assert.match(cards[0]!.text, /中断前的问题/)
+    assert.match(cards[0]!.text, /未作答/)
   } finally { app.dispose(); await rm(dir, { recursive: true, force: true }) }
 })

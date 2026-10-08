@@ -3,9 +3,10 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { loadConfig, setupProvider } from '../manager.js'
+import { loadConfig, saveConfig, setupProvider } from '../manager.js'
 import { contractModels } from '../contract-models.js'
 import { addProviderKey } from '../provider-key-store.js'
+import { findModelOwner } from '../provider-keys.js'
 import { readSecret } from '../secrets-store.js'
 
 describe('setupProvider with key pools: reconnect selection and model sync', () => {
@@ -181,5 +182,114 @@ describe('setupProvider with key pools: reconnect selection and model sync', () 
     // Secondary key remains untouched
     const secondaryKeyStill = prov.keys?.find(k => k.label === 'secondary-env')
     assert.equal(readSecret(secondaryKeyStill?.keyRef!), 'sk-secondary-keep')
+  })
+
+  // ── 2026-10-08 审查 P2 ③：单模型编辑不得劫持路由归属 ────────────────────
+  // 此前 options.model 路径只在顶层克隆（= 默认池副本）里 findIndex，找不到即
+  // unshift——只存在于次级 key 的模型被复制进默认 key，findModelOwner 按池序
+  // 先中默认 key，此后该模型请求的凭据从次级 key 切到默认 key。
+  it('editing a model owned by a secondary key stays on that key (no default-pool hijack)', () => {
+    setupProvider({
+      providerName: 'deepseek',
+      preset: 'deepseek',
+      apiKey: 'sk-primary',
+      models: [{ id: 'deepseek-flash', contextWindow: 1_000_000, maxTokens: 64_000 }],
+    })
+    const secondary = addProviderKey('deepseek', {
+      label: 'secondary',
+      apiKey: 'sk-secondary',
+      models: [{ id: 'secondary-only', contextWindow: 64_000, maxTokens: 4_096, supportsVision: true }],
+    })
+
+    // 桌面 Settings 表单路径：编辑只存在于次级 key 的模型（表单只发四个字段）。
+    setupProvider({
+      providerName: 'deepseek',
+      model: { id: 'secondary-only', contextWindow: 96_000, maxTokens: 8_192 },
+    })
+
+    const prov = loadConfig().provider.providers.deepseek!
+    const defaultKey = prov.keys!.find(k => k.id === 'default') ?? prov.keys![0]!
+    const secondaryKey = prov.keys!.find(k => k.id === secondary.id)!
+    assert.ok(
+      !defaultKey.models.some(m => m.id === 'secondary-only'),
+      '编辑不得把次级 key 的模型复制进默认 key——那会把请求凭据切到默认 key',
+    )
+    const edited = secondaryKey.models.find(m => m.id === 'secondary-only')!
+    assert.equal(edited.contextWindow, 96_000)
+    assert.equal(edited.maxTokens, 8_192)
+    assert.equal(edited.supportsVision, true, 'merge 语义保留表单未携带的字段')
+    const owner = findModelOwner(prov, 'secondary-only')
+    assert.equal(owner?.owner?.id, secondary.id, '路由归属必须仍是次级 key')
+  })
+
+  it('adding a brand-new model still lands on the default key, first position', () => {
+    setupProvider({
+      providerName: 'deepseek',
+      preset: 'deepseek',
+      apiKey: 'sk-primary',
+      models: [{ id: 'deepseek-flash', contextWindow: 1_000_000, maxTokens: 64_000 }],
+    })
+    const secondary = addProviderKey('deepseek', {
+      label: 'secondary',
+      apiKey: 'sk-secondary',
+      models: [{ id: 'secondary-only', contextWindow: 64_000, maxTokens: 4_096 }],
+    })
+
+    setupProvider({
+      providerName: 'deepseek',
+      model: { id: 'brand-new', contextWindow: 128_000, maxTokens: 8_192 },
+    })
+
+    const prov = loadConfig().provider.providers.deepseek!
+    const defaultKey = prov.keys!.find(k => k.id === 'default') ?? prov.keys![0]!
+    assert.equal(defaultKey.models[0]!.id, 'brand-new', '新增模型落默认池首位（连接流程的位置性默认语义）')
+    const secondaryKey = prov.keys!.find(k => k.id === secondary.id)!
+    assert.ok(!secondaryKey.models.some(m => m.id === 'brand-new'))
+  })
+
+  // ── 2026-10-08 审查 P2 ④：applyProviderCredential 切换须回收孤儿 secret ──
+  // 惯例（provider-key-store.updateProviderKeyCredential / manager.setApiKeyEnv）：
+  // keyRef 切 apiKeyEnv 时，旧 secret 在全仓无引用方即回收。setupProvider 的
+  // applyProviderCredential 通道此前不回收，旧 secret 永久滞留 secrets.json。
+  it('switching the default key from keyRef to apiKeyEnv reclaims the orphaned secret', () => {
+    setupProvider({
+      providerName: 'deepseek',
+      preset: 'deepseek',
+      apiKey: 'sk-to-orphan',
+      models: [{ id: 'deepseek-flash', contextWindow: 1_000_000, maxTokens: 64_000 }],
+    })
+    assert.equal(readSecret('deepseek'), 'sk-to-orphan')
+
+    process.env.TEST_CUSTOM_KEY_ENV = 'sk-from-env'
+    setupProvider({ providerName: 'deepseek', apiKeyEnv: 'TEST_CUSTOM_KEY_ENV' })
+
+    const prov = loadConfig().provider.providers.deepseek!
+    assert.equal(prov.apiKeyEnv, 'TEST_CUSTOM_KEY_ENV')
+    assert.equal(readSecret('deepseek'), undefined,
+      'keyRef 切走后旧 secret 已无任何引用方——必须按惯例回收，不得滞留成孤儿')
+  })
+
+  it('keeps the secret when another key still references the same keyRef', () => {
+    setupProvider({
+      providerName: 'deepseek',
+      preset: 'deepseek',
+      apiKey: 'sk-shared',
+      models: [{ id: 'deepseek-flash', contextWindow: 1_000_000, maxTokens: 64_000 }],
+    })
+    const secondary = addProviderKey('deepseek', {
+      label: 'secondary',
+      apiKey: 'sk-secondary',
+      models: [{ id: 'secondary-only', contextWindow: 64_000, maxTokens: 4_096 }],
+    })
+    // 手改配置共享 keyRef 的合法场景：次级 key 指向默认 key 的同一 secret。
+    const cfg = loadConfig()
+    cfg.provider.providers.deepseek!.keys!.find(k => k.id === secondary.id)!.keyRef = 'deepseek'
+    saveConfig(cfg)
+
+    process.env.TEST_CUSTOM_KEY_ENV = 'sk-from-env'
+    setupProvider({ providerName: 'deepseek', apiKeyEnv: 'TEST_CUSTOM_KEY_ENV' })
+
+    assert.equal(readSecret('deepseek'), 'sk-shared',
+      '次级 key 仍引用同一 keyRef——共享引用保留，不得误删')
   })
 })

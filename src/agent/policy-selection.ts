@@ -18,10 +18,6 @@ export interface PolicySelectionOptions {
   topK?: number
 }
 
-function clamp(value: number, min = 0, max = 1): number {
-  return Math.max(min, Math.min(max, value))
-}
-
 /**
  * 计算每个候选动作的 Expected Free Energy G(π)。
  *

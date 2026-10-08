@@ -1169,8 +1169,6 @@ export class AdvisoryBus {
     // 若先记账再裁剪，它们会同时落在 delivered（假送达）与 dropped 两本账上，
     // readback 会把它们误判为 ignored、推进习惯化静音与 efficacy 冷却。
     const CVM_INJECTION_BASE_BUDGET = 3
-    const busCount = sorted.length
-    const srPending = this.srPendingDelivery.size
     // ⚠ 按 key 数计数初期足够（SR 天然低频），后续可按 injectedTokens 加权校准
     const cvmInjectionBudget = this.overheadThrottled
       ? Math.max(1, CVM_INJECTION_BASE_BUDGET - 2)

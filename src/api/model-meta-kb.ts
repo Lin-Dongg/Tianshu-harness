@@ -32,16 +32,10 @@ export const MODEL_META_KB: readonly ModelAliasEntry[] = [
   // ── Kimi（Moonshot 官网规格，2026-08）——官网未公布最大输出，maxTokens 留空 ──
   { canonicalId: 'kimi-k2.6', aliases: [], metadata: { contextWindow: 262_144, capabilities: { reasoningSplit: true } } },
   { canonicalId: 'kimi-k2.5', aliases: [], metadata: { contextWindow: 262_144, capabilities: { reasoningSplit: true } } },
-  // ── MiMo V2.6（小米 mimo.mi.com 官方模型页，2026-10）──
-  // fleet（provider-presets 的 mimo / mimo-api）只收到 v2.5，v2.6 在售但未收录。
-  // 不补这两条，用户在向导里「从接口拉取列表」拿到的 v2.6-pro / v2.6-flash 就命中不了
-  // 任何元数据：视觉不勾（isVisionCapableId 读 metadata.supportsVision），上下文落默认值
-  // （实测 flash 显示 128K，官方 1M）。
-  // 刻意不带 capabilities.reasoningSplit：MiMo 预设未声明该能力，带上会让
-  // openai-client 往请求体注入 reasoning_split（src/api/openai-client.ts:603）。
-  // 官方规格：输入模态 Text/Image/Video/Audio，上下文 1M，最大输出 128K。
-  { canonicalId: 'mimo-v2.6-pro', aliases: [], metadata: { contextWindow: 1_000_000, maxTokens: 128_000, supportsVision: true } },
-  { canonicalId: 'mimo-v2.6-flash', aliases: [], metadata: { contextWindow: 1_000_000, maxTokens: 128_000, supportsVision: true } },
+  // ── MiMo V2.6 ──
+  // V2.6 Flash / Pro 曾以「fleet 未收录但在售」的身份住在这里（PR #323）。2026-10-08
+  // 起它们已进 mimo / mimo-api 预设（issue #386），职责归回 fleet——本表只放 fleet
+  // 未收录的型号，重复条目会让 ENRICHED_ALIAS_TABLE 出现两个同 canonical 的表项。
 ]
 
 /** 别名表 + 官网知识库——探测匹配/回填的统一基准（fleet 条目优先，不被覆盖）。 */

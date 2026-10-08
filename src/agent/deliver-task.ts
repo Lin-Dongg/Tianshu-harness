@@ -124,6 +124,10 @@ export interface B1Context {
   sessionId?: string
   /** Test hook / alternate runtime source for current dirty files. */
   getCurrentDirtyFiles?: (cwd: string) => string[] | undefined
+  /** 提交硬门恢复路径（会话中途 git init）：基线只在会话启动时采集一次；基线
+   *  不完整时由硬门现场重采，仓库现在可用则原地换基线并返回 true。缺省 → 无
+   *  恢复路径（保持硬阻断，现状行为不变）。 */
+  recaptureBaseline?: (cwd: string) => boolean
   /** Test hook / alternate runtime source for project memory markdown. */
   getProjectMemoryContent?: (cwd: string) => string | undefined
   /** Test hook / alternate runtime executor for scoped commits. */
@@ -533,7 +537,11 @@ export function createDeliverTaskTool(getB1Context: (params?: ToolCallParams) =>
         '',
         report.verificationCount > 0
           ? `Verifications: ${report.verificationCount}`
-          : 'Verifications: none (no tests were run for this task)',
+          // stale 判废把有效验证清空时，"no tests were run" 是误诊——跑过但被丢弃。
+          // 说出真实形态；越界类病因的修复指引见下方 outOfRootFingerprintPaths 段（L4）。
+          : report.staleFingerprintDropped > 0
+            ? `Verifications: none usable — ${report.staleFingerprintDropped} run(s) were dropped as stale (验证跑过，但验证后工作区/指纹又发生了变化)`
+            : 'Verifications: none (no tests were run for this task)',
       ]
       if (impact) {
         lines.push(`Impact policy ${impact.policyVersion ?? 1}: ${impact.requiredTests.length} required, ${impact.advisoryTests.length} advisory test(s).`)
@@ -547,8 +555,16 @@ export function createDeliverTaskTool(getB1Context: (params?: ToolCallParams) =>
         const v = report.latestVerificationTotals
         lines.push(`  Latest: ${v.passed ?? '未确认'} pass ${v.countsReliable !== true && !v.failed ? '未确认' : v.failed ?? '未确认'} fail ${v.skipped ?? '未确认'} skip${v.countsReliable !== true ? '（已确认计数，非全量；失败数量未确认时须补证据）' : ''} — ${v.command}`)
         if (v.executionId) lines.push(`  Execution: ${v.executionId} · ${v.timestamp ? new Date(v.timestamp).toISOString() : '时间未确认'} · ${v.durationMs ?? '未确认'}ms`)
-      } else if (report.verificationCount === 0) {
+      } else if (report.verificationCount === 0 && report.staleFingerprintDropped === 0) {
+        // stale 判废清空有效验证时不说 "no test suite was executed"——同 L4，跑过但被丢弃。
         lines.push('  (Typecheck passed, but no test suite was executed. Run tests before claiming "verified".)')
+      }
+
+      // L4 指引（交付门指纹治理，4251eea67 审查 P2）：stale 判废 + 越界 owned 路径
+      // 并存时输出修复指引。gate 只在两个条件同时成立时给该字段，此处只负责呈现。
+      if (report.outOfRootFingerprintPaths && report.outOfRootFingerprintPaths.length > 0) {
+        lines.push(`  ⚠️ owned 路径在仓库根之外：${report.outOfRootFingerprintPaths.join(', ')}`)
+        lines.push(`  指引：越界路径不可交付、不参与交付指纹——若这 ${report.staleFingerprintDropped} 条 stale 判废源于旧的越界指纹毒化（4251eea67 前的台账形态：owned 路径在仓库根之外 → 指纹不可计算），把需交付的内容移入仓库内（如 .rivet/scratch/）后重跑验证，新证据会替代 "no tests were run" 的误判。`)
       }
 
       // 测试存在性警告（advisory 不阻断）：交付物含 ≥3 个源文件却零测试文件。
@@ -866,9 +882,17 @@ export function createDeliverTaskTool(getB1Context: (params?: ToolCallParams) =>
           return { content: lines.join('\n') }
         }
         if (!ctx.ownership.isBaselineComplete()) {
-          lines.push('', '❌ Cannot commit: 归属基线未完整建立，无法安全执行 scoped commit。')
-          lines.push('文件改动已保存在工作区中。请确认 git 仓库可用并重新建立任务基线后再提交；force 不豁免。')
-          return { content: lines.join('\n'), isError: true, errorKind: 'delivery_gate' }
+          // 恢复路径：基线只在会话启动时采集一次——会话开始后目录才变成 git 仓库
+          // （新项目脚手架 git init）时基线仍停留在启动时的 incomplete，现场重采
+          // 一次，仓库现在可用即原地换基线放行。只解决这一类；重采仍失败（非 git
+          // 工作区）→「无法归因不许提交」的默认不变，硬门不撤。
+          if (ctx.recaptureBaseline?.(params.cwd) === true) {
+            lines.push('', '✅ 归属基线已现场重采（会话启动后目录才成为 git 仓库），按新基线继续。')
+          } else {
+            lines.push('', '❌ Cannot commit: 归属基线未完整建立，无法安全执行 scoped commit。')
+            lines.push('文件改动已保存在工作区中。git 仓库可用后重试 deliver_task 会现场重采基线（如刚执行 git init，直接重试即可）；force 不豁免。')
+            return { content: lines.join('\n'), isError: true, errorKind: 'delivery_gate' }
+          }
         }
         // Keep the atomic commit reminder at the commit boundary.
         lines.push(

@@ -132,3 +132,4 @@ export {
 } from './file-context-policy.js'
 
 export { STELLAR_CARDS, stellarCard } from '../agent/stellar-card.js'
+export { remoteAccessOrigin } from './remote-access-endpoint.js'

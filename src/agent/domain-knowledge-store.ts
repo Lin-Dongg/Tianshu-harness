@@ -20,7 +20,6 @@ import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, 
 import { join, dirname } from 'node:path'
 import { randomBytes, createHash } from 'node:crypto'
 import { computeCurrentStrength } from '../context/stigmergy.js'
-import type { StarDomainId } from './star-domain.js'
 
 // ─── Types ──────────────────────────────────────────────────────
 

@@ -19,7 +19,7 @@ import { spawnGitSync } from './tools/spawn-git.js'
 
 import type { Config, ProviderConfig } from './config/schema.js'
 import type { AuthProvider } from './auth/types.js'
-import type { BaselineSnapshot } from './agent/worktree-baseline.js'
+import type { BaselineSnapshot, WorktreeBaseline } from './agent/worktree-baseline.js'
 import { buildModelCards } from './model/capability.js'
 import type { ModelCapabilityCard } from './model/capability.js'
 
@@ -89,9 +89,12 @@ import { createModeAwareRunner, workerIsolationEnabled, workerIsolationMode } fr
 import type { ResolvedReviewOverride } from './agent/review-model-override.js'
 import { createAuthProvider } from './auth/registry.js'
 import { resolveCapabilities } from './api/provider.js'
+import { resolveInitialReasoningEffort } from './agent/runtime-effort.js'
+export { resolveInitialReasoningEffort }
 import { canonicalizeModelId } from './api/model-aliases.js'
 import { contractModels } from './config/contract-models.js'
-import { resolveModelRef } from './config/provider-keys.js'
+import { resolveProviderForModel, type ResolvedModelTarget, type ModelResolutionContext } from './bootstrap/model-resolution.js'
+export { resolveProviderForModel, type ResolvedModelTarget, type ModelResolutionContext }
 import { DelegationCoordinator } from './agent/coordinator.js'
 import { ProviderHealthTracker } from './agent/provider-health.js'
 import { effectiveBanditMode, resolveBanditPromotion } from './agent/bandit-promotion.js'
@@ -319,21 +322,85 @@ export function resolveProviderAndAuth(
 // ── Git Baseline ───────────────────────────────────────────────
 
 export function captureGitBaseline(cwd: string): BaselineSnapshot {
+  const run = (args: string[]) => spawnGitSync(['-c', 'core.quotePath=false', ...args], { cwd, encoding: 'utf-8', timeout: 5000 })
   try {
-    const branch = spawnGitSync(['-c', 'core.quotePath=false', 'rev-parse', '--abbrev-ref', 'HEAD'], { cwd, encoding: 'utf-8', timeout: 5000 }).stdout.trim()
-    const head = spawnGitSync(['-c', 'core.quotePath=false', 'rev-parse', 'HEAD'], { cwd, encoding: 'utf-8', timeout: 5000 }).stdout.trim()
-    const dirty = spawnGitSync(['-c', 'core.quotePath=false', 'diff', '--name-only'], { cwd, encoding: 'utf-8', timeout: 5000 }).stdout.trim()
-    const untracked = spawnGitSync(['-c', 'core.quotePath=false', 'ls-files', '--others', '--exclude-standard'], { cwd, encoding: 'utf-8', timeout: 5000 }).stdout.trim()
+    const branch = run(['rev-parse', '--abbrev-ref', 'HEAD'])
+    const head = run(['rev-parse', 'HEAD'])
+    const dirty = run(['diff', '--name-only'])
+    const untracked = run(['ls-files', '--others', '--exclude-standard'])
+    // spawnGitSync 对非零退出不抛错——必须显式查 status，否则非 git 目录会静默
+    // 产出「全空但 complete 未标 false」的基线：isComplete() 恒真，提交硬门对
+    // CLI 失效。桌面端异步采集 captureGitBaselineAsync 经 execFile 回调拒绝非零
+    // 退出、会标 complete: false——两端硬门口径在此对齐（含 unborn HEAD：
+    // rev-parse HEAD 失败 → 两端同为 false，交付时经恢复路径重采放行）。
+    for (const r of [branch, head, dirty, untracked]) {
+      if (r.error || r.status !== 0) throw new Error(`git baseline capture failed (exit ${r.status})`)
+    }
+    const dirtyOut = dirty.stdout.trim()
+    const untrackedOut = untracked.stdout.trim()
     return {
-      branch,
-      head,
-      preExistingDirty: dirty ? dirty.split(/\r?\n/) : [],
-      preExistingUntracked: untracked ? untracked.split(/\r?\n/) : [],
+      branch: branch.stdout.trim(),
+      head: head.stdout.trim(),
+      preExistingDirty: dirtyOut ? dirtyOut.split(/\r?\n/) : [],
+      preExistingUntracked: untrackedOut ? untrackedOut.split(/\r?\n/) : [],
       capturedAt: Date.now(),
+      complete: true,
     }
   } catch {
-    return { branch: '', head: '', preExistingDirty: [], preExistingUntracked: [], capturedAt: Date.now() }
+    return { branch: '', head: '', preExistingDirty: [], preExistingUntracked: [], capturedAt: Date.now(), complete: false }
   }
+}
+
+/** 交付硬门的现场重采（会话中途 git init 恢复路径）。判据是「仓库现在可用」
+ *  ——git 仓库存在且工作树可读，而非启动采集的「四个命令全成功」：git init 后
+ *  首次提交前（unborn HEAD）rev-parse HEAD 仍失败，但 scoped commit 要创建的
+ *  正是 root commit，仓库对此完全可用（head 记 ''）。非 git 目录 → null。 */
+export function captureGitBaselineForRecovery(cwd: string): BaselineSnapshot | null {
+  const run = (args: string[]) => spawnGitSync(['-c', 'core.quotePath=false', ...args], { cwd, encoding: 'utf-8', timeout: 5000 })
+  const ok = (r: { error?: Error; status: number | null }) => !r.error && r.status === 0
+  try {
+    const probe = run(['rev-parse', '--git-dir'])
+    const dirty = run(['diff', '--name-only'])
+    const untracked = run(['ls-files', '--others', '--exclude-standard'])
+    if (!ok(probe) || !ok(dirty) || !ok(untracked)) return null
+    const head = run(['rev-parse', 'HEAD'])
+    const branch = run(['symbolic-ref', '--short', 'HEAD'])
+    const abbrev = ok(branch) ? null : run(['rev-parse', '--abbrev-ref', 'HEAD'])
+    const dirtyOut = dirty.stdout.trim()
+    const untrackedOut = untracked.stdout.trim()
+    return {
+      // unborn HEAD 走 symbolic-ref（rev-parse --abbrev-ref 此时非零退出且 stdout
+      // 是垃圾串 'HEAD'）；detached HEAD 回落 abbrev-ref（与启动采集同形）。
+      branch: ok(branch) ? branch.stdout.trim() : (abbrev !== null && ok(abbrev) ? abbrev.stdout.trim() : ''),
+      head: ok(head) ? head.stdout.trim() : '',
+      preExistingDirty: dirtyOut ? dirtyOut.split(/\r?\n/) : [],
+      preExistingUntracked: untrackedOut ? untrackedOut.split(/\r?\n/) : [],
+      capturedAt: Date.now(),
+      complete: true,
+    }
+  } catch {
+    return null
+  }
+}
+
+/** 提交硬门恢复路径：现场重采并原地换基线。本会话 ledger 有证据（file_write /
+ *  git_action）的文件不得进入新基线的 pre-existing 集——否则重采会把会话自己
+ *  写的文件吞成 external（isOwned 反噬、scoped commit 范围被清空）。ledger 无
+ *  证据的文件保持 external：「无法归因不许提交」的默认不变。 */
+export function recaptureBaselineInto(baseline: WorktreeBaseline, taskLedger: import('./agent/task-ledger.js').TaskLedger, cwd: string): boolean {
+  const snap = captureGitBaselineForRecovery(cwd)
+  if (!snap) return false
+  const ledgerPaths = new Set(
+    taskLedger.getEvents()
+      .filter(e => (e.type === 'file_write' || e.type === 'git_action') && e.path)
+      .map(e => e.path as string),
+  )
+  baseline.replaceSnapshot({
+    ...snap,
+    preExistingDirty: snap.preExistingDirty.filter(f => !ledgerPaths.has(f)),
+    preExistingUntracked: snap.preExistingUntracked.filter(f => !ledgerPaths.has(f)),
+  })
+  return true
 }
 
 // ── Session ID ─────────────────────────────────────────────────
@@ -780,6 +847,7 @@ export function createInteractiveToolRegistry(
     taskLedger: b1TaskLedger,
     ownership: b1Ownership,
     attribution: b1Attribution,
+    repoRoot: cwd,
   })
   refs.deliveryGate = b1Gate
   reg.register(createDeliverTaskTool((params) => ({
@@ -787,6 +855,9 @@ export function createInteractiveToolRegistry(
     continuityStatus: taskState.recovery,
     ownership: b1Ownership,
     gate: b1Gate,
+    // 提交硬门恢复路径：会话中途 git init 后现场重采并原地换基线
+    // （TUI 与桌面 sidecar 共用本装配，详见 recaptureBaselineInto）。
+    recaptureBaseline: (targetCwd) => recaptureBaselineInto(b1Baseline, b1TaskLedger, targetCwd),
     getCurrentSnapshotRef: () => b1SnapshotManager?.currentSnapshotRef() ?? undefined,
     sessionRegistry: refs.sessionRegistry ?? undefined,
     sessionId: refs.sessionId ?? undefined,
@@ -945,9 +1016,7 @@ export function createAgentRuntime(deps: {
       id: currentModel.id,
       maxTokens: currentModel.maxTokens,
       contextWindow: currentModel.contextWindow,
-      // 用户显式 defaultEffort（/model 面板随「设为默认」持久化）压过 preset 默认档；
-      // 未配置时沿用 preset/模型的 reasoningEffort（auto-reasoning 仍可在其上动态调）。
-      reasoningEffort: config.agent.defaultEffort ?? currentModel.reasoningEffort,
+      reasoningEffort: resolveInitialReasoningEffort(config.agent.defaultEffort ?? currentModel.reasoningEffort, resolveCapabilities(provider.name, provider.capabilities, currentModel.capabilities)),
       supportsVision: currentModel.supportsVision,
     },
     cwd,
@@ -1433,67 +1502,6 @@ export interface SwitchModelResult {
   /** 成功时返回的展示名（alias 优先）与上下文窗口，供 UI 刷新 */
   modelName?: string
   contextWindow?: number
-}
-
-/** 跨 provider 解析模型 + 凭证（switchAgentRuntime 与 resume 原模型恢复共用）。
- *  模型不在任何 provider → null；找到但 API key 缺失 → { error }（oauth 免 key）；
- *  命中且凭证就绪 → 完整解析（provider/apiKey/auth 已按目标 provider 摆正）。 */
-export interface ResolvedModelTarget {
-  provider: ProviderConfig
-  providerName: string
-  apiKey: string
-  auth: AuthProvider | undefined
-  modelId: string
-  contextWindow?: number
-}
-export function resolveProviderForModel(ctx: Pick<BootstrapContext, 'config' | 'provider' | 'apiKey' | 'auth'>, modelId: string, targetProvider?: string): ResolvedModelTarget | { error: string } | null {
-  // Accept the `provider:modelId` / `provider:alias` form used by desktop
-  // session records. Before this parse, "deepseek:deepseek-v4-flash" never
-  // matched any provider model entry (id was compared with the prefix still
-  // attached) — the same false negative behind the 2026-09-08 resume failure.
-  // 首段只有确是已配置 provider 时才当前缀拆（#313：`cn:glm-5.3-flash` 整串是模型 id）。
-  const { provider: pinnedProvider, modelRef } = resolveModelRef(ctx.config.provider.providers, modelId, targetProvider)
-  const providerFilter = targetProvider ?? pinnedProvider
-  if (!modelRef) return null
-
-  for (const [provName, prov] of Object.entries(ctx.config.provider.providers)) {
-    if (providerFilter && provName !== providerFilter) continue
-    // 上面注释承诺的这个 form 是「provider:modelId / provider:alias」——所以末段也经别名表
-    // 归一再比（与 provider-keys.findModelOwner、main.ts 的解析同一口径）。此前只做精确比，
-    // `/model deepseek:v4-flash` 这类短名一律落空，表现为 "not found in any provider" 的
-    // 硬报错，而不是静默回退。精确命中优先、归一补位——别名 key 可能是池内某模型的真实 id。
-    // 池子同样取契约层（keys 池并集）：本函数是 /model 切换与 startup resume 的入口，
-    // 只读顶层快照会让「只在 key 池里」的模型永远解析不到。
-    const contractPool = contractModels(prov)
-    const wanted = canonicalizeModelId(modelRef)
-    const found = contractPool.find(m => m.id === modelRef)
-      ?? (wanted !== modelRef ? contractPool.find(m => m.id === wanted) : undefined)
-    if (!found) continue
-    let provider = ctx.provider
-    let apiKey = ctx.apiKey
-    let auth = ctx.auth
-    if (prov.auth?.type === 'oauth') {
-      if (provName !== ctx.provider.name) {
-        provider = prov
-        apiKey = ''
-        auth = createAuthProvider(prov.auth, process.env, prov.apiKey)
-      }
-    } else {
-      const provKey = prov.apiKey ?? process.env[prov.apiKeyEnv ?? ''] ?? (() => {
-        try { return resolveApiKey(prov) } catch { return undefined }
-      })()
-      if (!provKey) {
-        return { error: `API key not set for ${provName}. Set ${prov.apiKeyEnv ?? 'apiKey'} in config or environment.` }
-      }
-      if (provName !== ctx.provider.name || provKey !== apiKey) {
-        provider = prov
-        apiKey = provKey
-        auth = undefined
-      }
-    }
-    return { provider, providerName: provName, apiKey, auth, modelId: found.id, contextWindow: found.contextWindow }
-  }
-  return null
 }
 
 /**

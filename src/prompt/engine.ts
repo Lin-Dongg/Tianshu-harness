@@ -194,7 +194,6 @@ export class PromptEngine {
    */
   private firstUserKey: string | null = null
   private taskProgress?: TaskState
-  private repairHint?: string | null
   private toolContext?: string | null
   private planCacheAdvisory?: string | null
   /** U6: serialized PlanExecutionTrace appendix (survives compaction). */
@@ -206,7 +205,6 @@ export class PromptEngine {
   /** Advisory text — only set when task depth layer changes, null otherwise to avoid noise. */
   private taskDepthAdvisory: string | null = null
   private planMethodology?: import('../context/task-contract.js').PlanMethodology
-  private planMethodologyReason?: string
   /** Whether the last setPlanMethodology was under Plan Mode (design-doc advisory). */
   private planMethodologyPlanMode = false
   /** Advisory text — only set when methodology changes, null otherwise to avoid noise. */
@@ -1184,8 +1182,9 @@ export class PromptEngine {
     this.taskProgress = state
   }
 
-  setRepairHint(hint: string | null): void {
-    this.repairHint = hint
+  setRepairHint(_hint: string | null): void {
+    // no-op：repairHint 字段已不被读取（内核死代码清理，2026-10）。
+    // 保留方法签名以维持内核调用方与测试不变。
   }
 
 
@@ -1246,7 +1245,6 @@ export class PromptEngine {
     const changed = this.planMethodology !== methodology
       || this.planMethodologyPlanMode !== !!opts?.planMode
     this.planMethodology = methodology
-    this.planMethodologyReason = reason
     this.planMethodologyPlanMode = !!opts?.planMode
     // Only inject the advisory when methodology changes or is first set.
     // Repeated identical advisory every turn is pure noise (~60 tokens/turn).

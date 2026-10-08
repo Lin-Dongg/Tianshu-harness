@@ -40,15 +40,18 @@ function cipherFor(base?: string): SecretCipher {
   return createSecretCipher(dirname(secretsPath(base)))
 }
 
-function readStore(base?: string): SecretsFile | undefined {
+function readStore(base?: string, forWrite = false): SecretsFile | undefined {
   try {
     const raw = readFileSync(secretsPath(base), 'utf-8')
     const plain = decodeSecret(cipherFor(base), raw)
-    if (plain === null) return undefined
+    if (plain === null) throw new Error('unreadable store')
     const parsed = JSON.parse(plain) as Partial<SecretsFile>
-    if (parsed.version !== 1 || typeof parsed.keys !== 'object' || parsed.keys === null) return undefined
+    if (parsed.version !== 1 || typeof parsed.keys !== 'object' || parsed.keys === null) throw new Error('invalid store')
     return { version: 1, keys: parsed.keys as Record<string, string> }
-  } catch {
+  } catch (error) {
+    if (forWrite && (error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw new Error('Existing model credentials could not be read; refusing to overwrite them')
+    }
     return undefined
   }
 }
@@ -69,7 +72,7 @@ export function readSecret(keyRef: string, base?: string): string | undefined {
 }
 
 export function writeSecret(keyRef: string, value: string, base?: string): void {
-  const store = readStore(base) ?? { version: 1 as const, keys: {} }
+  const store = readStore(base, true) ?? { version: 1 as const, keys: {} }
   store.keys[keyRef] = value
   writeStore(store, base)
 }

@@ -426,7 +426,7 @@ export function isSandboxActive(env: NodeJS.ProcessEnv = process.env): boolean {
  */
 export function applySandboxPolicyForApprovalMode(
   approvalMode: string | undefined,
-  env: NodeJS.ProcessEnv = process.env,
+  _env: NodeJS.ProcessEnv = process.env,
 ): void {
   // Approval mode no longer drives the sandbox (yolo = full permission).
   // Sandbox is opt-in via explicit RIVET_SANDBOX=1 only.

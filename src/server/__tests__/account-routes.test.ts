@@ -14,12 +14,14 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createRouter } from '../index.js'
 import { buildAccountRoutes, type AccountApi } from '../account-routes.js'
 import { TokenStore } from '../../auth/token-store.js'
+import { readSecret, writeSecret, secretsPath } from '../../config/secrets-store.js'
+import { __resetSecretCipherCache } from '../../auth/secure-store.js'
 import {
   accountIdentityUrl,
   accountManageUrl,
@@ -299,6 +301,36 @@ test('POST /account/logout 清账号凭据，但不碰 provider 凭据', async (
       '登出天枢账号不得顺手清掉 provider 登录',
     )
   } finally {
+    cleanup()
+  }
+})
+
+test('退出天枢账号并重新授权保留模型配置、Key 池和可解密的 API Key，重启后也可读', async () => {
+  const { home, cleanup } = makeHome()
+  const previous = process.env.RIVET_TOKEN_STORE
+  try {
+    process.env.RIVET_TOKEN_STORE = 'local-key'
+    const files = [join(home, 'config.json'), join(home, 'provider-keys.json')]
+    writeFileSync(files[0]!, JSON.stringify({ provider: { default: 'custom', providers: { custom: { keyRef: 'model-key' } } } }))
+    writeFileSync(files[1]!, JSON.stringify({ version: 1, providers: { custom: [{ id: 'key-1', keyRef: 'model-key', models: [{ id: 'fixture-model' }] }] } }))
+    writeSecret('model-key', 'fixture-api-key', home)
+    files.push(secretsPath(home))
+    const before = files.map(file => readFileSync(file))
+    new TokenStore(home, 'account').save({ accessToken: 'fixture-old-account', expiresAt: Date.now() + 3600000 })
+    const route = routerFor(home, {
+      checkDeviceOnce: async () => ({ status: 'approved', accessToken: 'fixture-new-account', expiresIn: 3600 }),
+    })
+    assert.equal((await route('POST', '/account/logout', {}, AUTH)).status, 200)
+    assert.equal((await route('POST', '/account/device', {}, AUTH)).status, 200)
+    assert.equal((await route('POST', '/account/poll', { deviceCode: DEVICE.deviceCode }, AUTH)).status, 200)
+    assert.equal(new TokenStore(home, 'account').load()?.accessToken, 'fixture-new-account')
+    files.forEach((file, i) => assert.deepEqual(readFileSync(file), before[i]))
+    __resetSecretCipherCache()
+    assert.equal(readSecret('model-key', home), 'fixture-api-key')
+  } finally {
+    if (previous === undefined) delete process.env.RIVET_TOKEN_STORE
+    else process.env.RIVET_TOKEN_STORE = previous
+    __resetSecretCipherCache()
     cleanup()
   }
 })

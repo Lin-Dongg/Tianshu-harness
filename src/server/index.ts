@@ -119,6 +119,8 @@ export interface StartServerOptions {
   host?: string
   /** Host header allowlist（不带端口）。配置后非回环 Host 仅 allowlist 放行。 */
   allowedHosts?: string[]
+  /** Explicit HTTPS proxy host registered by the authenticated desktop settings. */
+  additionalAllowedHosts?: () => string[]
   /**
    * P2 Mobile Remote — /mobile 静态挂载目录。配置后 GET /mobile 与 /mobile/* 在
    * auth 门前直接服务该目录内的前端资产（免 Bearer）；未配置则 /mobile 一律 404。
@@ -268,6 +270,7 @@ export async function startServer(
     if (host === undefined) return true
     const h = host.toLowerCase()
     if (isLoopbackHostHeader(h, p)) return true
+    if (opts.additionalAllowedHosts?.().includes(stripHostPort(h))) return true
     if (allowlistConfigured) return allowlist.includes(stripHostPort(h))
     return false
   }

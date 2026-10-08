@@ -105,7 +105,7 @@ export function createDeadEndDetectorHook(
     phase: 'postTool',
     name: 'dead-end-detector',
     getCycleCount(file: string) { return files.get(file)?.cycles ?? 0 },
-    async run(ctx: RuntimeHookContext, tool: RuntimeToolEvent): Promise<void> {
+    async run(_ctx: RuntimeHookContext, tool: RuntimeToolEvent): Promise<void> {
       // ── 编辑:标记所有被修改文件进入"等待验证"───────────────
       if (WRITE_TOOL_NAMES.has(tool.name) && tool.success) {
         for (const file of extractWriteFilePaths(tool.name, tool.input as Record<string, unknown> | undefined)) {

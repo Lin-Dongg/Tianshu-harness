@@ -861,9 +861,6 @@ function createNullDb(): any {
   })
 }
 
-/** Current Meridian data schema version (mirrored to PRAGMA user_version). */
-const MERIDIAN_SCHEMA_VERSION = 2
-
 /**
  * One-shot migration to schema v1: purge historical dirty rows — absolute-path
  * file rows (written before toRepoRelative fail-closed) and dangling imports edges

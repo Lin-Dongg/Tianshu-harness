@@ -26,7 +26,6 @@ function extractTopDir(filePath: string): string {
 }
 
 const NUDGE_FILE_THRESHOLD = 4
-const NUDGE_AREA_THRESHOLD = 2
 
 /**
  * Build a commit nudge string to append to tool results after file writes.

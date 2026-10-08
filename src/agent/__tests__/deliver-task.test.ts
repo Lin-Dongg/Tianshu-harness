@@ -51,6 +51,8 @@ function makeContext(opts: {
   claimTracker?: import('../hooks/external-claim-tracking-hook.js').ClaimTracker
   scoutFirewall?: boolean
   completeBaseline?: boolean
+  recaptureBaseline?: (cwd: string) => boolean
+  repoRoot?: string
 }) {
   const baseline = createWorktreeBaseline({
     branch: 'feat/b1',
@@ -66,7 +68,7 @@ function makeContext(opts: {
   const ownership = createOwnershipLedger({ baseline, taskLedger: ledger })
   ownership.autoOwnFromLedger()
   const attribution = createVerificationAttribution({ ownership })
-  const gate = createDeliveryGateV2({ taskLedger: ledger, ownership, attribution })
+  const gate = createDeliveryGateV2({ taskLedger: ledger, ownership, attribution, ...(opts.repoRoot ? { repoRoot: opts.repoRoot } : {}) })
 
   const tool = createDeliverTaskTool(() => ({
     taskLedger: ledger,
@@ -76,6 +78,7 @@ function makeContext(opts: {
     sessionId: opts.sessionId,
     getCurrentDirtyFiles: () => opts.dirtyFiles,
     getProjectMemoryContent: () => opts.projectMemory,
+    recaptureBaseline: opts.recaptureBaseline,
     commitOwnedFiles: opts.commitOwnedFiles,
     routeReviewWorkflow: opts.disableReviewDeps
       ? opts.routeReviewWorkflow
@@ -160,6 +163,39 @@ describe('deliver-task — semantic task delivery tool', () => {
     const result = await tool.execute(params)
     assert.equal(result.isError ?? false, false)
     assert.ok(result.content.includes('RED'))
+  })
+
+  it('L4: stale 判废 + 越界 owned 路径时输出修复指引，不再报 "no tests were run"（4251eea67 审查 P2）', async () => {
+    const { tool, params } = makeContext({
+      taskId: 'l4-stale-out-of-root',
+      ownedFiles: ['src/a.ts', '/tmp/l4-out-fixture.ts'],
+      repoRoot: '/fake/project',
+      verifications: [{ command: 'npm test', status: 'passed', meta: { stale: true } }],
+    })
+
+    const result = await tool.execute(params)
+    assert.equal(result.isError ?? false, false)
+    assert.ok(result.content.includes('none usable'), 'stale 判废清空有效验证时要说出真实形态（跑过但被丢弃）')
+    // 指引文案本身会引用 "no tests were run" 这个被替代的形态，断言要锚在原来的误导整行上。
+    assert.ok(!result.content.includes('Verifications: none (no tests were run for this task)'), '不得再报误导性的 "no tests were run" 整行')
+    assert.ok(!result.content.includes('no test suite was executed'), '"没有测试被执行"同样是误诊')
+    assert.ok(result.content.includes('仓库根之外'), '要输出越界指引')
+    assert.ok(result.content.includes('/tmp/l4-out-fixture.ts'), '越界路径要点名')
+    assert.ok(result.content.includes('移入仓库内'), '指引要含修复动作（替代 no tests were run 的 L4 承诺）')
+  })
+
+  it('L4: stale 判废但路径全部仓内 → 说真实形态但不给越界指引', async () => {
+    const { tool, params } = makeContext({
+      taskId: 'l4-stale-in-repo',
+      ownedFiles: ['src/a.ts'],
+      repoRoot: '/fake/project',
+      verifications: [{ command: 'npm test', status: 'passed', meta: { stale: true } }],
+    })
+
+    const result = await tool.execute(params)
+    assert.equal(result.isError ?? false, false)
+    assert.ok(result.content.includes('none usable'), '仓内再编辑类判废也要说真实形态')
+    assert.ok(!result.content.includes('仓库根之外'), '没有越界路径时不得误指越界（失效方向：宁缺勿误）')
   })
 
   it('W1: commit=true blocked when impacted tests were never covered (module_unverified → RED)', async () => {
@@ -3297,5 +3333,45 @@ describe('PR #371 — incomplete baseline commit boundary', () => {
     assert.match(result.content, /Delivery Gate: YELLOW/)
     assert.match(result.content, /Owned files \(1\):/)
     assert.match(result.content, /src\/app\.ts/)
+  })
+
+  it('恢复路径：基线 incomplete → 现场重采成功 → commit 不再被硬阻断（会话中途 git init）', async () => {
+    let commitCalls = 0
+    let recaptureCalls = 0
+    const { tool, params } = makeContext({
+      taskId: 'incomplete-recapture-ok',
+      ownedFiles: ['src/app.ts'],
+      dirtyFiles: ['src/app.ts'],
+      verifications: [{ command: 'npx vitest run', status: 'passed' }],
+      completeBaseline: false,
+      disableReviewDeps: true,
+      isAutoReviewOff: true,
+      recaptureBaseline: () => { recaptureCalls++; return true },
+      commitOwnedFiles: () => { commitCalls++; return { ok: true, output: 'created' } },
+    })
+    const result = await tool.execute({ ...params, input: { commit: true, message: 'fix: app' } })
+    assert.equal(recaptureCalls, 1, '硬门触发时应现场重采一次')
+    assert.equal(commitCalls, 1, '重采成功后应放行到 commit 执行器')
+    assert.notEqual(result.isError, true)
+    assert.doesNotMatch(result.content, /归属基线未完整建立/)
+  })
+
+  it('恢复路径：现场重采仍失败（非 git 工作区）→ 仍硬阻断，force 不豁免', async () => {
+    let commitCalls = 0
+    const { tool, params } = makeContext({
+      taskId: 'incomplete-recapture-fail',
+      ownedFiles: ['src/app.ts'],
+      dirtyFiles: ['src/app.ts'],
+      verifications: [{ command: 'npx vitest run', status: 'passed' }],
+      completeBaseline: false,
+      disableReviewDeps: true,
+      recaptureBaseline: () => false,
+      commitOwnedFiles: () => { commitCalls++; return { ok: true, output: 'unexpected commit' } },
+    })
+    const result = await tool.execute({ ...params, input: { commit: true, force: true, message: 'fix: app' } })
+    assert.equal(result.isError, true)
+    assert.equal(result.errorKind, 'delivery_gate')
+    assert.match(result.content, /归属基线未完整建立/)
+    assert.equal(commitCalls, 0)
   })
 })

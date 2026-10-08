@@ -1,9 +1,9 @@
 import { describe, it, before, after, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, realpathSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, rmSync, realpathSync, writeFileSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { loadConfig, runConfigCLI, type ConfigCliIO } from '../manager.js'
+import { loadConfig, setNetworkConfig, runConfigCLI, type ConfigCliIO } from '../manager.js'
 import { resolveTransportType } from '../../mcp/transport-factory.js'
 
 function makeIo() {
@@ -38,6 +38,19 @@ describe('runConfigCLI provider commands', () => {
     assert.equal(exits.length, 0)
     assert.match(stdout.join('\n'), /Usage: rivet config <command>/)
     assert.match(stdout.join('\n'), /setup <provider>/)
+  })
+
+  it('normalizes bare HTTP proxies and rejects invalid saves without replacing existing settings', () => {
+    assert.equal(setNetworkConfig({ proxy: '127.0.0.1:7890' }).proxy, 'http://127.0.0.1:7890')
+    const path = process.env.RIVET_CONFIG_PATH!
+    const saved = readFileSync(path, 'utf8')
+    for (const proxy of ['http://', 'wrong', 'socks5://127.0.0.1:1080', 'http://localhost:99999', 'http://localhost/path']) {
+      assert.throws(() => setNetworkConfig({ proxy }), { message: 'invalid_proxy_url' })
+      assert.equal(readFileSync(path, 'utf8'), saved)
+    }
+    writeFileSync(path, JSON.stringify({ network: { proxy: 'http://' } }))
+    assert.equal(loadConfig().network.proxy, 'http://', 'legacy invalid settings must not prevent loading')
+    assert.equal(setNetworkConfig({ proxy: '' }).proxy, '', 'clearing must recover a legacy invalid setting')
   })
 
   it('prints help and /connect guidance when config has no args in TTY', async () => {

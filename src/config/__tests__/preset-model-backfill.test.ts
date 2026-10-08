@@ -11,6 +11,7 @@ import {
   migratePresetModelBackfill,
 } from '../preset-model-backfill.js'
 import { cloneProviderPreset, findPresetModel } from '../provider-presets.js'
+import { contractModels } from '../contract-models.js'
 import { loadConfig, setApiKey } from '../manager.js'
 import type { Config, ModelConfig, ProviderConfig } from '../schema.js'
 
@@ -168,6 +169,57 @@ describe('backfillProviderFromPreset', () => {
     const provider = cloneProviderPreset('minimax')
     assert.equal(backfillProviderFromPreset('minimax', provider), provider)
   })
+
+  // keys 池是契约层唯一事实源（contractModels 只认 keys 并集，不回退顶层快照）。
+  // 只补顶层 = 池里的卡永远拿不到 preset 后来声明的 supportVision，消费方
+  // （CLI 识图候选 / /config 投影 / 桌面端视觉设置）读到的都是「不支持视觉」。
+  it('refills capability fields inside every key pool (契约层事实源)', () => {
+    const stale: ModelConfig = { id: 'MiniMax-M3', contextWindow: 1_000_000, maxTokens: 64000 }
+    const provider: ProviderConfig = {
+      ...cloneProviderPreset('minimax'),
+      models: [{ ...stale }],
+      keys: [
+        { id: 'default', models: [{ ...stale }] },
+        { id: 'backup', models: [{ ...stale }] },
+      ],
+    }
+    const out = backfillProviderFromPreset('minimax', provider)
+    assert.equal(out.keys![0]!.models[0]?.supportsVision, true, '默认 key 池')
+    assert.equal(out.keys![1]!.models[0]?.supportsVision, true, '次级 key 池')
+    assert.equal(
+      out.keys![0]!.models[0]?.pricing?.input,
+      findPresetModel('minimax', 'MiniMax-M3')!.pricing!.input,
+      '定价等其余白名单字段一并补齐',
+    )
+  })
+
+  it('keeps an explicit false inside a key pool (用户表态不回灌)', () => {
+    const provider: ProviderConfig = {
+      ...cloneProviderPreset('minimax'),
+      models: [{ id: 'MiniMax-M3', contextWindow: 1_000_000, maxTokens: 64000, supportsVision: false }],
+      keys: [{
+        id: 'default',
+        models: [{ id: 'MiniMax-M3', contextWindow: 1_000_000, maxTokens: 64000, supportsVision: false }],
+      }],
+    }
+    const out = backfillProviderFromPreset('minimax', provider)
+    assert.equal(out.keys![0]!.models[0]?.supportsVision, false)
+  })
+
+  it('keeps the top-level array shared with keys[0] when both hold the same array', () => {
+    // 迁移那一刻 keys[0].models 与顶层 models 是同一数组（provider-keys.ts）。
+    // 回填若各自 map 就拆掉这份共享，后续对顶层的写入不再反映到池——正是本次
+    // 要修的漂移形态。
+    const shared: ModelConfig[] = [{ id: 'MiniMax-M3', contextWindow: 1_000_000, maxTokens: 64000 }]
+    const provider: ProviderConfig = {
+      ...cloneProviderPreset('minimax'),
+      models: shared,
+      keys: [{ id: 'default', models: shared }],
+    }
+    const out = backfillProviderFromPreset('minimax', provider)
+    assert.equal(out.keys![0]!.models, out.models, '同一数组引用保持共享')
+    assert.equal(out.models[0]?.supportsVision, true)
+  })
 })
 
 describe('backfillPresetModelFields', () => {
@@ -221,6 +273,58 @@ describe('loadConfig integration', () => {
     const model = loadConfig().provider.providers.minimax!.models.find(m => m.id === 'MiniMax-M3')!
     assert.equal(model.supportsVision, true)
     assert.equal(model.maxTokens, 131072, 'the user tuned value is preserved')
+  })
+
+  // issue #386 验收面：存量配置里（keys 池形态 = 契约层事实源）的 MiMo V2.6 卡，
+  // loadConfig 后必须补上 supportsVision，否则 CLI 识图候选与桌面端视觉设置
+  // 都看不到这款全模态模型——用户表现就是「模型明明能读图，却选不了」。
+  it('repairs the V2.6 vision flag inside a key pool at load time (issue #386)', () => {
+    writeFileSync(configPath, JSON.stringify({
+      provider: {
+        default: 'mimo',
+        providers: {
+          mimo: {
+            ...cloneProviderPreset('mimo'),
+            apiKey: 'sk-test',
+            userSaved: true,
+            // 迁移那刻的存量形态：顶层快照与 keys[0] 持有同一份卡，且都没写
+            // supportsVision（建卡时元数据里还没有这条）。
+            models: [{ id: 'mimo-v2.6-flash', contextWindow: 1_000_000, maxTokens: 128_000 }],
+            keys: [{
+              id: 'default',
+              models: [{ id: 'mimo-v2.6-flash', contextWindow: 1_000_000, maxTokens: 128_000 }],
+            }],
+          },
+        },
+      },
+    }))
+    const provider = loadConfig().provider.providers.mimo!
+    const model = contractModels(provider).find(m => m.id === 'mimo-v2.6-flash')!
+    assert.equal(model.supportsVision, true, '池里的 V2.6 卡必须拿到视觉标记（识图候选读它）')
+    assert.equal(model.pricing?.input, 0.14, '定价随预设补齐')
+    assert.equal(model.tier, 'cheap')
+  })
+
+  it('keeps a user-unchecked V2.6 card unchecked across reload (显式 false 不回灌)', () => {
+    writeFileSync(configPath, JSON.stringify({
+      provider: {
+        default: 'mimo',
+        providers: {
+          mimo: {
+            ...cloneProviderPreset('mimo'),
+            apiKey: 'sk-test',
+            userSaved: true,
+            models: [],
+            keys: [{
+              id: 'default',
+              models: [{ id: 'mimo-v2.6-pro', contextWindow: 1_000_000, maxTokens: 128_000, supportsVision: false }],
+            }],
+          },
+        },
+      },
+    }))
+    const model = contractModels(loadConfig().provider.providers.mimo!).find(m => m.id === 'mimo-v2.6-pro')!
+    assert.equal(model.supportsVision, false, '用户显式取消的勾选不得被预设回灌')
   })
 
   it('heals the file itself on the next write', () => {

@@ -105,6 +105,7 @@ import { SessionJobs, type JobEvent } from '../tools/job-store.js'
 import { buildUserQuestionEvent } from './user-question-event.js'
 import { grantApp as grantComputerUseApp, resolveRememberedComputerUseApp } from '../tools/computer-use/app-grants.js'
 import { approvalPathGrant, buildApprovalSnapshot } from './approval-snapshot.js'
+import { readClaimConflict } from '../agent/claim-liveness.js'
 import { applySandboxPolicyForApprovalMode } from '../tools/sandbox-profile.js'
 import {
   DELEGATE_CAPABILITY_TTL_MS,
@@ -4088,7 +4089,10 @@ export class RuntimeSessionManager {
     await this.ensureEventsAsync(s)
     const input = await loadTitleInput(s.record, s.events, this.persistence)
     if (!input) return true
-    await this.ensureAgentAsync(s)
+    // cwd 已删 / 配置失效的会话建不出 agent（ensureSessionAgent 同口径）。构建只是
+    // 为了拿到模型候选——失败时照常交给协调器：无候选即落 fallback 标题 + failed 态，
+    // 与该特性其余路径一致地 fail-open，绝不让路由抛成 500。
+    try { await this.ensureAgentAsync(s) } catch { /* fail-open — 无模型候选的降级由协调器表达 */ }
     await this.titles.generate(id, input, explicit)
     return true
   }
@@ -5030,11 +5034,17 @@ export class RuntimeSessionManager {
       if (!force && activity.sessions + activity.tasks > 0) throw new Error('UPDATE_BUSY')
       if (force) {
         this.abortAll()
+        const jobCleanups: Promise<void>[] = []
         for (const s of this.sessions.values()) {
           for (const controller of s.backgroundAborts?.values() ?? []) controller.abort()
           for (const workerId of s.pendingDelegations.keys()) this.killWorker(s.record.id, workerId)
-          s.jobs?.killAll()
+          // 更新重启随即替换二进制/数据文件（Windows 要求句柄全关）——必须等
+          // job 子进程 close + 日志流关闭，只发信号（killAll）句柄仍在。
+          // killAllAsync 内部先同步发信号再等待，时序语义与 killAll 一致；
+          // 拒绝吞掉：句柄晚关优于挡住更新链。
+          if (s.jobs) jobCleanups.push(s.jobs.killAllAsync().catch(() => undefined))
         }
+        await Promise.all(jobCleanups)
       }
       while (true) {
         signal.throwIfAborted()
@@ -5098,7 +5108,11 @@ export class RuntimeSessionManager {
       } else if (shutdownResult !== false) {
         releaseIdleClaims()
       }
-      try { s.jobs?.killAll() } catch { /* best-effort */ }
+      // 进程退出路径必须等 job 子进程 close + 日志流关闭（Windows 句柄未关会
+      // 挡住紧随其后的文件操作；PR #364 的 killAllAsync 此前只被测试消费）。
+      // killAllAsync 先同步发信号（与 killAll 等价）再等待；拒绝吞掉——句柄
+      // 晚关优于关停失败。
+      if (s.jobs) pending.push(s.jobs.killAllAsync().catch(() => undefined))
       // Drain any coalescing delta window so the tail is never lost on exit.
       try { this.flushDeltaBuf(s) } catch { /* best-effort */ }
       try { this.flushToolResultBuf(s) } catch { /* best-effort */ }
@@ -6597,11 +6611,15 @@ export class RuntimeSessionManager {
       session.pending.set(requestId, pend)
       this.recountApprovals(session)
       const pathGrant = approvalPathGrant(session.record.cwd, name, input)
+      // 认领冲突标记提升为命名事件字段：桌面审批卡据此渲染「是否接管」语义，
+      // 不必从 input 里解析 `__` 前缀内部键（redactValue 不透出该约定）。
+      const claimConflict = readClaimConflict(input) ?? undefined
       this.append(session, 'approval_required', {
         requestId,
         toolName: name,
         input: redactValue(input),
         ...(pathGrant ? { pathGrant } : {}),
+        ...(claimConflict ? { claimConflict } : {}),
       })
       // Persist the pendingApprovals count NOW — if the sidecar dies while
       // blocked on this approval, rehydrate() uses the on-disk count as the

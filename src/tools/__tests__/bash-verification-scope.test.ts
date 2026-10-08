@@ -73,6 +73,8 @@ test('复合 shell 给出可复制的单条建议命令（blocked 时不能只�
     'node --import tsx --test src/a.test.ts',
   )
   assert.equal(suggestSingleCommand('git status && npm test'), 'npm test')
+  // gradle 模块任务路径同样能切出可复制的单条（#380 收尾）
+  assert.equal(suggestSingleCommand('cd repo && ./gradlew :app:test | tail -5'), './gradlew :app:test')
   // 引号里的分隔符不该把命令切坏
   assert.equal(suggestSingleCommand(`cd x && node --import tsx --test "src/a b.test.ts"`), 'node --import tsx --test "src/a b.test.ts"')
   // 已经是单条 → 无需建议（避免把同一条命令回显成"建议"）

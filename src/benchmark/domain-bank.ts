@@ -96,11 +96,17 @@ const CATEGORY_BY_TASK_TYPE = {
   test: 'test_repair',
 } as const
 
-/** 题库 → scripts/experiments/taiyi-variant-pilot.ts 消费的 suite 形状（{tasks:[...]}）。 */
+/**
+ * 题库 → scripts/experiments/taiyi-variant-pilot.ts 消费的 suite 形状（{tasks:[...]}）。
+ *
+ * `contractGiven` 必须随投影走：它是「禁作能力对比」标记，丢弃会让下游 suite
+ * 消费方（taiyi-variant-pilot / loadTaskSuite）机读止步于题库层——taskDefinitionSchema
+ * 已同步该字段（optional），zod 默认剥未知 key 不会再把它吃掉。
+ */
 export function toPilotSuite(
   bank: DomainBank,
   opts?: { status?: z.infer<typeof domainTaskStatusSchema>; ids?: string[] },
-): { tasks: Array<{ id: string; title: string; category: string; prompt: string; timeoutMs: number; tags: string[] }> } {
+): { tasks: Array<{ id: string; title: string; category: string; prompt: string; timeoutMs: number; tags: string[]; contractGiven: boolean }> } {
   const tasks = bank.tasks
     .filter(t => (opts?.status ? t.status === opts.status : true))
     .filter(t => (opts?.ids ? opts.ids.includes(t.id) : true))
@@ -111,6 +117,7 @@ export function toPilotSuite(
       prompt: t.symptom,
       timeoutMs: t.timeoutMs,
       tags: t.tags,
+      contractGiven: t.contractGiven,
     }))
   return { tasks }
 }

@@ -30,7 +30,14 @@ export function attachDecisionSession(app: TuiApp, current: () => AgentLoop, onP
   agent.onAskUserQuestionRequested = info => {
     const generation = app.runGen, epoch = app.decisions.epoch
     setImmediate(() => {
-      if (current() === agent && app.runGen === generation && app.decisions.epoch === epoch) app.openAskUserQuestionPanel(info)
+      if (current() === agent && app.runGen === generation && app.decisions.epoch === epoch) {
+        app.openAskUserQuestionPanel(info)
+        return
+      }
+      // 面板没起来（Esc abort 改了 runGen / 切会话切目录改了 epoch）：handleToolResult
+      // 已把卡挂起，面板永远不会出现，不兜底归档的话提问挂到退出才以「未作答」出现。
+      // 卡尚未落位/已被归档时此调用静默无操作，不会重复落卡。
+      if (info.requestId) app.archiveDroppedAskCard(info.requestId)
     })
   }
   const state = deliverySessions.get(app) ?? { epoch: app.decisions.epoch, deliveries: new Map<string, DecisionDelivery>() }

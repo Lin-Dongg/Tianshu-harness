@@ -16,12 +16,16 @@
  * @task B1-7
  */
 
+import { realpathSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { spawnGitSync } from '../tools/spawn-git.js'
 import type { TaskLedger } from './task-ledger.js'
 import type { OwnershipLedger } from './ownership-ledger.js'
 import type { VerificationAttribution, AttributionClass } from './verification-attribution.js'
 import { getEffectiveVerifications, assessImpactedTestCoverage, isInvocationFailure } from './verification-attribution.js'
+import { hasIsolatedComparison } from './verification-comparison.js'
 import { summarizeOwnershipHealth } from './ownership-health.js'
+import { classifyFingerprintPath } from './task-state-persist.js'
 import type { VerificationMetadata } from '../tools/types.js'
 
 // ─── External-file noise filtering (C-fix, session 803d897d) ───────────────
@@ -43,6 +47,9 @@ const JUNK_PATH_PREFIXES = [
 export function isJunkExternalPath(file: string): boolean {
   return JUNK_PATH_PREFIXES.some(prefix => file.startsWith(prefix))
 }
+
+/** Same canonicalization as the fingerprint layer (task-state-persist rootOf). */
+function canonicalRoot(path: string): string { try { return realpathSync(path) } catch { return resolve(path) } }
 
 /** Files matched by .gitignore (batched `git check-ignore`). Fails open to []. */
 function gitIgnoredSubset(files: string[], cwd: string): Set<string> {
@@ -96,11 +103,19 @@ export interface DeliveryGateResult {
   /** Count of verifications dropped because their snapshotRef is stale
    *  (owned diff changed since they ran — ran on outdated code). */
   staleSnapshotDropped: number
-  /** Count of verifications dropped because their workspace fingerprint was
-   *  unavailable/mismatched (meta.stale === true) — distinct from snapshotRef
-   *  staleness. Typically: an owned path resolved outside the repo root, so no
-   *  comparable fingerprint could be computed. */
+  /** Count of verifications dropped on the workspace-fingerprint dimension
+   *  (meta.stale === true) — ALL stale drops, distinct from snapshotRef staleness.
+   *  典型病因两类：① 仓内再编辑（验证后 owned/仓内文件又被改写——正常开发循环的
+   *  良性多数，可频繁非零）；② 指纹不可计算（敏感路径/非 git 工作区/4251eea67
+   *  前台账的越界 owned 路径）。越界类病因的修复指引锚点见
+   *  {@link outOfRootFingerprintPaths}。 */
   staleFingerprintDropped: number
+  /** L4 指引锚点：owned/写入路径解析到仓库根之外的清单。仅在
+   *  staleFingerprintDropped > 0 且确有越界路径时出现——deliver_task 据此输出
+   *  「越界 → 旧台账指纹不可计算 → 移入仓内重跑验证」的修复指引，替代
+   *  "no tests were run" 的误导形态。缺席 = 没有可行动的越界角度（仓内再编辑
+   *  类判废只需重跑验证，不需要指引）。 */
+  outOfRootFingerprintPaths?: string[]
   latestVerificationTotals?: { passed?: number; failed?: number; skipped?: number; countsReliable?: boolean; command: string; executionId?: string; timestamp?: number; durationMs?: number; executionComplete?: boolean }
   /** @deprecated use supersededFailures instead — renamed for semantic clarity. */
   staleFailureCandidates: number
@@ -135,9 +150,11 @@ export interface DeliveryReport {
   supersededFailures: number
   /** Count of verifications dropped because their snapshotRef is stale. */
   staleSnapshotDropped: number
-  /** Count of verifications dropped because their workspace fingerprint was
-   *  unavailable/mismatched (meta.stale === true) — see DeliveryGateResult. */
+  /** Count of verifications dropped on the workspace-fingerprint dimension
+   *  (meta.stale === true) — all stale drops; 病因分类见 DeliveryGateResult。 */
   staleFingerprintDropped: number
+  /** 越界 owned/写入路径清单 — see DeliveryGateResult.outOfRootFingerprintPaths。 */
+  outOfRootFingerprintPaths?: string[]
   /** Latest verification pass/fail/skipped totals — for "声明即实测" echo in deliver_task output.
    *  Agents copy these numbers into delivery reports instead of guessing from memory. */
   latestVerificationTotals?: { passed?: number; failed?: number; skipped?: number; countsReliable?: boolean; command: string; executionId?: string; timestamp?: number; durationMs?: number; executionComplete?: boolean }
@@ -212,8 +229,13 @@ export function createDeliveryGateV2(opts: {
   taskLedger: TaskLedger
   ownership: OwnershipLedger
   attribution: VerificationAttribution
+  /** 仓库根（会话 cwd）。提供时启用越界路径诊断（outOfRootFingerprintPaths）。 */
+  repoRoot?: string
 }): DeliveryGateV2 {
   const { taskLedger, ownership, attribution } = opts
+  // 与指纹层（task-state-persist rootOf）同口径：root 需 canonical，否则 macOS
+  // /var→/private/var 符号链接会把仓内绝对路径误判成越界。
+  const repoRoot = opts.repoRoot ? canonicalRoot(opts.repoRoot) : undefined
 
   const emptyDiagnostics = {
     supersededFailures: 0,
@@ -229,11 +251,28 @@ export function createDeliveryGateV2(opts: {
     return isInvocationFailure(v)
   }
 
-  function verificationDiagnostics(verifications: VerificationMetadata[], supersededFailures: number, staleSnapshotDropped: number, staleFingerprintDropped: number): Pick<DeliveryGateResult, 'supersededFailures' | 'staleFailureCandidates' | 'staleSnapshotDropped' | 'staleFingerprintDropped' | 'toolInvocationFailureCandidates' | 'shortestNextStep'> {
+  // L4 观测（交付门指纹治理计划，4251eea67 审查 P2）：stale 丢弃与「owned/写入路径
+  // 在仓库根之外」并存时给出越界清单，供 deliver_task 输出修复指引——否则病因被报成
+  // "no tests were run"。与计数分工：staleFingerprintDropped 统计所有 stale 丢弃
+  // （仓内再编辑是良性多数），本字段只在确有越界路径时出现，把指引锚在可行动的那一类。
+  // 失效方向：宁可缺席（少指引）也不在纯仓内判废时误指越界。
+  function outOfRootFingerprintPaths(staleFingerprintDropped: number): string[] | undefined {
+    if (!repoRoot || staleFingerprintDropped === 0) return undefined
+    const candidates = new Set<string>()
+    for (const event of taskLedger.getEvents()) {
+      if (event.type === 'file_write' && event.path) candidates.add(event.path)
+    }
+    for (const file of ownership.getOwnedFiles()) candidates.add(file)
+    const outside = [...candidates].filter(p => classifyFingerprintPath(repoRoot, p) === 'out-of-project').sort()
+    return outside.length > 0 ? outside : undefined
+  }
+
+  function verificationDiagnostics(verifications: VerificationMetadata[], supersededFailures: number, staleSnapshotDropped: number, staleFingerprintDropped: number): Pick<DeliveryGateResult, 'supersededFailures' | 'staleFailureCandidates' | 'staleSnapshotDropped' | 'staleFingerprintDropped' | 'toolInvocationFailureCandidates' | 'shortestNextStep' | 'outOfRootFingerprintPaths'> {
     const invocationFailures = verifications.filter(isToolInvocationFailure)
     const shortestNextStep = invocationFailures
       .map(v => v.recommendedCommand ?? v.resolvedCommand)
       .find((cmd): cmd is string => typeof cmd === 'string' && cmd.length > 0)
+    const outOfRoot = outOfRootFingerprintPaths(staleFingerprintDropped)
     return {
       supersededFailures,
       staleFailureCandidates: supersededFailures,
@@ -241,6 +280,7 @@ export function createDeliveryGateV2(opts: {
       staleFingerprintDropped,
       toolInvocationFailureCandidates: invocationFailures.map(v => v.command),
       ...(shortestNextStep ? { shortestNextStep } : {}),
+      ...(outOfRoot ? { outOfRootFingerprintPaths: outOfRoot } : {}),
     }
   }
 
@@ -353,23 +393,47 @@ export function createDeliveryGateV2(opts: {
       ? assessImpactedTestCoverage(moduleCoverage.impactedTests, allVerifications, moduleCoverage.testExists, moduleCoverage.repositoryRoot)
       : undefined
     if (coverage?.failed?.length) {
-      // 外部阻塞 / 未归因的全量失败降级（2026-10-07 对齐）：受影响测试的失败若
-      // 无法归因到本次改动（`unattributed_failure`）或来自外部阻塞（`external_blocked`），
-      // 在共享工作区里很可能是其他会话的在途改动污染了全量 run_tests（假红）。降级
-      // 为 YELLOW（可交付 + 警示），仍逐条列出失败的受影响测试供人裁决。覆盖**义务
-      // 本身不豁免**（守卫 8784b64b8「覆盖义务不受聚合归因影响」不变，只放宽 `failed`
-      // 这一支的硬 RED）；本会话自己的回归仍走 `owned_failure` 分支硬拦。
-      const externallyBlocked = aggregate.attribution === 'unattributed_failure' || aggregate.attribution === 'external_blocked'
+      // 外部阻塞 / 未归因的全量失败降级（2026-10-07 对齐，2026-10-08 收紧）：
+      // 受影响测试的失败若无法归因到本次改动（`unattributed_failure`）或来自外部
+      // 阻塞（`external_blocked`），在共享工作区里很可能是其他会话的在途改动污染了
+      // 全量 run_tests（假红）。但「聚合归因 ∈ {unattributed_failure, external_blocked}」
+      // 本身不构成证据：任何 full-scope 失败在归因器里恒为 unattributed_failure
+      // （owned_failure 只来自 targeted owned 失败），单会话干净工作区里「自己改坏
+      // impacted test、只跑了全量」同样命中——判据宽于理据会让真失败在报告层搭便车
+      // 成 YELLOW（canDeliver=true，语义停在中间态：gate 放行而 commit 通路 W1 硬拦）。
+      // 因此降级要求「失败非本会话造成」的正向证据（失效方向选收紧：宁可少降级、
+      // 无证据保持 RED，也不错放行——RED 文案指引隔离单跑配对取证的正确出路）：
+      //   ① 工作区确有外部在途改动（externalFiles 非空）——共享工作区污染理据成立；
+      //   ② 存在隔离单跑配对（isolated 通过 + integration 失败、同 comparisonId /
+      //      snapshotRef，判据复用 verification-comparison.ts）——owned diff 隔离
+      //      可过而集成失败，失败指向外部集成差异。
+      // 覆盖**义务本身不豁免**（守卫 8784b64b8「覆盖义务不受聚合归因影响」不变，
+      // 只放宽 `failed` 这一支的硬 RED）；本会话自己的回归仍走 `owned_failure` 分支
+      // 硬拦。配对成立时失败文件本就不计入 coverage.failed、聚合转
+      // integration_conflict（W1 不拦）——那是单会话自证清白的标准出路。
+      const unattributedOrExternal = aggregate.attribution === 'unattributed_failure' || aggregate.attribution === 'external_blocked'
+      const hasExternalEvidence = externalFiles.length > 0
+        || allVerifications.some(v => hasIsolatedComparison(v, allVerifications))
+      const externallyBlocked = unattributedOrExternal && hasExternalEvidence
+      const reason = externallyBlocked
+        ? `受影响测试失败，但聚合归因未指向本次改动（${aggregate.attribution}）：${coverage.failed.join(', ')}。${externalFiles.length > 0 ? `共享工作区的外部在途改动（${externalFiles.length} 个）可能造成假红` : '隔离单跑配对证明 owned diff 隔离通过、集成失败，失败指向外部集成差异'}——可降级 scoped 交付，但须在报告点名。`
+        : unattributedOrExternal
+          ? `Required impacted tests failed: ${coverage.failed.join(', ')}。聚合归因未指向本次改动（${aggregate.attribution}），但无外部在途改动、无隔离单跑配对——外部污染理据不成立，按真失败处理。若确信失败来自外部并发改动，先用隔离单跑配对（isolated/integration 同 comparisonId）取证再交付。`
+          : `Required impacted tests failed: ${coverage.failed.join(', ')}`
       return {
         state: externallyBlocked ? 'YELLOW' : 'RED',
         canDeliver: externallyBlocked,
         isBlocked: !externallyBlocked,
-        reason: externallyBlocked
-          ? `受影响测试失败，但聚合归因未指向本次改动（${aggregate.attribution}）：${coverage.failed.join(', ')}。共享工作区的外部在途改动（${externalFiles.length} 个）可能造成假红——可降级 scoped 交付，但须在报告点名。`
-          : `Required impacted tests failed: ${coverage.failed.join(', ')}`,
+        reason,
         ownedFileCount: ownedFiles.length, externalFileCount: externalFiles.length,
         verificationCount: allVerifications.length, ...diagnostics, latestVerificationTotals,
         attributionClass: 'module_unverified', uncoveredImpactedTests: coverage.failed,
+        // RED 臂补 blockingReason/currentBlockingFailure：deliver_task(commit=true)
+        // 的 RED Recovery 段只打印这两个字段，缺了它们失败清单在提交路径不可见。
+        ...(externallyBlocked ? {} : {
+          blockingReason: reason,
+          currentBlockingFailure: `Required impacted tests failed: ${coverage.failed.join(', ')}`,
+        }),
       }
     }
     if (coverage && coverage.uncovered.length > 0) {
@@ -580,6 +644,7 @@ export function createDeliveryGateV2(opts: {
       supersededFailures: result.supersededFailures,
       staleSnapshotDropped: result.staleSnapshotDropped,
       staleFingerprintDropped: result.staleFingerprintDropped,
+      outOfRootFingerprintPaths: result.outOfRootFingerprintPaths,
       latestVerificationTotals: result.latestVerificationTotals,
       staleFailureCandidates: result.staleFailureCandidates,
       toolInvocationFailureCandidates: result.toolInvocationFailureCandidates,

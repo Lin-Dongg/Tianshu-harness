@@ -11,6 +11,14 @@
 import { findPresetModel } from './provider-presets.js'
 import type { ModelConfig } from './schema.js'
 
+/** A vendor preset may be repointed to a gateway with its own valid model IDs. */
+function isOfficialDeepseek(provider: Record<string, unknown> | undefined): boolean {
+  if (!provider || provider.baseUrl === undefined) return true // Inherits the official default.
+  if (typeof provider.baseUrl !== 'string') return false
+  try { return new URL(provider.baseUrl).hostname === 'api.deepseek.com' }
+  catch { return false }
+}
+
 /** 把退役条目在**顶层快照**与**每个权威 key 池**（`keys[].models`）里一并处理——
  *  选择器与请求端读的是后者，只改顶层等于没改（2026-10-08 收编公开仓 PR #381）。
  *  语义：池里已有替代档 → 删掉退役条目；没有 → 就地改名（保留用户调过的窗口与字段）。
@@ -67,12 +75,19 @@ function retireProviderModel(
  * 补顶层 models。不做无差别回流（userSaved 的剪枝语义仍由 backfill 尊重），
  * 只在确有引用需要重定向时补——调用方在 redirect 之前调用，幂等由池内查重守卫。
  *
+ * `targetKeyId`：引用是 `provider:keyId:model` 三段式时，补池落点必须与**被引用
+ * 的 key** 对齐——契约层 keyId 分支（assertDefaultModelRef）只认该 key 的池，
+ * 并集可达不算数；补进「首个含模型的 key」会让三段引用继续悬空。key 已不存在
+ * 时引用在 key 层级悬空、补池救不了，落回并集逻辑兜底（两段引用仍受益；不伪造
+ * key——伪造的空凭据 key 比悬空引用更难排查）。
+ *
  * Mutates `raw` in place. Returns true if any value was changed.
  */
 function ensureReplacementInPool(
   raw: Record<string, unknown>,
   providerName: string,
   replacementId: string,
+  targetKeyId?: string,
 ): boolean {
   const provider = raw.provider as Record<string, unknown> | undefined
   const providers = provider?.providers as Record<string, unknown> | undefined
@@ -84,8 +99,8 @@ function ensureReplacementInPool(
       !!m && typeof m === 'object' && (m as { id?: unknown }).id === replacementId)
 
   const preset = findPresetModel(providerName, replacementId)
+  if (!preset) return false // 查不到 preset 条目时无源可补——返回 true 会让每次加载都做无用写盘
   const appendPresetEntry = (models: unknown[]): void => {
-    if (!preset) return
     models.push({
       id: preset.id,
       contextWindow: preset.contextWindow,
@@ -98,18 +113,44 @@ function ensureReplacementInPool(
     } satisfies Partial<ModelConfig> & { id: string })
   }
 
-  // 事实源池：keys 池存在 → 首个含模型的 key 池；否则顶层 models（契约层回退路径）。
+  // 事实源池：keys 池存在时契约层只认 keys 并集（contractModels 不回退顶层——
+  // 本函数此前注释声称「keys 全空会回退顶层」与实现相反，写顶层等于没补，2026-10-08
+  // 审查实证）；没有任何 key 时顶层 models 才是契约池，才轮到补顶层。
   const keys = prov.keys
   if (Array.isArray(keys) && keys.length > 0) {
+    // 三段引用钉了 keyId：补进被引用 key 的池（契约层 keyId 分支只认它）。
+    if (targetKeyId !== undefined) {
+      const pinned = keys.find(k =>
+        !!k && typeof k === 'object' && (k as { id?: unknown }).id === targetKeyId,
+      ) as Record<string, unknown> | undefined
+      if (pinned) {
+        if (hasId(pinned.models)) return false
+        if (!Array.isArray(pinned.models)) pinned.models = []
+        appendPresetEntry(pinned.models as unknown[])
+        return true
+      }
+    }
+    // 任一 key 已有替代档 → 并集可达，无需补（只看首个非空 key 会漏掉后续 key
+    // 已持档的情况，补出并集重复条目）。
+    for (const key of keys) {
+      if (!key || typeof key !== 'object') continue
+      if (hasId((key as Record<string, unknown>).models)) return false
+    }
+    // 补首个含模型的 key 池；全是空池（removeProviderKeyModel 允许删到空）时补
+    // 第一个 key——空并集同样不回退顶层。
+    let firstKey: Record<string, unknown> | undefined
+    let target: Record<string, unknown> | undefined
     for (const key of keys) {
       if (!key || typeof key !== 'object') continue
       const slot = key as Record<string, unknown>
-      if (!Array.isArray(slot.models) || slot.models.length === 0) continue
-      if (hasId(slot.models)) return false
-      appendPresetEntry(slot.models as unknown[])
-      return true
+      if (!firstKey) firstKey = slot
+      if (Array.isArray(slot.models) && slot.models.length > 0) { target = slot; break }
     }
-    // keys 全是空池：契约层会回退顶层 models——检查顶层（有 keys 但顶层也无条目时，补顶层）。
+    target ??= firstKey
+    if (!target) return false // keys 全不是对象——畸形输入，不猜
+    if (!Array.isArray(target.models)) target.models = []
+    appendPresetEntry(target.models as unknown[])
+    return true
   }
   const models = prov.models
   if (Array.isArray(models)) {
@@ -148,6 +189,7 @@ export function migrateDeepseekVisionExpRetirement(raw: Record<string, unknown>)
   const provider = raw.provider as Record<string, unknown> | undefined
   const providers = provider?.providers as Record<string, unknown> | undefined
   const ds = providers?.['deepseek'] as Record<string, unknown> | undefined
+  if (!isOfficialDeepseek(ds)) return false
   if (retireProviderModel(ds, RETIRED, REPLACEMENT)) changed = true
 
   const agent = raw.agent as Record<string, unknown> | undefined
@@ -201,30 +243,31 @@ export function migrateDeepseekV4FlashRetirement(raw: Record<string, unknown>): 
   const provider = raw.provider as Record<string, unknown> | undefined
   const providers = provider?.providers as Record<string, unknown> | undefined
   const ds = providers?.['deepseek'] as Record<string, unknown> | undefined
+  if (!isOfficialDeepseek(ds)) return false
   if (retireProviderModel(ds, RETIRED, REPLACEMENT)) changed = true
 
-  const redirectRef = (value: string): string | undefined => {
+  const redirectRef = (value: string): { next: string; keyId?: string } | undefined => {
     const parts = value.split(':')
     if (parts.length < 2 || parts[0] !== 'deepseek') return undefined
     if (!isRetired(parts[parts.length - 1])) return undefined
     parts[parts.length - 1] = REPLACEMENT
-    return parts.join(':')
+    // 三段式钉 key：补池落点与被引用 key 对齐（key 不存在时 ensure 内落并集兜底）。
+    return { next: parts.join(':'), keyId: parts.length === 3 ? parts[1] : undefined }
   }
 
-  // 引用改指 REPLACEMENT 前保证它在事实源池可达——否则迁移制造悬空引用，
-  // 启动报「不在 provider 下」并位置性回退（见 ensureReplacementInPool 头注释）。
-  let poolEnsured = false
-  const ensurePoolOnce = (): void => {
-    if (poolEnsured) return
-    poolEnsured = true
-    if (ensureReplacementInPool(raw, 'deepseek', REPLACEMENT)) changed = true
+  // 引用改指 REPLACEMENT 前保证它在被引用 key 的池可达——否则迁移制造悬空引用
+  // （keyId 分支只认该 key 的池；见 ensureReplacementInPool 头注释）。幂等由池内
+  // 查重守卫，逐引用调用安全：钉不同 key 的引用各自需要本 key 池可达，不能用
+  // 「只补一次」的 once 守卫合并。
+  const ensurePool = (keyId?: string): void => {
+    if (ensureReplacementInPool(raw, 'deepseek', REPLACEMENT, keyId)) changed = true
   }
 
   const redirectProfile = (profile: unknown): void => {
     if (!profile || typeof profile !== 'object') return
     const p = profile as Record<string, unknown>
     if (p.provider === 'deepseek' && isRetired(p.model)) {
-      ensurePoolOnce()
+      ensurePool()
       p.model = REPLACEMENT
       changed = true
     }
@@ -234,21 +277,21 @@ export function migrateDeepseekV4FlashRetirement(raw: Record<string, unknown>): 
   if (agent) {
     const vm = agent.visionModel as Record<string, unknown> | undefined
     if (vm && vm.provider === 'deepseek' && isRetired(vm.model)) {
-      ensurePoolOnce()
+      ensurePool()
       agent.visionModel = { ...vm, model: REPLACEMENT }
       changed = true
     }
     if (typeof agent.defaultModel === 'string') {
-      const next = redirectRef(agent.defaultModel)
-      if (next) {
-        ensurePoolOnce()
-        agent.defaultModel = next
+      const redirected = redirectRef(agent.defaultModel)
+      if (redirected) {
+        ensurePool(redirected.keyId)
+        agent.defaultModel = redirected.next
         changed = true
       }
     }
     const greeting = agent.greeting as Record<string, unknown> | undefined
     if (greeting && greeting.model === RETIRED) {
-      ensurePoolOnce()
+      ensurePool()
       greeting.model = REPLACEMENT
       changed = true
     }
@@ -261,7 +304,7 @@ export function migrateDeepseekV4FlashRetirement(raw: Record<string, unknown>): 
 
   const compact = raw.compact as Record<string, unknown> | undefined
   if (compact && compact.model === RETIRED) {
-    ensurePoolOnce()
+    ensurePool()
     compact.model = REPLACEMENT
     changed = true
   }
@@ -286,18 +329,58 @@ export function migrateDeepseekV4FlashRetirement(raw: Record<string, unknown>): 
   // 都有）。把它们纳入守卫会让「用户在设置页主动把 flash 剪掉」被反复补回
   // （remove-model 语义被破坏，探针实测）。弱引用悬空由各自回退链兜底；硬引用
   // 悬空没有可接受的回退（改指=静默换档，不补=启动告警+resume 死路）。
-  const pointsToReplacement = (ref: unknown): boolean => {
-    if (typeof ref !== 'string') return false
-    if (ref === REPLACEMENT) return true
-    const parts = ref.split(':')
-    return parts.length >= 2 && parts[0] === 'deepseek' && parts[parts.length - 1] === REPLACEMENT
+  // 引用形态判据（parseModelRef + disambiguateKeyPrefix 语义，2026-10-08 审查收窄）：
+  //   deepseek-flash                    裸 id——全 provider 扫描：仅当**没有其他
+  //                                     provider 的契约池持有该 id** 才判指向本档。
+  //                                     否则引用由用户自建 provider 的同名模型承接、
+  //                                     并不悬空，把官方 preset 补进 deepseek 池就是
+  //                                     无差别回流（剪枝语义被破坏）。
+  //   deepseek:deepseek-flash           限定 provider——明确的官方归属。
+  //   deepseek:<keyId>:deepseek-flash   限定 key——补池落点必须是被引用的 key
+  //                                     （keyId 分支只认该 key 的池）；中间段不是
+  //                                     现存 key id 时按消歧语义整段是模型 id
+  //                                     （≠ 本档），补哪都救不了，不判指向（少做
+  //                                     侧——伪造 key 比悬空更难排查）。
+  const poolHoldsId = (prov: unknown, id: string): boolean => {
+    if (!prov || typeof prov !== 'object') return false
+    const p = prov as Record<string, unknown>
+    const has = (models: unknown): boolean =>
+      Array.isArray(models) && models.some(m =>
+        !!m && typeof m === 'object' && (m as { id?: unknown }).id === id)
+    const keys = p.keys
+    if (Array.isArray(keys) && keys.length > 0) {
+      return keys.some(k => !!k && typeof k === 'object' && has((k as Record<string, unknown>).models))
+    }
+    return has(p.models)
   }
-  let replacementReferenced = pointsToReplacement(agent?.defaultModel)
+  const dsKeyIds = new Set(
+    (Array.isArray(ds?.keys) ? ds.keys : [])
+      .filter(k => !!k && typeof k === 'object')
+      .map(k => (k as { id?: unknown }).id),
+  )
+  const pointsToReplacement = (ref: unknown): { referenced: boolean; keyId?: string } => {
+    if (typeof ref !== 'string') return { referenced: false }
+    if (ref === REPLACEMENT) {
+      const heldElsewhere = Object.entries(providers ?? {}).some(([name, prov]) =>
+        name !== 'deepseek' && poolHoldsId(prov, REPLACEMENT))
+      return { referenced: !heldElsewhere }
+    }
+    const parts = ref.split(':')
+    if (parts.length < 2 || parts[0] !== 'deepseek') return { referenced: false }
+    if (parts.length === 2) return { referenced: parts[1] === REPLACEMENT }
+    if (parts.length === 3 && parts[2] === REPLACEMENT && dsKeyIds.has(parts[1])) {
+      return { referenced: true, keyId: parts[1] }
+    }
+    return { referenced: false }
+  }
+  const dmRef = pointsToReplacement(agent?.defaultModel)
+  let replacementReferenced = dmRef.referenced
+  let referencedKeyId = dmRef.keyId
   if (!replacementReferenced && agent) {
     const vm = agent.visionModel as Record<string, unknown> | undefined
     replacementReferenced = !!vm && vm.provider === 'deepseek' && vm.model === REPLACEMENT
   }
-  if (replacementReferenced && ensureReplacementInPool(raw, 'deepseek', REPLACEMENT)) changed = true
+  if (replacementReferenced && ensureReplacementInPool(raw, 'deepseek', REPLACEMENT, referencedKeyId)) changed = true
 
   return changed
 }

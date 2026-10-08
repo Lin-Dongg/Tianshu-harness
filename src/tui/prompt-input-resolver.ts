@@ -9,9 +9,10 @@
  *
  * `slash-commands.ts` 保留同名再导出，main.ts 与既有测试 import 面不变。
  */
+import { isAbsolute, join, relative } from 'node:path'
 import { resolveCustomCommand } from '../commands/loader.js'
 import { projectSurfaceAllowed } from '../config/project-trust.js'
-import { skillRegistry, listSkillFiles, type SkillRegistry } from '../skills/skill-loader.js'
+import { skillRegistry, listSkillFiles, type SkillDefinition, type SkillRegistry, type SkillSource } from '../skills/skill-loader.js'
 import { resolveEcosystemWorkflowInput } from '../workflows/ecosystem-workflows.js'
 import { workspaceSkillSnapshot } from '../skills/workspace-skill-snapshot.js'
 import { looksLikeFilePath } from './engine/path-like.js'
@@ -75,17 +76,46 @@ export function resolveAppPromptInput(
 
 const SKILL_RESERVED_SUBCOMMANDS = new Set(['inspect', 'add', 'mode', 'update', 'remove', 'doctor', 'generate', 'list', 'ls', 'install', 'import', 'review', 'drafts', 'approve', 'reject', 'off', 'complete'])
 
+/**
+ * 项目槽位技能来源：backing 文件随仓库分发（.rivet/skills / .agents/skills），未授信
+ * 等同仓库内容指令。'project-claude' 当前不进任何 registry（仅 listInstallableSkills
+ * 的扫描标记），列入是 fail-closed——未来若新增其装载路径，忘了同步此集合也不会
+ * 静默放行。失效方向：宁可多门一个来源值，不漏项目槽位（漏判 = 仓库内容进用户消息）。
+ */
+const PROJECT_SLOT_SKILL_SOURCES: ReadonlySet<SkillSource> = new Set(['rivet', 'project-agents', 'project-claude'])
+
+/**
+ * 技能是否项目槽位（随仓库分发）。主判据是 loader 写入的 source；source 缺失时回落
+ * backing 文件物理位置（早期会话快照可能没冻 source）——只判路径归属不判文件存在，
+ * 全局技能（home 目录）与内置技能（无 backing 文件）永不落在 cwd 这两个子目录下，
+ * 误判只可能往「不展开」侧倒，不误伤全局技能。
+ */
+function isProjectSlotSkill(skill: SkillDefinition, cwd: string): boolean {
+  if (skill.source && PROJECT_SLOT_SKILL_SOURCES.has(skill.source)) return true
+  for (const p of [skill.bodyPath, skill.skillDir]) {
+    if (!p) continue
+    for (const root of [join(cwd, '.rivet', 'skills'), join(cwd, '.agents', 'skills')]) {
+      const rel = relative(root, p)
+      if (rel !== '' && !rel.startsWith('..') && !isAbsolute(rel)) return true
+    }
+  }
+  return false
+}
+
 /** 技能查找 + prompt 展开（/skill 网关与裸名直调共用）。未命中返回 null。 */
 function buildSkillPrompt(name: string, userTask: string, cwd?: string, sessionRegistry?: SkillRegistry): string | null {
-  // 未授信项目不展开技能正文（2026-10-07 审计 Finding 1 第二入口：slash 解析经
-  // sessionSkillSnapshot/workspaceSkillSnapshot 装载，独立于 loadProjectSkills 的门；
-  // 正文拼成的 prompt 会以用户消息身份进模型）。cwd 缺席时 registry 回落全局
-  // skillRegistry（已受 loadProjectSkills 门保护）；三处生产调用点（main.ts:1836、
-  // session-skills-helper.ts:10、session-manager.ts:2774）均传 cwd。
-  if (cwd && !projectSurfaceAllowed(cwd, 'skills')) return null
   const registry = sessionRegistry ?? (cwd ? workspaceSkillSnapshot(cwd).registry : skillRegistry)
   const skill = registry.get(name) ?? registry.list().find(s => s.name.toLowerCase() === name.toLowerCase())
   if (!skill) return null
+  // 未授信项目按 origin 门项目槽位技能（2026-10-07 审计 Finding 1 第二入口；
+  // 2026-10-08 由一刀切细化为按 origin 判门——一刀切把用户全局 ~/.rivet/skills 与
+  // 内置技能也封死，属可用性误伤：它们是用户自有/随发行版内容，不受项目信任门管辖）。
+  // workspaceSkillSnapshot/sessionSkillSnapshot 装载侧已排项目目录，此门兜底的窄例是
+  // 「授信期冻结的 session 快照在撤信后仍含项目技能」——快照按 pinned 语义原样读回，
+  // 必须在展开前判 origin。cwd 缺席时 registry 回落全局 skillRegistry（已受
+  // loadProjectSkills 门保护）；生产调用点（main.ts onSubmit、session-skills-helper、
+  // session-manager.createSession）均传 cwd。
+  if (cwd && isProjectSlotSkill(skill, cwd) && !projectSurfaceAllowed(cwd, 'skills')) return null
   if (skill.mode === 'off') return `Skill「${skill.name}」已停用，请先启用。`
   let prompt = `[Skill loaded: ${skill.name}]\n<skill name="${skill.name}">\n${skill.body}\n</skill>`
   if (skill.skillDir) {

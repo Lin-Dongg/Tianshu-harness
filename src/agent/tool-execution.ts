@@ -30,7 +30,7 @@ import { classifyFailure, isReadProbeInvocation, isTestRunInvocation, type Failu
 import { ToolAccumulator } from './tool-accumulator.js'
 import { ZEN_UNLOCK, ZEN_UNLOCK_RESULT, ZEN_UNLOCK_NOT_ZEN } from './zen-mode.js'
 import { guardLossyToolResult } from './negative-fact-detector.js'
-import { getToolStormLevel, type ToolStormLevel } from './trace-store.js'
+import { getToolStormLevel } from './trace-store.js'
 import { extractTrailingArtifactId, tierToolResult } from './tool-result-tiering.js'
 import {
   getInterventionLevel,
@@ -213,7 +213,7 @@ export class ToolExecutionController {
    * T2-02 P0: Shadow telemetry for effort bandit at intervention adjustment point.
    * Records what the bandit would recommend without changing behavior.
    */
-  private shadowEffortAdjustment(oldEffort: string, newEffort: string): void {
+  private shadowEffortAdjustment(_oldEffort: string, newEffort: string): void {
     try {
       if (!this.deps.p3) return
       // Build lightweight context from available deps

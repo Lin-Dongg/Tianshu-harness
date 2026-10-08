@@ -1,5 +1,6 @@
 import { readFileSync, existsSync } from 'fs'
 import { writeFileAtomicSync } from '../fs-atomic.js'
+import { normalizeHttpProxyUrl } from '../tools/net/proxy-url.js'
 import { resolve, join, dirname } from 'path'
 import { isProjectTrusted, stripUntrustedProjectKeys, stripProjectSafetyKeys, findForbiddenProjectSafetyKeys, notifyProjectSafetyKeysIgnored, notifyUntrustedOnce, findSensitiveProjectKeys } from './project-trust.js'
 import { z } from 'zod'
@@ -14,7 +15,8 @@ import { normalizeBaseUrl } from '../api/endpoint-map.js'
 import { backfillPresetModelFields, migratePresetModelBackfill } from './preset-model-backfill.js'
 import { migrateProviderToKeys, keyRefFor, defaultKeyOf, keyRefReferrers, applyProviderCredential, alignModelsWithDefaultKey, writeModelsToDefaultKey } from './provider-keys.js'
 import { injectProviderKeys, stripProviderKeys, writeProviderKeysFile, providerKeysPath } from './provider-keys-store.js'
-import { assertDefaultModelRef } from './contract-models.js'
+import { assertDefaultModelRef, contractModels } from './contract-models.js'
+import { upsertProviderPoolModel, addProviderPoolModel, removeProviderPoolModel } from './provider-models.js'
 import { migrateDeepseekVisionExpRetirement, migrateDeepseekV4FlashRetirement } from './preset-model-retirement.js'
 import { migrateInvalidWorkerTiers } from './worker-tier-repair.js'
 import { writeSecret, readSecret, deleteSecret } from './secrets-store.js'
@@ -599,8 +601,9 @@ export function loadConfig(options?: {
 
   // A′：keys 池权威源改为 provider-keys.json（详见 provider-keys-store.ts 头注）。
   // 必须放在 migrateProviderToKeys 之后——后者在 config.json 无 keys 时只合成
-  // keys[0]，靠文件覆盖才恢复完整池。
-  injectProviderKeys(config.provider.providers)
+  // keys[0]，靠文件覆盖才恢复完整池。agent 一并传入：外部池形态下注入前那遍
+  // 退役守卫只能修顶层快照（契约层不读），悬空硬引用复查要在注入后的真实池上重跑。
+  injectProviderKeys(config.provider.providers, { agent: config.agent })
 
   return config
 }
@@ -943,7 +946,7 @@ export function setNetworkConfig(input: { proxy?: unknown; noProxy?: unknown }):
   const merged: Record<string, unknown> = { ...cfg.network }
   if (input.proxy !== undefined) {
     const raw = String(input.proxy).trim()
-    if (raw) merged.proxy = raw
+    if (raw) merged.proxy = normalizeHttpProxyUrl(raw)
     else delete merged.proxy
   }
   if (input.noProxy !== undefined) {
@@ -1466,11 +1469,17 @@ export function setModelSupportsVision(providerName: string, modelId: string, va
   const cfg = loadConfig()
   const provider = cfg.provider.providers[providerName]
   if (!provider) throw new Error(`Provider "${providerName}" not found`)
-  const model = provider.models.find(m => m.id === modelId)
-  if (!model) throw new Error(`Model "${modelId}" not found in provider "${providerName}"`)
+  // 池是契约层事实源（contractModels 只认 keys 并集）：只在顶层找时，模型只活在
+  // 池里的 provider 会直接报「模型不存在」；写中顶层而池不变时用户勾了视觉、
+  // 识图候选照旧为空。顶层与池里的同名条目都写（共享数组时为同一对象，重复赋值无副作用）。
+  const targets = [
+    ...provider.models.filter(m => m.id === modelId),
+    ...(provider.keys ?? []).flatMap(key => key.models.filter(m => m.id === modelId)),
+  ]
+  if (targets.length === 0) throw new Error(`Model "${modelId}" not found in provider "${providerName}"`)
   // 直接比较而非 `=== true`：从未设置（undefined）→ false 也是真实表态，必须写盘。
-  if (model.supportsVision === value) return // no-op, avoid unnecessary disk write
-  model.supportsVision = value
+  if (targets.every(m => m.supportsVision === value)) return // no-op, avoid unnecessary disk write
+  for (const model of targets) model.supportsVision = value
   saveConfig(cfg)
 }
 
@@ -1942,6 +1951,7 @@ export interface SetupProviderOptions {
   apiKey?: string
   apiKeyEnv?: string
   baseUrl?: string
+  protocol?: ProviderProtocol
   model?: ModelConfig
   /** 批量模型回填（免密钥 preset 探测路径）——每项走与 model 相同的合并语义。 */
   models?: Array<Partial<ModelConfig> & { id: string }>
@@ -2018,15 +2028,7 @@ export function upsertProviderModel(providerName: string, model: ModelConfig, op
   const provider = cfg.provider.providers[providerName]
   if (!provider) throw new Error(`Provider "${providerName}" not found`)
   model = clampModelTokens(model)
-  const existingIndex = provider.models.findIndex(item => item.id === model.id)
-  const existing = existingIndex >= 0 ? provider.models[existingIndex] : undefined
-  if (existing) provider.models[existingIndex] = mergeModelUpdate(existing, model)
-  else provider.models.push(model)
-  if (options.preferred) {
-    const preferredIndex = provider.models.findIndex(item => item.id === model.id)
-    const preferred = provider.models.splice(preferredIndex, 1)[0]
-    if (preferred) provider.models.unshift(preferred)
-  }
+  upsertProviderPoolModel(provider, model, mergeModelUpdate, options.preferred)
   provider.userSaved = true
   saveConfig(cfg)
 }
@@ -2087,20 +2089,38 @@ export function setupProvider(options: SetupProviderOptions): void {
   if (options.baseUrl) {
     next.baseUrl = resolveProviderBaseUrl(options.baseUrl)
   }
+  if (options.protocol !== undefined) next.protocol = options.protocol
   // 池形态下请求端读的是默认 key 的槽——顶层写了不同步过去，就是「重连后模型/凭据
   // 看起来存上了、实际仍走旧的」（2026-10-08 收编公开仓 PR #381）。
-  if (options.apiKey) applyProviderCredential(next, { providerName: options.providerName })
-  if (options.apiKeyEnv) applyProviderCredential(next, { apiKeyEnv: options.apiKeyEnv })
+  // 被摘除的旧 keyRef 收集起来，落盘后按共享判据回收孤儿 secret（见函数尾）。
+  const detachedKeyRefs: string[] = []
+  if (options.apiKey) detachedKeyRefs.push(...applyProviderCredential(next, { providerName: options.providerName }))
+  if (options.apiKeyEnv) detachedKeyRefs.push(...applyProviderCredential(next, { apiKeyEnv: options.apiKeyEnv }))
   const syncKeyModels = !!(options.model || options.models)
   if (syncKeyModels) alignModelsWithDefaultKey(next)
   if (options.model) {
     const model = clampModelTokens(options.model)
-    const existingIndex = next.models.findIndex(item => item.id === model.id)
-    const existing = existingIndex >= 0 ? next.models[existingIndex] : undefined
-    // Merge, never replace — see mergeModelUpdate. This is the path the desktop
-    // Settings form takes, and it only ever sends four fields.
-    if (existing) next.models[existingIndex] = mergeModelUpdate(existing, model)
-    else next.models.unshift(model)
+    // 编辑落点跟随模型当前 owner key（池序首个精确命中），与 provider 级
+    // upsertProviderModel 共用 upsertProviderPoolModel 的同一份 owner 语义——
+    // 此前这里只在顶层克隆（= 默认池副本）里 findIndex：只存在于次级 key 的
+    // 模型查找落空即 unshift，writeModelsToDefaultKey 再把它复制进默认 key——
+    // findModelOwner 按池序先中默认 key，此后该模型请求的凭据从次级 key 被切
+    // 到默认 key（一次单模型编辑劫持路由归属，2026-10-08 审查实证）。
+    // 未命中 = 新增：落默认池并保持 unshift 首位（连接流程里新配模型即位置性
+    // 默认；upsertProviderPoolModel 的 push 追加会丢掉这层语义，故不进它）。
+    // 判据必须精确匹配 id：findModelOwner 的 alias 归一会把「改名式编辑」误并进
+    // 别名所指条目（条目 id 被改写，原引用悬空）。
+    const pooled = (next.keys ?? []).some(key => key.models.some(m => m.id === model.id))
+    if (pooled) {
+      upsertProviderPoolModel(next, model, mergeModelUpdate)
+    } else {
+      const existingIndex = next.models.findIndex(item => item.id === model.id)
+      const existing = existingIndex >= 0 ? next.models[existingIndex] : undefined
+      // Merge, never replace — see mergeModelUpdate. This is the path the desktop
+      // Settings form takes, and it only ever sends four fields.
+      if (existing) next.models[existingIndex] = mergeModelUpdate(existing, model)
+      else next.models.unshift(model)
+    }
   }
   if (options.models) {
     // 批内按 id 去重（alias 已废弃，merge 键只剩 id）。
@@ -2149,6 +2169,15 @@ export function setupProvider(options: SetupProviderOptions): void {
   }
   applyAdvancedConfig(next, options.advanced)
   saveProviderConfigWithSecret(cfg, previousConfig, options.apiKey ? options.providerName : undefined, options.apiKey)
+  // 回收孤儿 secret（setApiKeyEnv / clearApiKey / removeProviderKey 同一判据）：
+  // 默认 key 从 keyRef 切 apiKeyEnv（或换绑别的 ref）后，旧 secret 在最终配置里
+  // 已无任何槽位引用时才删——共享引用（其他 key / 其他 provider）保留。cfg 已过
+  // saveConfig，剩下的引用方都是外部的。
+  for (const ref of new Set(detachedKeyRefs)) {
+    if (keyRefReferrers(cfg, ref).length === 0 && readSecret(ref) !== undefined) {
+      deleteSecret(ref)
+    }
+  }
 }
 
 export interface RegisterProviderOptions {
@@ -2253,7 +2282,7 @@ export function addModel(providerName: string, model: ModelConfig): void {
   const cfg = loadConfig()
   const provider = cfg.provider.providers[providerName]
   if (!provider) throw new Error(`Provider "${providerName}" not found`)
-  provider.models.push(model)
+  addProviderPoolModel(provider, clampModelTokens(model))
   provider.userSaved = true
   saveConfig(cfg)
 }
@@ -2263,23 +2292,7 @@ export function removeModel(providerName: string, modelId: string): void {
   const provider = cfg.provider.providers[providerName]
   if (!provider) throw new Error(`Provider "${providerName}" not found`)
 
-  // 先检查 modelId 是否存在——不存在时应尽早报错，不要被下游的"最后一个模型"
-  // 检查拦截，否则报错文案会误导用户。
-  if (!provider.models.some(m => m.id === modelId)) {
-    throw new Error(`Model "${modelId}" not found in provider "${providerName}"`)
-  }
-
-  // 禁止移除最后一个模型——预设 provider 删除后会从 DEFAULT_CONFIG 恢复全部预设模型，
-  // 导致用户之前手动移除的模型全部回来；自定义 provider 删除后则彻底消失。
-  // 用户应通过「移除 Provider」按钮删除整个 provider。
-  if (provider.models.length <= 1) {
-    throw new Error(
-      `Cannot remove the last model from "${providerName}". ` +
-      `Remove the provider instead, or add another model first.`,
-    )
-  }
-
-  provider.models = provider.models.filter(m => m.id !== modelId)
+  removeProviderPoolModel(provider, modelId)
   // 删除是编辑行为——打 userSaved 标记，让 migratePresetModelBackfill 尊重
   // 删减（否则下次 loadConfig 会把删除的预设模型回流，删除被静默撤销）。
   provider.userSaved = true
@@ -2289,7 +2302,7 @@ export function removeModel(providerName: string, modelId: string): void {
 export function listModels(providerName: string): ModelConfig[] {
   const provider = getProvider(providerName)
   if (!provider) throw new Error(`Provider "${providerName}" not found`)
-  return provider.models
+  return contractModels(provider)
 }
 
 // --- CLI entry point ---
@@ -2378,9 +2391,9 @@ Examples:
   rivet config set-vision-auto-bridge on
   rivet config set-default-model glm:glm-5.2
   rivet config add-model deepseek my-vision-model 128000 32000 --vision
-  rivet config set-model-vision deepseek deepseek-v4-pro on
+  rivet config set-model-vision deepseek deepseek-flash on
   rivet config set-url mimo https://token-plan-sgp.xiaomimimo.com/v1
-  rivet config set-model minimax MiniMax-M2.8 300000 64000 m28
+  rivet config set-model minimax MiniMax-M3 1000000 64000
   rivet config mcp add-stdio fs npx -y @modelcontextprotocol/server-filesystem /tmp`)
 }
 

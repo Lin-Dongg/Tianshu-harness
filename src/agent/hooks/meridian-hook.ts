@@ -45,7 +45,7 @@ export function createMeridianHook(deps: MeridianHookDeps): {
 
   /** 单项软超时：Promise.race 跳过不取消——底层操作继续后台跑，
    *  但 drain 不被无界 await 卡死（与 runtime-hooks runPhase 同策略）。 */
-  const runItemWithTimeout = async (item: PendingIndex, operation: Promise<void>): Promise<'done' | 'timeout'> => {
+  const runItemWithTimeout = async (_item: PendingIndex, operation: Promise<void>): Promise<'done' | 'timeout'> => {
     let timer: ReturnType<typeof setTimeout> | null = null
     const timeout = new Promise<'timeout'>(resolve => {
       timer = setTimeout(() => resolve('timeout'), deps.itemTimeoutMs ?? ITEM_TIMEOUT_MS)

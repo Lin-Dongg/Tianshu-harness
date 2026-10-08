@@ -7,11 +7,12 @@ import { AgentLoop } from '../loop.js'
 import { SessionContext } from '../context.js'
 import { PromptEngine } from '../../prompt/engine.js'
 import { ToolRegistry } from '../../tools/registry.js'
+import { GoalTracker } from '../goal-tracker.js'
 import type { StreamCallbacks, StreamClient } from '../../api/stream-client.js'
 import type { OaiChatRequest } from '../../api/oai-types.js'
 import type { AgentCallbacks } from '../loop-types.js'
 
-async function runScenario(outputs: string[], maxTurns = 0, thinking = true, steer = '') {
+async function runScenario(outputs: string[], maxTurns = 0, thinking = true, steer = '', providerName?: string, goal?: string) {
   const cwd = mkdtempSync(join(tmpdir(), 'rivet-no-answer-'))
   const session = new SessionContext()
   const requests: OaiChatRequest[] = []
@@ -32,8 +33,12 @@ async function runScenario(outputs: string[], maxTurns = 0, thinking = true, ste
   } as StreamClient
   const engine = new PromptEngine({ model: 'deepseek-v4-flash', maxTokens: 1024, staticCtx: { tools: [] }, volatileCtx: { cwd } })
   const agent = new AgentLoop({ client, promptEngine: engine, toolRegistry: new ToolRegistry(), maxTurns, contextWindow: 1_000_000,
+    ...(providerName ? { providerName } : {}),
     compact: { enabled: false, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash' },
   }, session, cwd)
+  if (goal) {
+    agent.setGoalTracker(new GoalTracker({ goal, maxIterations: 5, contextWindow: 1_000_000 }))
+  }
   const callbacks: AgentCallbacks = {
     onTextDelta: () => {}, onThinkingDelta: () => {}, onToolUse: () => {}, onToolResult: () => {},
     onTurnComplete: (_u, _t, final, _e, _c, reason) => { if (final) finals.push(reason) },
@@ -88,4 +93,30 @@ test('pending user guidance is consumed before declaring an empty response incom
   assert.equal(r.requests.length, 2)
   assert.ok(JSON.stringify(r.requests[1]!.messages).includes('check src/agent'))
   assert.equal(r.phases.at(-1)?.source, 'natural-finish')
+})
+
+test('GLM skip-thinking-retry: pure-reasoning turn is legitimate output, not no-answer', async () => {
+  const r = await runScenario([''], 0, true, '', 'glm')
+  assert.equal(r.requests.length, 1, 'skipThinkingRetry → no recovery retry')
+  assert.equal(r.phases.at(-1)?.source, 'natural-finish')
+  assert.equal(r.finals.at(-1), undefined)
+  assert.ok(!r.finals.includes('no_answer'))
+})
+
+test('GLM completely empty response (no thinking either) still reports no-answer', async () => {
+  const r = await runScenario([''], 0, false, '', 'glm')
+  assert.equal(r.requests.length, 1)
+  assert.equal(r.phases.at(-1)?.source, 'no-answer')
+  assert.equal(r.finals.at(-1), 'no_answer')
+})
+
+test('active goal absorbs an empty turn before no-answer fires', async () => {
+  const r = await runScenario(['', 'GOAL ACHIEVED — found the domain definition.'], 0, false, '', undefined, 'find the domain definition')
+  assert.equal(r.requests.length, 2, 'goal continuation consumes the empty turn and runs one more turn')
+  assert.ok(!r.finals.includes('no_answer'))
+  assert.equal(r.phases.at(-1)?.source, 'natural-finish')
+  assert.ok(
+    JSON.stringify(r.session.getMessages()).includes('[GOAL CONTINUATION'),
+    'goal continuation reminder injected for the absorbed turn',
+  )
 })

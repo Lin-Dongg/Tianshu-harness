@@ -334,6 +334,22 @@ export class SessionRegistry {
     this.safeRun('DELETE FROM claims WHERE session_id = ? AND file_path = ?', sessionId, filePath)
   }
 
+  /**
+   * CAS 释放（接管路径专用）：仅当认领行的租约凭据仍是「判定时读到的值」才删除。
+   * 比较口径与 claimLiveness 一致（last_touched_at 为 NULL 时回落 acquired_at）。
+   * changes=0 → false：凭据已变（等待窗口内持有方经同会话写路径合法刷新了
+   * last_touched_at，或认领已易手/被回收）——调用方必须放弃接管并落回「问」
+   * 流程。失效方向选「少做」：宁可接管失败让用户重试，不按陈旧判定删掉对方
+   * 已刷新的认领行（删了就是双方各持锁、并发写同一文件）。
+   */
+  releaseClaimIfUnchanged(sessionId: string, filePath: string, expectedLastTouchedAt: string): boolean {
+    const changes = this.safeRun(
+      'DELETE FROM claims WHERE session_id = ? AND file_path = ? AND COALESCE(last_touched_at, acquired_at) = ?',
+      sessionId, filePath, expectedLastTouchedAt,
+    )
+    return changes > 0
+  }
+
   releaseAllClaims(sessionId: string): void {
     this.safeRun('DELETE FROM claims WHERE session_id = ?', sessionId)
   }

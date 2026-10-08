@@ -12,7 +12,8 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { loadProjectSkills } from '../../skills/skill-loader.js'
+import { loadProjectSkills, SkillRegistry, type SkillDefinition } from '../../skills/skill-loader.js'
+import { workspaceSkillSnapshot } from '../../skills/workspace-skill-snapshot.js'
 import { resolveAppPromptInput } from '../../tui/prompt-input-resolver.js'
 import { loadProjectRules } from '../../context/rules-loader.js'
 import { loadCustomCommands, resolveCustomCommand } from '../../commands/loader.js'
@@ -20,6 +21,7 @@ import { renderMemoryBlock } from '../../memory/unified-memory.js'
 import { loadPresence } from '../../agent/companion-presence.js'
 import { resolvePlanContract, findApprovedPlanConstraints, resetApprovedPlanCache } from '../../agent/plan-constraints.js'
 import { KnowledgeIndex } from '../../memory/knowledge-index.js'
+import { readCommitFacts } from '../../context/project-memory-writer.js'
 
 describe('信任门族 surface 清单（未授信不读 / 授信恢复）', () => {
   let proj = ''
@@ -41,6 +43,10 @@ describe('信任门族 surface 清单（未授信不读 / 授信恢复）', () =
     writeFileSync(join(proj, '.rivet', 'knowledge', 'memory.jsonl'), JSON.stringify({
       id: 'gate_probe_mem', text: 'GATE-PROBE-MEMORY', kind: 'fact', confidence: 0.9,
       source: 'agent-crafted', status: 'verified', tags: [], ts: Date.now(), repeatCount: 1,
+    }) + '\n')
+    writeFileSync(join(proj, '.rivet', 'knowledge', 'commit-facts.jsonl'), JSON.stringify({
+      id: 'gate_probe_cf', text: 'GATE-PROBE-COMMIT-FACT', kind: 'decision', confidence: 0.95,
+      createdAt: 1, source: 'gate-probe', tags: ['commit_fact'],
     }) + '\n')
     writeFileSync(join(proj, '.rivet', 'presence.json'), JSON.stringify([
       { sessionId: 'gate-other-session', starDomain: '瑶光', objective: '(active task)', updatedAt: Date.now() },
@@ -145,6 +151,67 @@ describe('信任门族 surface 清单（未授信不读 / 授信恢复）', () =
     process.env.RIVET_TRUST_PROJECT = '1'
     const allowed = resolveAppPromptInput('/skill gate-probe-skill do it', proj)
     assert.ok((allowed?.prompt ?? '').includes('# Probe'), '授信后正常展开技能正文')
+  })
+
+  it('skills（slash 解析按 origin 判门）：未授信项目全局/内置技能可展开，项目槽位技能（含冻结 session 快照残留）不展开', () => {
+    process.env.RIVET_TRUST_PROJECT = '0'
+
+    // A. 真实 workspace 快照组合：全局技能（fake home 的 ~/.rivet/skills）未授信照常展开。
+    mkdirSync(join(skillHome, '.rivet', 'skills'), { recursive: true })
+    writeFileSync(join(skillHome, '.rivet', 'skills', 'gate-global-skill.md'),
+      '---\nname: gate-global-skill\ndescription: GATE-GLOBAL-DESC\n---\nGATE-GLOBAL-BODY\n')
+    const workspaceRegistry = workspaceSkillSnapshot(proj, skillHome).registry
+    assert.ok(workspaceRegistry.get('gate-global-skill'), '未授信快照须保留全局技能')
+    assert.ok(!workspaceRegistry.get('gate-probe-skill'), '未授信快照不得含项目技能')
+    const globalViaSkill = resolveAppPromptInput('/skill gate-global-skill do it', proj, undefined, undefined, workspaceRegistry)
+    assert.ok((globalViaSkill?.prompt ?? '').includes('GATE-GLOBAL-BODY'), '未授信时 /skill 网关须展开全局技能')
+    const globalBare = resolveAppPromptInput('/gate-global-skill', proj, undefined, undefined, workspaceRegistry)
+    assert.ok((globalBare?.prompt ?? '').includes('GATE-GLOBAL-BODY'), '未授信时裸名形态须展开全局技能')
+    // 内置技能（registerBuiltinSkills 形态：source 缺失、无 backing 文件）不受项目信任门管辖
+    const builtin = resolveAppPromptInput('/skill galaxy', proj, undefined, undefined, workspaceRegistry)
+    assert.ok((builtin?.prompt ?? '').includes('星河'), '未授信时内置技能须可用')
+
+    // B. 冻结 session 快照窄例：授信期冻入的快照撤信后按 pinned 语义原样读回，
+    //    registry 里仍含项目技能——按 origin 判门必须仍挡住（/skill 与裸名两形态）。
+    const frozen = new SkillRegistry()
+    const def = (name: string, body: string, extra: Partial<SkillDefinition>): SkillDefinition =>
+      ({ name, description: '', triggers: [], body, ...extra })
+    // 项目槽位（快照里 source 随 ManagedSkill 冻入）
+    frozen.register(def('gate-frozen-rivet', 'GATE-FROZEN-RIVET-BODY', { source: 'rivet', bodyPath: join(proj, '.rivet', 'skills', 'gate-frozen-rivet.md') }))
+    frozen.register(def('gate-frozen-agents', 'GATE-FROZEN-AGENTS-BODY', { source: 'project-agents', bodyPath: join(proj, '.agents', 'skills', 'gate-frozen-agents', 'SKILL.md') }))
+    // source 缺失但 backing 在项目目录内（早期快照形态）——路径兜底仍须门住
+    frozen.register(def('gate-frozen-legacy', 'GATE-FROZEN-LEGACY-BODY', { bodyPath: join(proj, '.rivet', 'skills', 'gate-frozen-legacy.md') }))
+    // 全局/内置/插件（快照再水合形态：内置技能的 source 冻为 'builtin'）
+    frozen.register(def('gate-frozen-global', 'GATE-FROZEN-GLOBAL-BODY', { source: 'global-rivet', bodyPath: join(skillHome, '.rivet', 'skills', 'gate-frozen-global.md') }))
+    frozen.register(def('gate-frozen-builtin', 'GATE-FROZEN-BUILTIN-BODY', { source: 'builtin', builtIn: true }))
+    frozen.register(def('gate-frozen-plugin', 'GATE-FROZEN-PLUGIN-BODY', { source: 'plugin' }))
+
+    for (const [name, body] of [['gate-frozen-rivet', 'GATE-FROZEN-RIVET-BODY'], ['gate-frozen-agents', 'GATE-FROZEN-AGENTS-BODY'], ['gate-frozen-legacy', 'GATE-FROZEN-LEGACY-BODY']] as const) {
+      const viaSkill = resolveAppPromptInput(`/skill ${name}`, proj, undefined, undefined, frozen)
+      assert.ok(!(viaSkill?.prompt ?? '').includes(body), `未授信时 /skill 不得展开项目槽位技能 ${name}（冻结快照残留）`)
+      const bare = resolveAppPromptInput(`/${name}`, proj, undefined, undefined, frozen)
+      assert.ok(!(bare?.prompt ?? '').includes(body), `未授信时裸名不得展开项目槽位技能 ${name}（冻结快照残留）`)
+    }
+    for (const [name, body] of [['gate-frozen-global', 'GATE-FROZEN-GLOBAL-BODY'], ['gate-frozen-builtin', 'GATE-FROZEN-BUILTIN-BODY'], ['gate-frozen-plugin', 'GATE-FROZEN-PLUGIN-BODY']] as const) {
+      const viaSkill = resolveAppPromptInput(`/skill ${name}`, proj, undefined, undefined, frozen)
+      assert.ok((viaSkill?.prompt ?? '').includes(body), `未授信时 /skill 须展开非项目技能 ${name}`)
+      const bare = resolveAppPromptInput(`/${name}`, proj, undefined, undefined, frozen)
+      assert.ok((bare?.prompt ?? '').includes(body), `未授信时裸名须展开非项目技能 ${name}`)
+    }
+
+    // 授信恢复：项目槽位技能立即可展开
+    process.env.RIVET_TRUST_PROJECT = '1'
+    const allowed = resolveAppPromptInput('/skill gate-frozen-rivet', proj, undefined, undefined, frozen)
+    assert.ok((allowed?.prompt ?? '').includes('GATE-FROZEN-RIVET-BODY'), '授信后项目技能恢复展开')
+  })
+
+  it('commit-facts 侧车（recall 的 includeCommitFacts/hash 查询通道）：未授信不读；授信读到', () => {
+    process.env.RIVET_TRUST_PROJECT = '0'
+    assert.deepEqual(readCommitFacts(proj), [], 'untrusted must not read commit-facts sidecar')
+
+    process.env.RIVET_TRUST_PROJECT = '1'
+    const facts = readCommitFacts(proj)
+    assert.ok(facts.some(e => e.text.includes('GATE-PROBE-COMMIT-FACT')), 'trusted must read commit-facts sidecar')
   })
 
   it('授信切换即拍即生效（同进程内无缓存跳过结论）', () => {

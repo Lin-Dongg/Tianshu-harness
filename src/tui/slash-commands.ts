@@ -97,6 +97,7 @@ import { routeReviewWorkflow, type ReviewMode, type ReviewOutcome } from '../age
 import type { ChangeSet } from '../agent/review-discipline.js'
 import { HELP_TEXT } from './format/help-text.js'
 import { contractModels } from '../config/contract-models.js'
+import { handleEffortSlash, resolveActiveEffortChoices } from './effort-slash.js'
 
 /**
  * Framework-agnostic mutable ref. Structurally compatible with React's
@@ -173,6 +174,7 @@ export interface SlashHandlerContext {
   claimStoreRef: MutableRefLike<ContextClaimStore | null>
   setReasoningEffort?: (effort: import('../agent/auto-reasoning.js').ReasoningEffort | 'auto') => void
   reasoningEffort?: string
+  effortChoices?: import('../api/provider.js').ReasoningEffortChoice[]
   onDomainChange?: (domainName: string | undefined) => void
   /** T5: bandit promotion state for /status observability. */
   banditState?: import('../server/routes.js').BanditStatusEntry[]
@@ -597,7 +599,10 @@ const TUI_SLASH_COMMANDS: readonly TuiSlashCommandDef[] = [
         return true
       }
 
-      if (ctx.agent.config.promptEngine.getRequestBudgetPolicy()) {
+      // 轻量测试替身没有 config.promptEngine——无引擎即无预算策略，等价于
+      // getRequestBudgetPolicy() 返回 undefined，走下方 micro compact（与
+      // 320bdd0ee 同款的替身容忍；生产装配 promptEngine 恒在，行为不变）。
+      if (ctx.agent.config?.promptEngine?.getRequestBudgetPolicy?.()) {
         setIsStreaming(true)
         void ctx.agent.compactContext().then(changed => {
           pushStatic(createLogEntry({ type: 'system', content: changed ? '上下文已整理，原始内容已归档。' : '未替换历史：当前没有足够的安全回收空间。' }))
@@ -616,7 +621,9 @@ const TUI_SLASH_COMMANDS: readonly TuiSlashCommandDef[] = [
       pushStatic(createLogEntry({ type: 'system', content: 'Micro-compacting conversation...' }))
       const { messages: compacted, truncated } = microCompactOai(msgs, ctx.maxTokens, beforeTokens)
       ctx.session.replaceMessages(compacted)
-      ctx.agent.config.promptEngine.resetAppendixBaseline()
+      // 轻量测试替身没有 config.promptEngine——没有引擎也没有 appendix 基线可
+      // 重置，跳过即等价（与 320bdd0ee 同款替身容忍；生产装配 promptEngine 恒在）。
+      ctx.agent.config?.promptEngine?.resetAppendixBaseline?.()
       const afterTokens = estimateOaiTokens(compacted)
       ctx.session.recordCompactEvent({
         turn: ctx.session.getTurnCount(),
@@ -2601,7 +2608,9 @@ const TUI_SLASH_COMMANDS: readonly TuiSlashCommandDef[] = [
       const p = new SessionPersist(targetId, ctx.agent.cwd)
       const preflight = runResumePreflightOai(p.loadOai())
       ctx.session.replaceMessages(preflight.messages)
-      ctx.agent.config.promptEngine.resetAppendixBaseline()
+      // 轻量测试替身没有 config.promptEngine——没有引擎也没有 appendix 基线可
+      // 重置，跳过即等价（与 320bdd0ee 同款替身容忍；生产装配 promptEngine 恒在）。
+      ctx.agent.config?.promptEngine?.resetAppendixBaseline?.()
       if (preflight.repaired) p.compactOai(preflight.messages)
       pushStatic(createLogEntry({ type: 'system', content: `已恢复会话 ${targetId.slice(0, 8)} (${preflight.messages.length} 条消息, apiSafe=${preflight.safe})` }))
       setIsStreaming(false)
@@ -3377,32 +3386,7 @@ const TUI_SLASH_COMMANDS: readonly TuiSlashCommandDef[] = [
   {
     name: '/effort',
     immediate: true,
-    handler(ctx) {
-      const { parts, pushStatic, setIsStreaming, surfacePush } = ctx
-      const cmd = parts[0]!.toLowerCase()
-      const level = parts[1]?.toLowerCase() as 'off' | 'low' | 'medium' | 'high' | 'max' | 'auto' | undefined
-      const valid: Array<'off' | 'low' | 'medium' | 'high' | 'max' | 'auto'> = ['off', 'low', 'medium', 'high', 'max', 'auto']
-      if (!level) {
-        // 无参数 → 重置面板类型后打开交互式选择面板（上下选、回车确认）。
-        // 不重置的话，先开过 /permission 等面板后 choicePanelKind 残留，
-        // 选择面板会按旧类型渲染（PR #29 移植）。
-        pushStatic(createLogEntry({ type: 'system', content: '也可在 /model 面板用 </> 随模型一起调整推理等级（Enter 可随默认持久化）。' }))
-        ctx.setChoicePanelKind?.('effort')
-        surfacePush?.('choice-panel')
-        setIsStreaming(false)
-        return true
-      }
-      if ((valid as string[]).includes(level)) {
-        ctx.setReasoningEffort?.(level)
-        pushStatic(createLogEntry({ type: 'system', content: level === 'auto'
-          ? 'Reasoning effort: auto (autoReasoning picks per task)'
-          : `Reasoning effort set to: ${level}` }))
-      } else {
-        pushStatic(createLogEntry({ type: 'system', content: `Usage: /effort [off|low|medium|high|max|auto]\n\nSet max for full reasoning on every turn. auto lets autoReasoning pick per-task complexity.` }))
-      }
-      setIsStreaming(false)
-      return true
-    },
+    handler: (ctx) => handleEffortSlash(ctx),
   },
   {
     name: '/yes',
@@ -3927,6 +3911,7 @@ export function registerTuiSlashCommands(app: TuiApp, ctx: BootstrapContext): vo
       surfacePop: () => { app.deactivateOverlay() },
       setReasoningEffort: (effort) => { ctx.agent.setReasoningEffort(effort) },
       reasoningEffort: ctx.agent.getReasoningEffort() ?? ctx.agent.config.reasoningEffort,
+      effortChoices: resolveActiveEffortChoices(ctx.provider, ctx.agent.config.promptEngine.getModel()),
     }
   }
 

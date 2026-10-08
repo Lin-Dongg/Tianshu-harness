@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync, openSync, closeSync } from 'node:fs'
 import { join } from 'node:path'
 import { randomBytes } from 'node:crypto'
+import { projectStateAllowed } from '../config/project-trust.js'
 
 const MAX_ENTRIES = 200
 const MAX_FILE_SIZE = 16_384 // 16KB
@@ -128,8 +129,13 @@ function appendToJsonl(cwd: string, filename: string, entry: MemoryEntry, fifoCa
   }
 }
 
-/** Read commit-fact sidecar entries (newest last). Used by recall on explicit request. */
+/**
+ * Read commit-fact sidecar entries (newest last). Used by recall on explicit request.
+ * 信任门（2026-10-08 审计补漏）：侧车与 memory.jsonl 同住 .rivet/knowledge/、同样
+ * 可随仓库分发，未授信项目一律不读——门下沉到读取函数内部，防新调用点漏门。
+ */
 export function readCommitFacts(cwd: string): MemoryEntry[] {
+  if (!projectStateAllowed(cwd)) return []
   const path = join(cwd, '.rivet', 'knowledge', 'commit-facts.jsonl')
   if (!existsSync(path)) return []
   const entries: MemoryEntry[] = []

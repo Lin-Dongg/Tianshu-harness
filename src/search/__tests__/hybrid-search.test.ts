@@ -59,6 +59,17 @@ describe('vector-index', () => {
     assert.ok(vi.has('src/y.ts:1-5'))
   })
 
+  it('prune drops vectors whose id fails the keep predicate', () => {
+    const vi = new VectorIndex()
+    vi.add('kentry:a', [1, 0])
+    vi.add('kmd:f.md:0', [0, 1])
+    vi.add('kpb:b', [1, 1])
+    vi.prune(id => id !== 'kmd:f.md:0')
+    assert.equal(vi.size, 2)
+    assert.ok(!vi.has('kmd:f.md:0'))
+    assert.ok(vi.has('kentry:a') && vi.has('kpb:b'))
+  })
+
   it('snapshot round-trips only for the matching provider', () => {
     const vi = new VectorIndex()
     vi.providerId = 'remote:m1'

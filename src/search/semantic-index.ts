@@ -313,7 +313,7 @@ export class SemanticIndex {
     return { reindexed, removed: toRemove.length, fallbackRebuild: false }
   }
 
-  private rebuildWithResult(indexed: number, skipped: number): { reindexed: number; removed: number; fallbackRebuild: boolean } {
+  private rebuildWithResult(_indexed: number, _skipped: number): { reindexed: number; removed: number; fallbackRebuild: boolean } {
     const result = this.rebuild()
     return { reindexed: result.indexed, removed: 0, fallbackRebuild: true }
   }

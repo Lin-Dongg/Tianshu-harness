@@ -45,7 +45,6 @@ export class PhysarumEngine {
   private frozen = new Map<string, number>() // node → exclusive expiry turn
   private avalanches: AvalancheStats = { sizes: [], lastCheckedTurn: 0 }
   private turnPruneHistory: number[] = []
-  private turnGrowthHistory: number[] = []
   private currentTurn = 0
   private lastFileAccess: { filePath: string; turn: number } | null = null
   /** Recent distinct file accesses (most recent last) — working set for structural epistemic. */

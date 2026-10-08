@@ -20,6 +20,7 @@
  */
 import { TokenStore, type AccountProfileSnapshot as StoredAccountProfile, type FoundingBadgeSnapshot, type TokenData } from './token-store.js'
 import { fetchAccountSnapshot as fetchSnapshot, type AccountSyncResult } from './account-sync.js'
+import { AccountDeviceRequestError, classifyDeviceError, deviceHttpError } from './account-device-errors.js'
 import { FOUNDING_USER_LIMIT, isFoundingBadge, tierOfBadgeCode, tierOfRank } from '../agent/founding-tiers.js'
 
 // 快照类型是消费方（sidecar 路由、桌面端镜像）要用的形状——从本模块再导出一次，
@@ -161,25 +162,29 @@ export interface RequestDeviceCodeOpts extends FetchInjection {
 
 /** 发起一次授权请求。调用方负责把 userCode / verifyUrl 展示给用户。 */
 export async function requestDeviceCode(opts: RequestDeviceCodeOpts = {}): Promise<DeviceCreateResult> {
-  const doFetch = opts.fetchImpl ?? fetch
-  const res = await doFetch(`${accountApiBase()}/functions/v1/tui-auth-create`, {
-    method: 'POST',
-    headers: accountHeaders(),
-    body: JSON.stringify({
-      tuiVersion: opts.tuiVersion ?? null,
-      deviceName: opts.deviceName ?? null,
-      deviceFingerprint: opts.deviceFingerprint ?? null,
-      purpose: 'account-login',
-    }),
-    signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
-  })
-  if (!res.ok) {
-    throw new Error(`device create failed: ${res.status}`)
-  }
-  const created = parseDeviceCreate((await res.json()) as Record<string, unknown>)
-  // 补上 code：返回的链接必须是「拿去就能打开」的。EF 给的是页面基址，
-  // 直接打开会停在授权页的「缺少授权码」态 —— 见 deviceAuthorizeUrl。
-  return { ...created, verifyUrl: deviceAuthorizeUrl(created.verifyUrl, created.userCode) }
+  try {
+    const doFetch = opts.fetchImpl ?? fetch
+    const res = await doFetch(`${accountApiBase()}/functions/v1/tui-auth-create`, {
+      method: 'POST',
+      headers: accountHeaders(),
+      body: JSON.stringify({
+        tuiVersion: opts.tuiVersion ?? null,
+        deviceName: opts.deviceName ?? null,
+        deviceFingerprint: opts.deviceFingerprint ?? null,
+        purpose: 'account-login',
+      }),
+      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+    })
+    if (!res.ok) {
+      throw deviceHttpError(res.status)
+    }
+    let created: DeviceCreateResult
+    try { created = parseDeviceCreate((await res.json()) as Record<string, unknown>) }
+    catch { throw new AccountDeviceRequestError('account-device-protocol') }
+    // 补上 code：返回的链接必须是「拿去就能打开」的。EF 给的是页面基址，
+    // 直接打开会停在授权页的「缺少授权码」态 —— 见 deviceAuthorizeUrl。
+    return { ...created, verifyUrl: deviceAuthorizeUrl(created.verifyUrl, created.userCode) }
+  } catch (error) { throw classifyDeviceError(error) }
 }
 
 /**

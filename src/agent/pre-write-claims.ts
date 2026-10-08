@@ -141,6 +141,10 @@ export function preWriteClaimPaths(
       // 路径取值镜像 ast-edit.ts 的顺序：paths 数组 → 单数 path 别名 → 缺省 ['.']。
       // 忽略单数形态会让真实的全仓写入整段绕过守卫（该文件注释：模型/worker
       // 常写成单数，忽略它会静默退化为 ['.'] 全仓扫描）。
+      // 缺省 ['.'] 是工具真值（ast-edit.ts 同款缺省）：写前拿不到实际命中文件
+      // （要 collectFiles + AST 计算后才知道），认领粒度无法收窄。全仓键的探测
+      // 代价在 tool-pipeline 收口：claimPath === '.' 时跳过 fileClean 探针、按
+      // 'unknown' 落 L3 问——失效方向选「多问少夺」，不做全仓 git status（2026-10-08）。
       const raw: unknown[] = Array.isArray(tu.input.paths)
         ? tu.input.paths
         : typeof tu.input.path === 'string' && tu.input.path.trim().length > 0

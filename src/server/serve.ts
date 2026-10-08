@@ -25,6 +25,7 @@ import { resolveExecutionBackend } from './execution-backend.js'
 import { buildSessionRoutes } from './session-routes.js'
 import { buildMissionRoutes } from './mission-routes.js'
 import { buildRemoteInfoRoutes } from './remote-info-routes.js'
+import { createRemoteAccessEndpoint } from './remote-access-endpoint.js'
 import { installParentWatchdog } from './parent-watchdog.js'
 import { MissionStore } from './mission-store.js'
 import { buildHealthRoute, createHealthSnapshot, RUNTIME_INSTANCE_ID } from './health-route.js'
@@ -1028,9 +1029,9 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
   // Mission routes (P1 任务身份化): /missions/* — 与 session-manager 共享同一 store。
   Object.assign(routes, buildMissionRoutes(missionStore, apiToken))
 
-  // Remote-info route (P1 Mobile Remote): GET /remote/info — 桌面远程访问区块
-  // 数据源 + 手机连通自检。mode 由实际绑定地址决定（127.0.0.1 → loopback）。
-  Object.assign(routes, buildRemoteInfoRoutes(apiToken, { host, allowedHosts, protocol: opts.tls ? 'https' : 'http' }))
+  // Remote access: desktop info, authenticated HTTPS endpoint registration and phone self-check.
+  const remoteEndpoint = createRemoteAccessEndpoint()
+  Object.assign(routes, buildRemoteInfoRoutes(apiToken, { host, allowedHosts, protocol: opts.tls ? 'https' : 'http', endpoint: remoteEndpoint }))
 
   // Config routes: provider + API key management for the desktop settings UI.
   Object.assign(routes, buildConfigRoutes(apiToken, {
@@ -1272,7 +1273,7 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
   installStallObserver()
   timing.mark('routes')
   const listenT0 = performance.now()
-  const server = await startServer(port, routes, apiToken, { host, allowedHosts, mobileDir, tls: opts.tls })
+  const server = await startServer(port, routes, apiToken, { host, allowedHosts, mobileDir, tls: opts.tls, additionalAllowedHosts: remoteEndpoint.hosts })
   timing.mark('listen', `bind=${Math.round(performance.now() - listenT0)}ms wall=${Date.now() - startedAt}ms`)
   const serverInfo: ServerInfo = { port, host, ...(opts.tls ? { protocol: 'https' as const } : {}), token: apiToken, pid: process.pid, startedAt: new Date(startedAt).toISOString() }
   // 首批 UI 请求里的 GET /environment 此前是这些探针的首个调用方，同步 spawnSync

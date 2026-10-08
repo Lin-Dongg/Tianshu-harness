@@ -20,6 +20,13 @@ export const taskDefinitionSchema = z.object({
   successCommands: z.array(z.string().min(1)).default([]),
   timeoutMs: z.number().int().positive(),
   tags: z.array(z.string().min(1)).default([]),
+  /**
+   * 「契约已给」标记——只由星域题库投影（domain-bank.toPilotSuite）填入。
+   * true = 题面已把 oracle 参考测试交给 agent，**禁作能力对比**（两侧信息量不等价）。
+   * optional：历史 suite 文件（benchmark/tasks/*.json、docs/experiments/*）无此字段，
+   * 缺省按未知处理；缺失不得被解读为 false。
+   */
+  contractGiven: z.boolean().optional(),
 })
 
 export const benchmarkFailureSchema = z.object({

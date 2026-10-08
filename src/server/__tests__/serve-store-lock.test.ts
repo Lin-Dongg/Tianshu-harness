@@ -197,6 +197,40 @@ test('P0-1 接线：先到者独占会话库，后来者降级为 data-dir-locke
 })
 
 
+// 「信号 → graceful shutdown → storeLock.release」接线链回归：f585b4faf 曾钉
+// 此断言，a6a242197（PR #364/#367 收编）把实例 1 的关停换成 POST /shutdown 后
+// 丢失——POST /shutdown 与 SIGTERM 是两条关停入口，各自都得释放锁。平台判据与
+// serve-sighup.test.ts 一致：Windows 无 POSIX 信号投递（child.kill 返回 OK 但
+// handler 不触发，进程被 TerminateProcess 直接杀），故 POSIX 限定。
+test('SIGTERM → 优雅退出 → 锁文件释放（信号入口接线链）', {
+  timeout: 90_000,
+  skip: process.platform !== 'win32' ? false : 'Windows 无 POSIX 信号投递（child.kill 返回 OK 但 handler 不触发，进程被 TerminateProcess 直接杀）——CI ubuntu-latest 真跑',
+}, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'serve-store-lock-sigterm-'))
+  mkdirSync(join(root, 'home'), { recursive: true })
+  mkdirSync(join(root, 'desktop'), { recursive: true })
+  const lockPath = join(root, 'desktop', 'sidecar.lock')
+
+  const handle = spawnServe(root, await freePort())
+  try {
+    await waitForHealth(handle, (b) => b.readiness === 'ready', 40_000, '实例未就绪')
+    assert.ok(existsSync(lockPath), '持锁实例必须在 desktopDir()/sidecar.lock 留下锁文件')
+    assert.equal(readLockFile(lockPath)?.pid, handle.child.pid, '锁文件的 pid 应是实例自身')
+
+    handle.child.kill('SIGTERM')
+    const code = await waitForExit(handle.child, 30_000)
+    assert.equal(code, 0,
+      `SIGTERM 应走优雅退出（shutdownServer → process.exit(0)）code=0，实际 ${code}——` +
+      `信号 handler 未接线时进程被信号直杀（code=-1）；stderr=${handle.stderr.join('').slice(-400)}`)
+    assert.ok(!existsSync(lockPath),
+      'SIGTERM → graceful shutdown 必须释放锁文件——残留会让下一个实例被判 contended')
+  } finally {
+    if (handle.child.exitCode === null && !handle.child.killed) handle.child.kill('SIGKILL')
+    try { rmSync(root, { recursive: true, force: true }) } catch { /* best-effort */ }
+  }
+})
+
+
 test('锁创建权限失败报告 data-dir-lock-error，不虚构占用进程', { timeout: 60_000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), 'serve-lock-error-'))
   const handle = spawnServe(root, await freePort(), true)

@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "version": "3.29.1",
+  "date": "2026-10-08",
+  "fullNotesUrl": "https://github.com/huiliyi37/Tianshu-harness/releases/tag/v3.29.1",
+  "locales": {
+    "zh": {
+      "title": "审查闭环：三条链路按证据收口",
+      "highlights": [
+        "Java 项目的验证命令终于算数：dotnet、maven、gradle 的测试与构建会被交付门正确识别；多模块仓的局部跑不再被记成全量证据。",
+        "全量失败不再自动变黄：没有外部在途改动证据时保持红灯并指引取证；会话中途 git init 的项目可以现场重采基线交付。",
+        "多会话接管不留缝：判定后对方又写了文件就放弃接管；.env 等被忽略文件不再被当成「干净」误夺。未授信项目的 recall 不再读仓库自带的 commit 事实，你的全局技能恢复可用。"
+      ],
+      "notice": "交付门黄灯现在需要外部在途改动的证据；自己的回归仍是红灯。~/.rivet 请勿做成符号链接（serve 会拒绝启动）；桌面扫码配对只在独立 TLS 服务下可用。"
+    },
+    "en": {
+      "title": "Audit hardening: evidence-based gates",
+      "highlights": [
+        "Java builds finally count: dotnet, maven and gradle test/build commands are recognized by the delivery gate, and partial reactor runs in multi-module repos are no longer logged as full-suite evidence.",
+        "Full-suite failures no longer auto-downgrade: without evidence of external in-flight changes the gate stays red and tells you how to prove it; a session that git-inits mid-task can recapture its baseline and deliver.",
+        "Multi-session takeover leaves no gaps: if the owner refreshes the file after the check, the takeover is cancelled; ignored files like .env are no longer treated as clean. Recall no longer reads repo-shipped commit facts in untrusted projects, while your global skills work again."
+      ],
+      "notice": "A yellow delivery gate now requires evidence of external in-flight changes; your own regressions stay red. Do not symlink ~/.rivet (serve refuses to start); phone pairing via QR is only available on a standalone TLS serve."
+    }
+  }
+}

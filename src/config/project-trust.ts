@@ -199,19 +199,24 @@ export function projectInstructionsAllowed(cwd: string): boolean {
   return false
 }
 
-/** 目录内是否存在项目状态注入文件（.rivet/knowledge 的记忆与索引）——供未受信时的跳过提示判定。 */
+/** 目录内是否存在项目状态注入文件（.rivet/knowledge 的记忆、索引与 commit 事实侧车）——供未受信时的跳过提示判定。 */
 export function hasProjectStateInjectionFiles(cwd: string): boolean {
   const knowledgeDir = join(cwd, '.rivet', 'knowledge')
-  return existsSync(join(knowledgeDir, 'memory.jsonl')) || existsSync(join(knowledgeDir, 'manifest.md'))
+  return existsSync(join(knowledgeDir, 'memory.jsonl'))
+    || existsSync(join(knowledgeDir, 'manifest.md'))
+    || existsSync(join(knowledgeDir, 'commit-facts.jsonl'))
 }
 
 /**
- * 项目状态（.rivet/knowledge/memory.jsonl 项目记忆、manifest.md 知识索引）是否允许
- * 进入模型上下文 —— #218 信任门的 .rivet 状态面扩展（2026-10-03 安全报告，链 A/B）。
+ * 项目状态（.rivet/knowledge/ 下的 memory.jsonl 项目记忆、manifest.md 知识索引、
+ * commit-facts.jsonl 事实侧车）是否允许进入模型上下文 —— #218 信任门的 .rivet
+ * 状态面扩展（2026-10-03 安全报告，链 A/B）。
  *
- * 这两个文件物理上位于仓库内、可随仓库分发，却以权威化框架（<project-memory> 的
- * user_constraint / manifest 路由索引）常驻冻结前缀——与 AGENTS.md 同属「随仓库
- * 分发的指令」注入面。未受信目录一律不读不注入，与 projectInstructionsAllowed 同契约。
+ * 这些文件物理上位于仓库内、可随仓库分发，却以权威化框架（<project-memory> 的
+ * user_constraint / manifest 路由索引 / recall 事实结果）注入上下文——与 AGENTS.md
+ * 同属「随仓库分发的指令」注入面。未受信目录一律不读不注入，与
+ * projectInstructionsAllowed 同契约。门同时下沉到各读取函数内部（含
+ * project-memory-writer.readCommitFacts）。
  */
 export function projectStateAllowed(cwd: string): boolean {
   if (isProjectTrusted(cwd)) return true

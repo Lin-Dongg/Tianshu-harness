@@ -52,7 +52,7 @@ export class CollaborationProtocol {
   private listeners: Array<(event: CollaborationEvent) => void> = []
   private mergedFiles: string[] = []
 
-  constructor(private readonly config: CollaborationConfig = {}) {
+  constructor(config: CollaborationConfig = {}) {
     this.lockManager = new SemanticLockManager({
       defaultTtl: config.defaultLockTtl,
       heartbeatInterval: config.heartbeatInterval,

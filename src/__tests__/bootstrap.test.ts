@@ -1,9 +1,14 @@
 import { describe, it, before, after, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, utimesSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, utimesSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { cleanupStaleWorkerSessionDirs, restorePlanModeFromMeta, switchAgentCwd, resolveProviderAndAuth, type BootstrapContext } from '../bootstrap.js'
+import { cleanupStaleWorkerSessionDirs, restorePlanModeFromMeta, switchAgentCwd, resolveProviderAndAuth, captureGitBaseline, captureGitBaselineForRecovery, recaptureBaselineInto, type BootstrapContext } from '../bootstrap.js'
+import { captureGitBaselineAsync } from '../agent/git-baseline-async.js'
+import { createWorktreeBaseline } from '../agent/worktree-baseline.js'
+import { createTaskLedger } from '../agent/task-ledger.js'
+import { createOwnershipLedger } from '../agent/ownership-ledger.js'
+import { spawnGitSync } from '../tools/spawn-git.js'
 import { loadConfig } from '../config/manager.js'
 import type { AgentLoop } from '../agent/loop.js'
 
@@ -275,5 +280,123 @@ describe('resolveProviderAndAuth allowMissingKey', () => {
     const config = loadConfig()
     const result = resolveProviderAndAuth(config, 'deepseek', { allowMissingKey: true })
     assert.equal(result.apiKey, 'sk-test-12345', '有 key 时正常返回，allowMissingKey 不影响')
+  })
+})
+
+describe('captureGitBaseline complete 标记（CLI 同步采集 ↔ 桌面异步采集口径对齐）', () => {
+  let dir = ''
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'rivet-baseline-')) })
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
+
+  const git = (args: string[]) => {
+    const r = spawnGitSync(args, { cwd: dir, encoding: 'utf-8' })
+    if (r.error || r.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${r.stderr}`)
+    return r.stdout.trim()
+  }
+
+  it('非 git 目录 → complete: false（修复前同步采集未标记，isComplete 恒真、CLI 硬门失效）', async () => {
+    const syncSnap = captureGitBaseline(dir)
+    assert.equal(syncSnap.complete, false)
+    const asyncSnap = await captureGitBaselineAsync(dir)
+    assert.equal(asyncSnap.complete, false, '两端同场景同标记（桌面侧既有行为不动）')
+  })
+
+  it('正常 git 仓库（有提交）→ 两端同为 complete: true', async () => {
+    git(['init', '-q', '.'])
+    writeFileSync(join(dir, 'a.ts'), 'export const a = 1\n')
+    git(['add', 'a.ts'])
+    git(['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init'])
+    writeFileSync(join(dir, 'b.ts'), 'export const b = 1\n')
+    const syncSnap = captureGitBaseline(dir)
+    assert.equal(syncSnap.complete, true)
+    assert.ok(syncSnap.head.length > 0)
+    assert.deepEqual(syncSnap.preExistingUntracked, ['b.ts'])
+    const asyncSnap = await captureGitBaselineAsync(dir)
+    assert.equal(asyncSnap.complete, true)
+    assert.equal(asyncSnap.head, syncSnap.head)
+  })
+
+  it('unborn HEAD（git init 无提交）→ 两端同为 complete: false（严格口径对齐；交付时经恢复路径放行）', async () => {
+    git(['init', '-q', '.'])
+    const syncSnap = captureGitBaseline(dir)
+    assert.equal(syncSnap.complete, false, 'rev-parse HEAD 非零退出 → 与异步采集同判')
+    const asyncSnap = await captureGitBaselineAsync(dir)
+    assert.equal(asyncSnap.complete, false)
+  })
+})
+
+describe('captureGitBaselineForRecovery / recaptureBaselineInto（会话中途 git init 恢复路径）', () => {
+  let dir = ''
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'rivet-recapture-')) })
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
+
+  const git = (args: string[]) => {
+    const r = spawnGitSync(args, { cwd: dir, encoding: 'utf-8' })
+    if (r.error || r.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${r.stderr}`)
+    return r.stdout.trim()
+  }
+
+  it('非 git 目录 → null / false，基线保持 incomplete', () => {
+    assert.equal(captureGitBaselineForRecovery(dir), null)
+    const baseline = createWorktreeBaseline({ branch: '', head: '', preExistingDirty: [], preExistingUntracked: [], capturedAt: Date.now(), complete: false })
+    const ledger = createTaskLedger({ taskId: 'recapture-non-git' })
+    assert.equal(recaptureBaselineInto(baseline, ledger, dir), false)
+    assert.equal(baseline.isComplete(), false)
+  })
+
+  it('unborn HEAD（git init 后首次提交前）→ 仓库可用：complete: true、head 记空串', () => {
+    git(['init', '-q', '.'])
+    writeFileSync(join(dir, 'a.ts'), 'export const a = 1\n')
+    const snap = captureGitBaselineForRecovery(dir)
+    assert.ok(snap)
+    assert.equal(snap.complete, true)
+    assert.equal(snap.head, '', 'unborn HEAD 无提交可指，但仓库对 root commit 完全可用')
+    assert.ok(snap.branch.length > 0 && snap.branch !== 'HEAD', '分支名取 symbolic-ref（rev-parse 此时非零退出且 stdout 是垃圾串）')
+    assert.deepEqual(snap.preExistingUntracked, ['a.ts'])
+  })
+
+  it('有提交的仓库 → head 为真实 sha', () => {
+    git(['init', '-q', '.'])
+    writeFileSync(join(dir, 'a.ts'), 'export const a = 1\n')
+    git(['add', 'a.ts'])
+    git(['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init'])
+    const snap = captureGitBaselineForRecovery(dir)
+    assert.ok(snap)
+    assert.match(snap.head, /^[0-9a-f]{40}$/)
+  })
+
+  it('端到端：会话非 git 启动（incomplete）→ 任务中 git init → 重采换基线 → 归属仍按 ledger 证据', () => {
+    // 会话启动时目录不是 git 仓库：基线 incomplete，归属只看 ledger 证据
+    const baseline = createWorktreeBaseline({ branch: '', head: '', preExistingDirty: [], preExistingUntracked: [], capturedAt: Date.now(), complete: false })
+    const ledger = createTaskLedger({ taskId: 'recapture-e2e' })
+    const ownership = createOwnershipLedger({ baseline, taskLedger: ledger })
+    ledger.record({ type: 'file_write', path: 'src/app.ts' })
+    ownership.autoOwnFromLedger()
+    assert.equal(ownership.isBaselineComplete(), false)
+    assert.equal(ownership.isOwned('src/app.ts'), true)
+
+    // 任务中 git init（新项目脚手架）：会话写的文件与无关现场文件都在工作区
+    mkdirSync(join(dir, 'src'), { recursive: true })
+    writeFileSync(join(dir, 'src', 'app.ts'), 'export const app = 1\n')
+    writeFileSync(join(dir, 'scaffold.txt'), 'untouched\n')
+    git(['init', '-q', '.'])
+
+    assert.equal(recaptureBaselineInto(baseline, ledger, dir), true)
+    assert.equal(ownership.isBaselineComplete(), true, '仓库现在可用 → 基线完整，硬门放行')
+    assert.equal(ownership.isOwned('src/app.ts'), true,
+      'ledger 有证据的会话文件不得被重采基线吞成 external（否则 scoped commit 范围被清空）')
+    assert.equal(baseline.isExternal('src/app.ts'), false)
+    assert.equal(baseline.isExternal('scaffold.txt'), true,
+      'ledger 无证据的现场文件保持 external——「无法归因不许提交」的默认不变')
+    assert.equal(ownership.isOwned('scaffold.txt'), false)
+    // persist() 经 toSnapshot() 落新基线——resume 不再继承 incomplete 标记
+    assert.equal(baseline.toSnapshot().complete, true)
+  })
+
+  it('deliver_task 装配接线对账：bootstrap 把 recaptureBaseline 注入 ctx', () => {
+    // 可选面缺省 = 静默无恢复路径（硬阻断），读代码看不出——用源码对账守住接线。
+    const source = readFileSync(join(process.cwd(), 'src', 'bootstrap.ts'), 'utf8')
+    assert.match(source, /recaptureBaseline: \(targetCwd\) => recaptureBaselineInto\(b1Baseline, b1TaskLedger, targetCwd\)/,
+      'B1 deliver_task ctx 未接 recaptureBaseline——硬门恢复路径在 TUI/桌面 sidecar 生产装配中不生效')
   })
 })

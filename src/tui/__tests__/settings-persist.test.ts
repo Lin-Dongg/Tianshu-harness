@@ -6,7 +6,7 @@
 
 import { describe, it, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { loadConfig, setRoutingConfig } from '../../config/manager.js'
@@ -25,6 +25,36 @@ describe('settings persist', () => {
   afterEach(() => {
     delete process.env.RIVET_CONFIG_PATH
     rmSync(dir, { recursive: true, force: true })
+  })
+
+  // issue #386 验收面：存量配置（keys 池形态）里的 MiMo V2.6 若缺视觉标记，
+  // 识图候选列表里就没有这款全模态模型。loadConfig 的池回填 + loadSettingsEnv
+  // 的契约池读取必须串起来（这正是「模型能读图却选不了」的复现路径）。
+  it('keys 池里回填过视觉标记的 MiMo V2.6 出现在识图候选里 (issue #386)', () => {
+    writeFileSync(process.env.RIVET_CONFIG_PATH!, JSON.stringify({
+      provider: {
+        default: 'mimo',
+        providers: {
+          mimo: {
+            name: 'mimo',
+            baseUrl: 'https://token-plan-cn.xiaomimimo.com/v1',
+            protocol: 'openai',
+            apiKey: 'sk-test',
+            userSaved: true,
+            models: [],
+            keys: [{
+              id: 'default',
+              models: [{ id: 'mimo-v2.6-flash', contextWindow: 1_000_000, maxTokens: 128_000 }],
+            }],
+          },
+        },
+      },
+    }))
+    const vision = loadSettingsEnv().models.filter(m => m.supportsVision)
+    assert.ok(
+      vision.some(m => m.provider === 'mimo' && m.id === 'mimo-v2.6-flash'),
+      'MiMo V2.6 Flash 必须可作识图候选（visionOnly 过滤后仍在）',
+    )
   })
 
   it('reads the effective config into a draft', () => {

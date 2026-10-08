@@ -20,12 +20,13 @@
  * 侧车进程**不装配全局 dispatcher**：`setupHttpProxy()` 只被交互式会话的
  * `bootstrapInteractiveSession` 调用，`src/server/serve.ts` 有自己的入口不经过它。
  * 不管的话，配了代理的用户（官网反代正是为他们存在）会卡在「等待授权」转圈。
- * 所以这里在构建期解析一次代理并注入带 dispatcher 的 fetch。
+ * 所以这里在发送请求时读取当前网络设置，并注入带 dispatcher 的 fetch。
  */
-import { fetch as undiciFetch, ProxyAgent } from 'undici'
 import type { RouteHandler } from './index.js'
 import { withAuth } from './routes.js'
-import { resolveProxyForUrl } from '../tools/net/proxy-resolver.js'
+import { createAccountFetch } from './account-network.js'
+import { getNetworkConfig } from '../config/manager.js'
+import { classifyDeviceError } from '../auth/account-device-errors.js'
 import { cachedAccountSync, confirmedAccountPart, mergeAccountSnapshot, type AccountSyncResult } from '../auth/account-sync.js'
 import { rivetHome } from '../config/paths.js'
 import { serverLogger } from './logger.js'
@@ -38,7 +39,6 @@ import type {
   DeviceCreateResult,
   DevicePollResult,
   FetchInjection,
-  FetchLike,
   RequestDeviceCodeOpts,
   StellarIdentity,
 } from '../auth/account.js'
@@ -95,38 +95,7 @@ export interface AccountRoutesDeps {
   proxyUrl?: string
   /** `config.network.noProxy`。 */
   noProxy?: string
-}
-
-/** 按代理 URL 缓存 dispatcher——每请求新建会漏连接池。 */
-const agents = new Map<string, ProxyAgent>()
-
-function dispatcherFor(uri: string): ProxyAgent {
-  let agent = agents.get(uri)
-  if (!agent) {
-    agent = new ProxyAgent({ uri })
-    agents.set(uri, agent)
-  }
-  return agent
-}
-
-/**
- * 构建带代理 dispatcher 的 fetch；无代理时返回 undefined（调用方回退全局 fetch）。
- *
- * 目标 URL 只用于代理解析（NO_PROXY 匹配、协议选择），不参与请求本身——
- * 真正的请求 URL 由 `src/auth/account.ts` 按 `accountApiBase()` 拼。
- */
-function buildProxyFetch(deps: AccountRoutesDeps): FetchLike | undefined {
-  const target = accountModule.accountApiBase()
-  const proxyUrl = resolveProxyForUrl(target, { proxyUrl: deps.proxyUrl, noProxy: deps.noProxy })
-  if (!proxyUrl) return undefined
-  const dispatcher = dispatcherFor(proxyUrl)
-  // undici 的 fetch 接受 dispatcher，全局 fetch 的类型里没有这个字段——
-  // 这里是有意的类型抹平，运行时形状一致（status/ok/json 都在）。
-  return (async (input: unknown, init?: unknown) =>
-    undiciFetch(input as string, {
-      ...((init ?? {}) as Parameters<typeof undiciFetch>[1]),
-      dispatcher,
-    })) as unknown as FetchLike
+  getNetwork?: () => { proxy?: string; noProxy?: string }
 }
 
 function defaultAccountApi(): AccountApi {
@@ -182,9 +151,10 @@ const ACTIVATE_STATUS: Record<ActivateAccountLicenseCode, number> = {
 
 export function buildAccountRoutes(deps: AccountRoutesDeps): Record<string, RouteHandler> {
   const api = deps.account ?? defaultAccountApi()
-  // 代理在构建期解析一次：配置在进程生命周期内不变，而 macOS 的解析要起
-  // `scutil --proxy` 子进程，逐请求跑是白付。
-  const fetchImpl = buildProxyFetch(deps)
+  const fetchImpl = createAccountFetch(() => {
+    const network = deps.getNetwork?.() ?? { proxy: deps.proxyUrl, noProxy: deps.noProxy }
+    return { proxyUrl: network.proxy || undefined, noProxy: network.noProxy || undefined }
+  })
   // 与 /status、/abort 同一份认证实现（routes.ts 的 withAuth）——
   // 认证规则漂移出第二份就是安全洞。
   const guard = (handler: RouteHandler): RouteHandler => withAuth(handler, deps.apiToken)
@@ -339,8 +309,10 @@ export function buildAccountRoutes(deps: AccountRoutesDeps): Record<string, Rout
         }
         activeDeviceCode = created.deviceCode
         return { status: 200, body: created }
-      } catch {
-        return { status: 502, body: { error: 'device authorization temporarily unavailable' } }
+      } catch (error) {
+        const failure = classifyDeviceError(error)
+        serverLogger.warn('[account-device] 授权申请失败', { code: failure.code, upstreamStatus: failure.upstreamStatus })
+        return { status: 502, body: { error: failure.code } }
       }
     }),
     'POST /account/poll': guard(async body => {
@@ -475,5 +447,6 @@ export function buildAccountRoutesFor(
     rivetHome: rivetHome(),
     proxyUrl: config.network?.proxy,
     noProxy: config.network?.noProxy,
+    getNetwork: getNetworkConfig,
   })
 }

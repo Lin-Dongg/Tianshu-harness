@@ -22,7 +22,7 @@ export interface CacheDiagnostic {
 
 export function diagnoseCacheMiss(
   history: TurnCacheSnapshot[],
-  currentTurn: number,
+  _currentTurn: number,
   drift: DriftEvent | null,
   wasCompacted: boolean,
   evidence?: { wireChanged?: boolean; restored?: boolean; usageKnown?: boolean },

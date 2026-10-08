@@ -3,7 +3,7 @@ import { repositoryCapability, NonRepositoryError } from '../agent/repository-ca
 import { readFile as fsReadFile, stat as fsStat } from 'node:fs/promises'
 import { dirname, isAbsolute, resolve } from 'node:path'
 import type { Tool, ToolCallParams } from './types.js'
-import { relativePosix } from '../path-format.js'
+import { relativePosix, toPosixPath } from '../path-format.js'
 import { auditCommitTagScope } from './commit-audit.js'
 import { createWorkspaceGuard } from '../agent/workspace-guard.js'
 import { killProcessTreeAsync, killProcessTree } from './process-kill.js'
@@ -157,14 +157,23 @@ async function runGitSafe(args: string[], cwd: string, abortSignal?: AbortSignal
  * L3 判据的唯一实现点，供 R2 写前守卫判断「持有方是否还压着未提交的改动」：
  *  - 非仓库 → `true`：没有版本状态需要保护，staleness 才是主守卫；
  *  - 能力未知 → `'unknown'`：判定方保守落 L3（走人工确认），不臆断干净；
- *  - 否则 `git status --porcelain=v1 -z -uall -- <path>` 空输出即干净。
+ *  - 否则 `git status --porcelain=v1 -z -uall --ignored -- <path>` 空输出即干净。
  * 用 `-z` 避免非 ASCII 路径被引号包裹导致的解析歧义（与 git-workbench 同口径）。
+ * `--ignored` 让 ignored 条目（`!!` 前缀）也算「不干净」：ignored 文件天然无 git
+ * 保护（checkpoint 快照同样不含 ignored，无回滚兜底），存在即对方未入版本库的
+ * 内容，自动接管会无声覆盖——失效方向选「多问少夺」，命中即落 L3 问。pathspec
+ * 已限定目标路径，探测不会把全仓 ignored 拉进来；代价是全仓型认领键（ast_edit
+ * 缺省 ['.']）在有任何 ignored 文件的仓库里恒不 clean、恒落问，同属该方向。
  */
 export async function isPathClean(cwd: string, relPath: string): Promise<boolean | 'unknown'> {
   const capability = await repositoryCapability(cwd)
   if (capability === 'non_repository') return true
   if (capability !== 'repository') return 'unknown'
-  const { ok, output } = await runGitSafe(['status', '--porcelain=v1', '-z', '-uall', '--', relPath], cwd)
+  // pathspec 一律 POSIX 分隔符（与 normalizeProjectRelativePath 同约定）：认领键
+  // 来自 preWriteClaimPaths 的 norm，只剥 cwd 前缀、保留入参分隔符——Windows 反
+  // 斜杠键形会被 git 当转义/字面字符而恒不匹配，静默恒干净，L3 在该平台整段失效。
+  const pathspec = toPosixPath(relPath)
+  const { ok, output } = await runGitSafe(['status', '--porcelain=v1', '-z', '-uall', '--ignored', '--', pathspec], cwd)
   if (!ok) return 'unknown'
   return output.trim().length === 0
 }

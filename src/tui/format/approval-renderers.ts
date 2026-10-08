@@ -17,6 +17,7 @@ import type { RivetTheme } from '../theme.js'
 import { ambiguousWideEnabled, displayWidth, truncateToDisplayWidth } from '../width.js'
 import { useAsciiBorders } from '../term-caps.js'
 import type { RiskExplanation, RiskLevel } from '../../agent/risk-explain.js'
+import { readClaimConflict, type ClaimConflictInfo } from '../../agent/claim-liveness.js'
 
 export interface ApprovalRenderer {
   /** 渲染审批预览行（每行已做列宽控制，调用方直接显示） */
@@ -46,6 +47,24 @@ function isDangerousCommand(cmd: string): boolean {
 
 const WIDE = { get ambiguousAsWide(): boolean { return ambiguousWideEnabled() } }
 const PREVIEW_ROWS = 6
+
+/**
+ * 渲染/序列化审批入参时剥掉 `__` 前缀的内部标记键（如 __claimConflict）——
+ * 它们是给渲染层的结构化信号，不是用户可读参数；标记本身由渲染层特判成文案。
+ */
+function publicInputEntries(input: Record<string, unknown>): Array<[string, unknown]> {
+  return Object.entries(input).filter(([key]) => !key.startsWith('__'))
+}
+
+/** 认领冲突横幅（事实区首行，短屏截断也优先保住它）。 */
+function claimConflictLines(conflict: ClaimConflictInfo, columns: number, theme: RivetTheme): string[] {
+  const owner = conflict.ownerSessionId.slice(0, 8)
+  const lines = wrapFact(`⚠ 认领冲突：${conflict.filePath} 正被另一个会话（${owner}）持有`, columns)
+    .map(line => color(line, theme.warning))
+  if (conflict.reason) lines.push(...wrapFact(conflict.reason, columns).map(line => color(line, theme.muted)))
+  lines.push(...wrapFact('批准 = 接管该文件并继续本次操作；拒绝 = 保持对方持有', columns).map(line => color(line, theme.muted)))
+  return lines
+}
 
 /** Wrap facts without losing command/path suffixes; columns includes caller padding. */
 function wrapFact(value: string, columns: number): string[] {
@@ -121,7 +140,7 @@ const fileWriteRenderer: ApprovalRenderer = {
       lines.push(...wrapFact(`${contentLines.length} lines`, columns).map(line => color(line, theme.muted)))
       const contentRows = contentLines.flatMap((line, i) => wrapFact(`${i + 1} │ ${line}`, columns).map(row => color(row, theme.muted)))
       lines.push(...factPreview(contentRows, columns, theme, options))
-      const extra = Object.fromEntries(Object.entries(input).filter(([key]) => !['file_path', 'path', 'content', 'mode'].includes(key)))
+      const extra = Object.fromEntries(publicInputEntries(input).filter(([key]) => !['file_path', 'path', 'content', 'mode'].includes(key)))
       if (Object.keys(extra).length) lines.push(...factPreview(labeledFacts('Parameters', JSON.stringify(extra), columns, theme, options), columns, theme, options))
     }
     return lines
@@ -212,7 +231,7 @@ const webRenderer: ApprovalRenderer = {
 
 const fallbackRenderer: ApprovalRenderer = {
   render(toolName, input, columns, theme, options) {
-    const raw = JSON.stringify(input)
+    const raw = JSON.stringify(Object.fromEntries(publicInputEntries(input)))
     const rows = wrapFact(`→ ${raw}`, columns).map(line => color(line, theme.muted))
     return rows.length > PREVIEW_ROWS ? factPreview(rows, columns, theme, options) : rows
   },
@@ -258,6 +277,9 @@ export function renderApprovalPreview(
 /** Read-only facts for the approval pager. The execution input is never changed. */
 export function formatApprovalFacts(toolName: string, input: Record<string, unknown>, columns: number, theme: RivetTheme): string[] {
   const lines: string[] = []
+  // 认领冲突标记先翻译成人读横幅——「全文」是只读事实视图，不是 raw JSON dump。
+  const conflict = readClaimConflict(input)
+  if (conflict) lines.push(...claimConflictLines(conflict, columns, theme))
   if (['bash', 'shell', 'sandbox_exec'].includes(toolName)) {
     if (typeof input.command === 'string') lines.push(...labeledFacts('Command', input.command, columns, theme))
     if (typeof input.cwd === 'string') lines.push(...labeledFacts('CWD', input.cwd, columns, theme))
@@ -275,7 +297,7 @@ export function formatApprovalFacts(toolName: string, input: Record<string, unkn
     }
   }
   if (typeof input.content === 'string') lines.push(...input.content.split('\n').flatMap((line, i) => labeledFacts(String(i + 1), line, columns, theme)))
-  lines.push(...labeledFacts('Parameters', JSON.stringify(input, null, 2), columns, theme))
+  lines.push(...labeledFacts('Parameters', JSON.stringify(Object.fromEntries(publicInputEntries(input)), null, 2), columns, theme))
   return lines
 }
 
@@ -329,10 +351,16 @@ export function formatApprovalPromptLayout(input: FormatApprovalPromptInput, the
   const fit = (line: string): string[] => displayWidth(line, WIDE) <= width ? [line]
     : wrapFact(stripVTControlCharacters(line), width + 2).map(row => color(row, theme.muted))
   const title = fit(color(`等待审批 · ${input.toolName}`, theme.warning, { bold: true }))
-  const preview = renderApprovalPreview(input.toolName, input.input, width - 2, theme, {
-    labels: { CWD: '工作目录  ', Command: '命令  ', Path: '文件  ', Mode: '写入方式  ', Objective: '目标  ', Parameters: '参数  ' },
-    showFullHint: false,
-  })
+  // 认领冲突（另一个会话持有目标文件）：横幅进事实区首行，批准项改写为接管语义——
+  // 普通「批准/拒绝」措辞会把「是否接管」读成「是否允许写入」，授权对象错位。
+  const conflict = readClaimConflict(input.input)
+  const preview = [
+    ...(conflict ? claimConflictLines(conflict, width - 2, theme) : []),
+    ...renderApprovalPreview(input.toolName, input.input, width - 2, theme, {
+      labels: { CWD: '工作目录  ', Command: '命令  ', Path: '文件  ', Mode: '写入方式  ', Objective: '目标  ', Parameters: '参数  ' },
+      showFullHint: false,
+    }),
+  ]
     .map(line => `  ${line}`)
   const risks: string[] = []
   if (input.riskPending) {
@@ -346,7 +374,7 @@ export function formatApprovalPromptLayout(input: FormatApprovalPromptInput, the
   }
   const directories = [...new Set(input.pathGrant?.paths.map(path => dirname(resolve(path))) ?? [])]
   const capability = input.pathGrant?.mode === 'write' ? '读写' : '只读'
-  const options = ['批准 (Enter/y)', '拒绝 (Esc/n)', '编辑 JSON (e)']
+  const options = [conflict ? '接管并批准 (Enter/y)' : '批准 (Enter/y)', '拒绝 (Esc/n)', '编辑 JSON (e)']
   if (input.rememberOption) options.push(`批准并记住${directories.length > 1 ? ` ${directories.length} 个目录` : '此目录'} (r)`)
   if (!input.risk && !input.riskPending) options.push('解释风险 (^E)')
   const choices: string[][] = []
@@ -383,7 +411,7 @@ export function formatApprovalPromptLayout(input: FormatApprovalPromptInput, the
     else lines.push(...preview.slice(0, factBudget - 1), color('  其余事实已收起', theme.muted))
   }
   lines.push(rule)
-  if (roomy) lines.push(color('  是否允许这次操作？', theme.secondary, { bold: true }))
+  if (roomy) lines.push(color(conflict ? '  是否接管该文件？' : '  是否允许这次操作？', theme.secondary, { bold: true }))
   const choiceRows: number[] = []
   choices.forEach(rows => { choiceRows.push(lines.length); lines.push(...rows) })
   if (roomy) lines.push('')

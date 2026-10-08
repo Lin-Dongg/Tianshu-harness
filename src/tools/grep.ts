@@ -5,7 +5,6 @@ const execFileAsync = promisify(execFile)
 import { existsSync } from 'fs'
 import { lstat, readdir, realpath, stat } from 'fs/promises'
 import { join, resolve } from 'path'
-import { getResolvedEnv } from './resolved-env.js'
 import type { Dirent } from 'node:fs'
 import type { Tool, ToolCallParams, ToolResult } from './types.js'
 import { relativePosix } from '../path-format.js'

@@ -11,6 +11,7 @@ import type { RouteHandler } from './index.js'
 import { isAuthorizedRequest } from './auth.js'
 import { isLoopbackBind } from './host-policy.js'
 import { networkInterfaces } from 'node:os'
+import type { createRemoteAccessEndpoint } from './remote-access-endpoint.js'
 
 export interface RemoteInfoOptions {
   protocol?: 'http' | 'https'
@@ -18,6 +19,7 @@ export interface RemoteInfoOptions {
   host: string
   /** Host allowlist（有配置时随响应返回，供 UI 显示收紧状态）。 */
   allowedHosts?: string[]
+  endpoint?: ReturnType<typeof createRemoteAccessEndpoint>
 }
 
 export interface LanUrl {
@@ -47,6 +49,14 @@ export function buildRemoteInfoRoutes(apiToken?: string, opts?: RemoteInfoOption
   // 短路不画码（且 listenHost 显示 '::'，与 mode 自相矛盾）。
   const lanMode = !isLoopbackBind(host)
   return {
+    'PUT /remote/endpoint': async (body, _params, headers) => {
+      if (!isAuthorizedRequest({ body, headers }, apiToken)) return { status: 401, body: { error: 'Unauthorized' } }
+      if (!opts?.endpoint) return { status: 503, body: { error: 'remote_endpoint_unavailable' } }
+      const { baseUrl } = (body ?? {}) as { baseUrl?: unknown }
+      if (typeof baseUrl !== 'string') return { status: 400, body: { error: 'invalid_remote_https_address' } }
+      try { return { status: 200, body: { baseUrl: opts.endpoint.set(baseUrl) } } }
+      catch { return { status: 400, body: { error: 'invalid_remote_https_address' } } }
+    },
     'GET /remote/info': async (body, _params, headers) => {
       if (!isAuthorizedRequest({ body, headers }, apiToken)) {
         return { status: 401, body: { error: 'Unauthorized' } }
@@ -59,6 +69,7 @@ export function buildRemoteInfoRoutes(apiToken?: string, opts?: RemoteInfoOption
           }
         }
       }
+      const allowedHosts = [...new Set([...(opts?.allowedHosts ?? []), ...(opts?.endpoint?.hosts() ?? [])])]
       return {
         status: 200,
         body: {
@@ -66,7 +77,8 @@ export function buildRemoteInfoRoutes(apiToken?: string, opts?: RemoteInfoOption
           protocol: opts?.protocol ?? 'http',
           listenHost: opts?.host ?? '127.0.0.1',
           lanUrls: sortLanUrls(rawUrls),
-          ...(opts?.allowedHosts && opts.allowedHosts.length > 0 ? { allowedHosts: opts.allowedHosts } : {}),
+          remoteBaseUrl: opts?.endpoint?.get() ?? '',
+          ...(allowedHosts.length > 0 ? { allowedHosts } : {}),
         },
       }
     },

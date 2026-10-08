@@ -1,4 +1,4 @@
-import { describe, it, before, after } from 'node:test'
+import { describe, it, before, after, mock } from 'node:test'
 import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs'
@@ -9,7 +9,7 @@ import { resolveAppPromptInput, handleSlashCommand, formatVerificationStatus, mc
 // TUI slash 行为」正常语义（裸技能名用例走真实工作区技能目录）；未授信拒绝语义在
 // src/config/__tests__/project-trust-surface-gates.test.ts 覆盖。node:test 文件级进程隔离。
 process.env.RIVET_TRUST_PROJECT = '1'
-import { skillRegistry } from '../../skills/skill-loader.js'
+import { skillRegistry, SkillRegistry } from '../../skills/skill-loader.js'
 import { handleYoloToggle } from '../yolo-toggle.js'
 import { loadConstellation } from '../../constellation/store.js'
 import { DEFAULT_CONFIG } from '../../config/default.js'
@@ -86,6 +86,21 @@ function makeCtx(overrides?: Partial<SlashHandlerContext>): SlashHandlerContext 
     claimStoreRef: { current: null },
     ...overrides,
   }
+}
+
+// /skill 会话注册表主路径替身（4940f9c94 把 /skill 数据源换成
+// ctx.agent.config.promptEngine.getSkillRegistry() 的会话快照；320bdd0ee 的
+// 进程全局 skillRegistry 回落只服务没有 config.promptEngine 的轻量替身）。
+// 替身给出**独立**的 SkillRegistry 实例并给 list() 计数——计数为 0 即数据源
+// 退回全局，主路径失守（还原 4940f9c94 或误删会话读取时这些用例应变红）。
+function makeSessionSkillProbe(cwd = '/cwd') {
+  let listCalls = 0
+  const registry = new SkillRegistry()
+  const origList = registry.list.bind(registry)
+  registry.list = () => { listCalls++; return origList() }
+  const base = makeCtx().agent as any
+  const agent = { ...base, cwd, config: { ...base.config, promptEngine: { getSkillRegistry: () => registry } } } as any
+  return { agent, registry, listCalls: () => listCalls }
 }
 
 describe('/context 占用明细', () => {
@@ -970,13 +985,15 @@ describe('/skill review|approve|reject — auto-distill drafts', () => {
     const cwd = makeTestDir('skill-review-')
     try {
       const slug = seedDraft(cwd)
+      const probe = makeSessionSkillProbe(cwd)
       const entries: string[] = []
       const handled = await handleSlashCommand(makeCtx({
         parts: ['/skill', 'review'],
-        agent: { ...makeCtx().agent, cwd } as any,
+        agent: probe.agent,
         pushStatic: (entry) => entries.push(entry.content),
       }))
       assert.equal(handled, true)
+      assert.ok(probe.listCalls() > 0, '/skill 必须经会话技能注册表（主路径）取数，而非进程全局兜底')
       assert.ok(entries[0]!.includes(slug), `应列出草稿: ${entries[0]}`)
       assert.ok(entries[0]!.includes('approve'))
     } finally {
@@ -988,13 +1005,15 @@ describe('/skill review|approve|reject — auto-distill drafts', () => {
     const cwd = makeTestDir('skill-approve-')
     try {
       const slug = seedDraft(cwd)
+      const probe = makeSessionSkillProbe(cwd)
       const entries: string[] = []
       const handled = await handleSlashCommand(makeCtx({
         parts: ['/skill', 'approve', slug],
-        agent: { ...makeCtx().agent, cwd } as any,
+        agent: probe.agent,
         pushStatic: (entry) => entries.push(entry.content),
       }))
       assert.equal(handled, true)
+      assert.ok(probe.listCalls() > 0, '/skill 必须经会话技能注册表（主路径）取数，而非进程全局兜底')
       assert.ok(entries[0]!.includes('已入库'), `应报告入库: ${entries[0]}`)
       assert.equal(listSkillDrafts(cwd).length, 0)
     } finally {
@@ -1006,17 +1025,66 @@ describe('/skill review|approve|reject — auto-distill drafts', () => {
     const cwd = makeTestDir('skill-reject-')
     try {
       const slug = seedDraft(cwd)
+      const probe = makeSessionSkillProbe(cwd)
       const entries: string[] = []
       const handled = await handleSlashCommand(makeCtx({
         parts: ['/skill', 'reject', slug],
-        agent: { ...makeCtx().agent, cwd } as any,
+        agent: probe.agent,
         pushStatic: (entry) => entries.push(entry.content),
       }))
       assert.equal(handled, true)
+      assert.ok(probe.listCalls() > 0, '/skill 必须经会话技能注册表（主路径）取数，而非进程全局兜底')
       assert.ok(entries[0]!.includes('已丢弃'), `应报告丢弃: ${entries[0]}`)
       assert.equal(listSkillDrafts(cwd).length, 0)
     } finally {
       cleanupTestDir(cwd)
+    }
+  })
+})
+
+describe('/skill list — 会话注册表主路径', () => {
+  it('渲染会话快照里的技能（哨兵只在会话注册表，全局没有）', async () => {
+    const probe = makeSessionSkillProbe()
+    probe.registry.register({ name: 'session-pinned-probe', description: 'only in session registry', triggers: [], body: 'SENTINEL-BODY' })
+    const entries: string[] = []
+    const handled = await handleSlashCommand(makeCtx({
+      parts: ['/skill', 'list'],
+      agent: probe.agent,
+      pushStatic: (entry) => entries.push(entry.content),
+    }))
+    assert.equal(handled, true)
+    assert.ok(!skillRegistry.get('session-pinned-probe'), '前提：哨兵技能不在全局注册表，否则无法区分数据源')
+    assert.ok(probe.listCalls() > 0, '/skill 必须经会话技能注册表（主路径）取数，而非进程全局兜底')
+    assert.ok(entries[0]!.includes('session-pinned-probe'), `会话快照里的技能必须出现在列表: ${entries[0]}`)
+  })
+})
+
+describe('/compact 轻量替身容忍（mock 无 config.promptEngine）', () => {
+  it('micro compact 全程不崩：无引擎 = 无预算策略、无 appendix 基线可重置', async () => {
+    // 与 320bdd0ee 同族的替身崩面：/compact 曾两处裸读 ctx.agent.config.promptEngine
+    // （getRequestBudgetPolicy / resetAppendixBaseline），轻量 mock 没有这一层直接
+    // TypeError。加固后：无策略 → 走 micro compact；无基线 → 跳过重置即等价。
+    mock.timers.enable({ apis: ['setTimeout'] })
+    try {
+      const entries: string[] = []
+      const compactEvents: unknown[] = []
+      const handled = await handleSlashCommand(makeCtx({
+        parts: ['/compact'],
+        session: {
+          getMessages: () => [],
+          replaceMessages: () => {},
+          recordCompactEvent: (e: unknown) => { compactEvents.push(e) },
+          getTurnCount: () => 0,
+          getCacheHitRate: () => 0,
+        } as any,
+        pushStatic: (entry) => entries.push(entry.content),
+      }))
+      assert.equal(handled, true)
+      assert.ok(entries.some(e => e.includes('Micro-compacting')), `无预算策略应走 micro compact: ${entries.join(' | ')}`)
+      assert.equal(compactEvents.length, 1, 'micro compact 必须记录事件')
+      mock.timers.tick(8000) // 收掉 summary 清理定时器，不让它拖住进程退出
+    } finally {
+      mock.timers.reset()
     }
   })
 })
@@ -1057,6 +1125,133 @@ describe('/effort', () => {
     }))
 
     assert.equal(kind, 'effort')
+  })
+  it('rejects /effort with unsupported notice when effortChoices is empty', async () => {
+    const logs: string[] = []
+    let panelKind: string | undefined
+    let effortSet: string | undefined
+
+    const handledNoArg = await handleSlashCommand(makeCtx({
+      parts: ['/effort'],
+      effortChoices: [],
+      setChoicePanelKind: (k) => { panelKind = k as any },
+      setReasoningEffort: (e) => { effortSet = e },
+      pushStatic: (entry) => logs.push(entry.content),
+    }))
+    assert.equal(handledNoArg, true)
+    assert.equal(panelKind, undefined)
+    assert.equal(effortSet, undefined)
+    assert.ok(logs.some(m => m.includes('当前模型不支持推理等级调节')))
+
+    logs.length = 0
+    const handledWithArg = await handleSlashCommand(makeCtx({
+      parts: ['/effort', 'high'],
+      effortChoices: [],
+      setReasoningEffort: (e) => { effortSet = e },
+      pushStatic: (entry) => logs.push(entry.content),
+    }))
+    assert.equal(handledWithArg, true)
+    assert.equal(effortSet, undefined)
+    assert.ok(logs.some(m => m.includes('当前模型不支持推理等级调节')))
+  })
+
+  it('restricts choices and rejects invalid level with dynamic usage when effortChoices is provided', async () => {
+    const deepseekChoices = [
+      { id: 'off' as const, label: 'Off', wireValue: 'none' },
+      { id: 'low' as const, label: 'Low' },
+      { id: 'high' as const, label: 'High' },
+      { id: 'max' as const, label: 'Max' },
+    ]
+    const logs: string[] = []
+    let effortSet: string | undefined
+
+    // Invalid / unsupported choice on DeepSeek (medium aliases to high, not a direct choice)
+    await handleSlashCommand(makeCtx({
+      parts: ['/effort', 'medium'],
+      effortChoices: deepseekChoices,
+      setReasoningEffort: (e) => { effortSet = e },
+      pushStatic: (entry) => logs.push(entry.content),
+    }))
+    assert.equal(effortSet, undefined)
+    assert.ok(logs.some(m => m.includes('Usage: /effort [off|low|high|max|auto]')))
+
+    // Valid choices
+    await handleSlashCommand(makeCtx({
+      parts: ['/effort', 'high'],
+      effortChoices: deepseekChoices,
+      setReasoningEffort: (e) => { effortSet = e },
+      pushStatic: (entry) => logs.push(entry.content),
+    }))
+    assert.equal(effortSet, 'high')
+
+    // Wire alias none maps to internal off
+    await handleSlashCommand(makeCtx({
+      parts: ['/effort', 'none'],
+      effortChoices: deepseekChoices,
+      setReasoningEffort: (e) => { effortSet = e },
+      pushStatic: (entry) => logs.push(entry.content),
+    }))
+    assert.equal(effortSet, 'off')
+  })
+
+  it('accepts wire alias xhigh for max and rejects unsupported off for Grok', async () => {
+    const grokChoices = [
+      { id: 'low' as const, label: 'Low' },
+      { id: 'medium' as const, label: 'Medium' },
+      { id: 'high' as const, label: 'High' },
+      { id: 'max' as const, label: 'XHigh', wireValue: 'xhigh' },
+    ]
+    const logs: string[] = []
+    let effortSet: string | undefined
+
+    await handleSlashCommand(makeCtx({
+      parts: ['/effort', 'xhigh'],
+      effortChoices: grokChoices,
+      setReasoningEffort: (e) => { effortSet = e },
+      pushStatic: (entry) => logs.push(entry.content),
+    }))
+    assert.equal(effortSet, 'max')
+    assert.ok(logs.some(m => m === 'Reasoning effort set to: XHigh'))
+
+    logs.length = 0
+    effortSet = undefined
+    await handleSlashCommand(makeCtx({
+      parts: ['/effort', 'off'],
+      effortChoices: grokChoices,
+      setReasoningEffort: (e) => { effortSet = e },
+      pushStatic: (entry) => logs.push(entry.content),
+    }))
+    assert.equal(effortSet, undefined)
+    assert.ok(logs.some(m => m.includes('Usage: /effort [low|medium|high|max|auto]')))
+  })
+
+  it('omits Set max guidance when model lacks max and guides Enter=session s=default', async () => {
+    const limitedChoices = [
+      { id: 'off' as const, label: 'Off', wireValue: 'none' },
+      { id: 'low' as const, label: 'Low' },
+      { id: 'high' as const, label: 'High' },
+    ]
+    const logs: string[] = []
+
+    // No arg hint
+    await handleSlashCommand(makeCtx({
+      parts: ['/effort'],
+      effortChoices: limitedChoices,
+      pushStatic: (entry) => logs.push(entry.content),
+    }))
+    assert.ok(logs.some(m => m.includes('Enter 仅应用本会话，s 设为默认')))
+
+    // Invalid arg usage omits 'Set max'
+    logs.length = 0
+    await handleSlashCommand(makeCtx({
+      parts: ['/effort', 'unknown'],
+      effortChoices: limitedChoices,
+      pushStatic: (entry) => logs.push(entry.content),
+    }))
+    const usageMsg = logs.find(m => m.includes('Usage: /effort'))!
+    assert.ok(usageMsg.includes('Usage: /effort [off|low|high|auto]'))
+    assert.ok(!usageMsg.includes('Set max'))
+    assert.ok(usageMsg.includes('auto lets autoReasoning pick per-task complexity.'))
   })
 })
 
@@ -1410,12 +1605,15 @@ describe('/yes — one-command YOLO shortcut', () => {
 
 describe('/skill install — copy skills from .claude/skills into .rivet/skills', () => {
   it('shows usage when no name is given', async () => {
+    const probe = makeSessionSkillProbe()
     const entries: string[] = []
     const handled = await handleSlashCommand(makeCtx({
       parts: ['/skill', 'install'],
+      agent: probe.agent,
       pushStatic: (entry) => entries.push(entry.content),
     }))
     assert.equal(handled, true)
+    assert.ok(probe.listCalls() > 0, '/skill 必须经会话技能注册表（主路径）取数，而非进程全局兜底')
     assert.ok(entries[0]!.includes('用法'), entries[0])
   })
 
@@ -1427,13 +1625,15 @@ describe('/skill install — copy skills from .claude/skills into .rivet/skills'
       mkdirSync(projectClaude, { recursive: true })
       writeFileSync(join(projectClaude, 'SKILL.md'), '---\nname: test-skill\n---\nTest skill body.')
 
+      const probe = makeSessionSkillProbe(cwd)
       const entries: string[] = []
       const handled = await handleSlashCommand(makeCtx({
         parts: ['/skill', 'install', 'test-skill'],
-        agent: { ...makeCtx().agent, cwd } as any,
+        agent: probe.agent,
         pushStatic: (entry) => entries.push(entry.content),
       }))
       assert.equal(handled, true)
+      assert.ok(probe.listCalls() > 0, '/skill 必须经会话技能注册表（主路径）取数，而非进程全局兜底')
       assert.ok(entries[0]!.includes('已安装'), `expected install success: ${entries[0]}`)
       assert.ok(existsSync(join(cwd, '.rivet', 'skills', 'test-skill', 'SKILL.md')))
     } finally {
@@ -1450,13 +1650,15 @@ describe('/skill install — copy skills from .claude/skills into .rivet/skills'
       mkdirSync(join(cwd, '.rivet', 'skills', 'test-skill-skip'), { recursive: true })
       writeFileSync(join(cwd, '.rivet', 'skills', 'test-skill-skip', 'SKILL.md'), '---\nname: test-skill-skip\n---\nExisting.')
 
+      const probe = makeSessionSkillProbe(cwd)
       const entries: string[] = []
       const handled = await handleSlashCommand(makeCtx({
         parts: ['/skill', 'install', 'test-skill-skip'],
-        agent: { ...makeCtx().agent, cwd } as any,
+        agent: probe.agent,
         pushStatic: (entry) => entries.push(entry.content),
       }))
       assert.equal(handled, true)
+      assert.ok(probe.listCalls() > 0, '/skill 必须经会话技能注册表（主路径）取数，而非进程全局兜底')
       assert.ok(entries[0]!.includes('跳过'), `expected skip: ${entries[0]}`)
     } finally {
       cleanupTestDir(cwd)

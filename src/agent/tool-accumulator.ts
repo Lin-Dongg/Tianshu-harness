@@ -105,7 +105,7 @@ export class ToolAccumulator {
     return this.buildGenericSummary(toolName, entries, count, totalChars)
   }
 
-  private buildBashSummary(entries: AccumulatorEntry[], count: number, totalChars: number): string {
+  private buildBashSummary(entries: AccumulatorEntry[], count: number, _totalChars: number): string {
     // Parse per-command metadata from the output header:
     //   [ls -la .rivet/sessions/] exit=0 time=0.1s lines=248
     const headerRe = /^\[(.+?)\]\s+exit=(\d+)\s+time=[\d.]+\S\s+lines=(\d+)/
@@ -177,7 +177,7 @@ export class ToolAccumulator {
     return null
   }
 
-  private buildGenericSummary(toolName: string, entries: AccumulatorEntry[], count: number, totalChars: number): string {
+  private buildGenericSummary(toolName: string, _entries: AccumulatorEntry[], count: number, totalChars: number): string {
     return `[storm-collapsed: ${count} ${toolName} calls, ${totalChars} chars collapsed]`
   }
 }

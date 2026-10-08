@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { formatApprovalPrompt, renderApprovalPreview } from '../approval-renderers.js'
+import { formatApprovalFacts, formatApprovalPrompt, renderApprovalPreview } from '../approval-renderers.js'
 import { getTheme } from '../../theme.js'
 
 const theme = getTheme()
@@ -128,5 +128,63 @@ describe('renderApprovalPreview', () => {
     const lines = renderApprovalPreview('bash', { command: 'rm -rf /tmp/foo' }, 60, theme)
     const plain = lines.map(stripAnsi).join('\n')
     assert.ok(plain.includes('rm -rf /tmp/foo'), 'command shown')
+  })
+})
+
+describe('claim conflict takeover semantics (__claimConflict)', () => {
+  const conflictInput = {
+    file_path: 'src/foo.ts',
+    content: 'x',
+    __claimConflict: {
+      filePath: 'src/foo.ts',
+      ownerSessionId: 'peer-1234abcd',
+      ownerAlive: true,
+      lastTouchedAt: '2026-10-08T00:00:00.000Z',
+      reason: '对方（会话 peer-123）已 23 分钟未触碰该文件，但工作区仍有未提交改动',
+    },
+  }
+
+  it('renders takeover banner, holder and approve-as-takeover wording', () => {
+    const lines = formatApprovalPrompt({
+      toolName: 'write_file',
+      input: conflictInput,
+      columns: 80,
+      selectedIndex: 0,
+    }, theme)
+    const plain = lines.map(stripAnsi)
+    const joined = plain.join('\n')
+    assert.ok(joined.includes('认领冲突'), '冲突横幅')
+    assert.ok(joined.includes('src/foo.ts'), '冲突文件')
+    assert.ok(joined.includes('peer-123'), '持有方会话（截断显示）')
+    assert.ok(joined.includes('已 23 分钟未触碰该文件'), '是否陈旧的判据')
+    assert.ok(joined.includes('批准 = 接管该文件'), '批准=接管的语义说明')
+    assert.ok(plain.some(l => l.includes('> 1. 接管并批准')), '批准项改写为接管')
+    assert.ok(joined.includes('是否接管该文件？'), '提问句改写为接管')
+    assert.ok(!joined.includes('是否允许这次操作？'), '普通措辞让位')
+  })
+
+  it('never dumps the raw __claimConflict marker into the visible preview or facts', () => {
+    for (const columns of [80, 40]) {
+      const lines = formatApprovalPrompt({ toolName: 'write_file', input: conflictInput, columns, selectedIndex: 0 }, theme)
+      assert.ok(!lines.map(stripAnsi).join('\n').includes('__claimConflict'), `columns=${columns} 不得泄漏内部标记键`)
+    }
+    const facts = formatApprovalFacts('write_file', conflictInput, 80, theme)
+    const plain = facts.map(stripAnsi).join('\n')
+    assert.ok(!plain.includes('__claimConflict'), '全文视图不得泄漏内部标记键')
+    assert.ok(plain.includes('认领冲突'), '全文视图仍有人读冲突信息')
+  })
+
+  it('malformed or edited-away marker degrades to ordinary approval wording', () => {
+    for (const marker of [undefined, 'garbage', { filePath: 1 }, { ownerSessionId: 'x' }]) {
+      const lines = formatApprovalPrompt({
+        toolName: 'write_file',
+        input: { file_path: 'src/foo.ts', content: 'x', ...(marker === undefined ? {} : { __claimConflict: marker }) },
+        columns: 80,
+        selectedIndex: 0,
+      }, theme)
+      const joined = lines.map(stripAnsi).join('\n')
+      assert.ok(joined.includes('> 1. 批准'), `marker=${JSON.stringify(marker)} 降级为普通批准`)
+      assert.ok(!joined.includes('接管'), `marker=${JSON.stringify(marker)} 不得渲染接管语义`)
+    }
   })
 })

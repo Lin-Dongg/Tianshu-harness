@@ -41,6 +41,14 @@ export type ThinkingRetryResult =
 export class PostTurnDecisionController {
   constructor(private deps: PostTurnDecisionDeps) {}
 
+  /** 思考重试是否被禁用（GLM 独立推理模式，见 deps.skipThinkingRetry）。
+   *  orchestrator 的 no-answer 闸门据此豁免纯思考轮：禁用重试的提供方里
+   *  「reasoning 即答案」是合法输出，报 no_answer 会让用户看着屏幕上的推理
+   *  内容却收到「未返回有效答案」。 */
+  isThinkingRetryDisabled(): boolean {
+    return this.deps.skipThinkingRetry === true
+  }
+
   /**
    * Check if the turn produced only thinking (no text, no tools) and should be retried.
    * Returns true if a retry was triggered (caller should `continue` the loop).

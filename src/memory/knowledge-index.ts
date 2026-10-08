@@ -127,9 +127,21 @@ export class KnowledgeIndex {
     this._chainIssues = []
     // 未授信项目不建索引（2026-10-07 审计 Finding 1b/1e）：adaptive 记忆注入与
     // recall 工具都读不到内容。指纹含 trust 位，/trust 后自动重建恢复。
-    if (!projectStateAllowed(this.cwd)) return
-    // 向量不清：id 稳定（entry id / file+chunk），provider 增量补缺
+    if (projectStateAllowed(this.cwd)) this.populate()
+    // 向量层与 maps 同生共死：只保留本次重建后仍存活 id 的向量，让「maps 已空、
+    // 向量残留」的中间态不可达。此前刻意不清向量——id 稳定（entry id / file+chunk），
+    // 留存可增量补缺、省每次重建全量重 embed 的 API 开销。但撤信时 maps 全空而
+    // 向量残留，残留 id 经 passesFilters 放行（entry 未命中时 !options.kind 为真），
+    // 在命中映射 mdChunksById.get(id)! 处 TypeError，recall 坏到进程重启；md 缩编 /
+    // playbook 删除同族可达。失效方向取舍：按存活 id 对账而非全清——知识写入是热
+    // 路径（每次写入都触发重建），全清意味着每次写入后全量重 embed；O(向量数)
+    // 对账相对重建本身的全量 IO 可忽略，增量补缺语义不变。
+    this.vectors.prune(
+      id => this.entriesById.has(id) || this.mdChunksById.has(id) || this.playbookById.has(id),
+    )
+  }
 
+  private populate(): void {
     // ① 结构化条目（含历史——validity 过滤在 search 时做，支持 includeHistory）
     const memoryEntries = readMemoryEntries(this.cwd)
     for (const entry of memoryEntries) {

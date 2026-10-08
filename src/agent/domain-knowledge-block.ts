@@ -5,7 +5,7 @@
  * Mirrors buildWorkerKnowledgeBlock pattern from worker-knowledge.ts.
  */
 
-import type { DomainKnowledgeStore, DomainLesson } from './domain-knowledge-store.js'
+import type { DomainKnowledgeStore } from './domain-knowledge-store.js'
 import type { StigmergyStore } from '../context/stigmergy.js'
 import { starDomainRegistry } from './star-domain-registry.js'
 

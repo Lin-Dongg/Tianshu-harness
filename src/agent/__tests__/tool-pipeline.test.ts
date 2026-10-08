@@ -5,6 +5,7 @@ import { execFileSync } from 'node:child_process'
 import { join, resolve as resolvePath } from 'node:path'
 import { tmpdir } from 'node:os'
 import { executeToolUse as rawExecuteToolUse, patchTargetPaths, type ToolPipelineDeps } from '../tool-pipeline.js'
+import { readClaimConflict } from '../claim-liveness.js'
 import { FileHistory } from '../file-history.js'
 import { createTurnBudget } from '../turn-budget.js'
 import { createCheckpoint, getRollbackPreview } from '../checkpoint.js'
@@ -1108,12 +1109,25 @@ describe('executeToolUse', () => {
     let executed = false
     const released: Array<[string, string]> = []
     let mine = false
+    let approvalInput: Record<string, unknown> | undefined
+    // 新鲜凭据 → 自动接管判定落 L4「问」，保持本用例在显式路径上
+    const touchedAt = new Date().toISOString()
     const fakeRegistry = {
       acquireClaim: () => mine,
       checkClaim: (filePath: string) => ({ sessionId: 'peer-1234abcd', claimType: 'exclusive', filePath }),
+      claimLiveness: () => ({
+        ownerSessionId: 'peer-1234abcd', ownerPid: process.pid, ownerAlive: true,
+        claimType: 'exclusive', acquiredAt: touchedAt, lastTouchedAt: touchedAt,
+      }),
       releaseClaim: (sid: string, path: string) => {
         released.push([sid, path])
         if (sid === 'peer-1234abcd') mine = true
+      },
+      releaseClaimIfUnchanged: (sid: string, path: string, expected: string) => {
+        if (expected !== touchedAt) return false
+        released.push([sid, path])
+        if (sid === 'peer-1234abcd') mine = true
+        return true
       },
     }
     const deps = makeDeps({
@@ -1127,7 +1141,7 @@ describe('executeToolUse', () => {
     const result = await executeToolUse(
       { id: 'tu-takeover', name: 'write_file', input: { file_path: 'foo.ts', content: 'x' } },
       deps,
-      { ...noopCallbacks, onApprovalRequired: async () => true } as any,
+      { ...noopCallbacks, onApprovalRequired: async (_id: string, _name: string, input: Record<string, unknown>) => { approvalInput = input; return true } } as any,
       1,
       false,
     )
@@ -1135,6 +1149,15 @@ describe('executeToolUse', () => {
     assert.notEqual((result.toolResult as any).is_error, true, `接管获准后应放行，got: ${(result.toolResult as any).content}`)
     assert.equal(executed, true, '接管获准后必须真的执行写入')
     assert.deepEqual(released[0], ['peer-1234abcd', 'foo.ts'], '必须先释放对方认领再抢')
+    // 审批载荷带接管语义（TUI/桌面审批卡据此渲染「是否接管 / 是否陈旧」）：
+    // 持有方、活性凭据与 L4 ask 判据一个不能少。
+    const conflict = readClaimConflict(approvalInput!)
+    assert.ok(conflict, '审批 input 必须携带可解析的 __claimConflict 标记')
+    assert.equal(conflict!.filePath, 'foo.ts')
+    assert.equal(conflict!.ownerSessionId, 'peer-1234abcd')
+    assert.equal(conflict!.ownerAlive, true)
+    assert.equal(conflict!.lastTouchedAt, touchedAt)
+    assert.match(conflict!.reason ?? '', /刚触碰该文件/, 'L4 新鲜凭据的 ask 判据随载荷下发')
   })
 
   it('R2 显式接管：用户拒绝 → 保持阻断（fail-closed 不放松）', async () => {
@@ -1177,19 +1200,25 @@ describe('executeToolUse', () => {
         checkClaim: (filePath: string) => ({ sessionId: liveness.ownerSessionId as string, claimType: 'exclusive', filePath }),
         claimLiveness: () => liveness,
         releaseClaim: (sid: string, path: string) => { released.push([sid, path]); taken = true },
+        releaseClaimIfUnchanged: (sid: string, path: string, expected: string) => {
+          if (expected !== liveness.lastTouchedAt) return false // 凭据已变 → CAS 失配
+          released.push([sid, path]); taken = true; return true
+        },
       },
     }
   }
 
-  it('R2 自动接管 L1：持有方进程已死 → 无需批准即放行并点名', async () => {
+  it('R2 自动接管 L1：持有方进程已死 → 无需批准即放行并点名（注记附脏态，§6）', async () => {
     let executed = false
     let approvalAsked = false
+    let probeCalls = 0
     const { registry, released } = makeClaimRegistry({
       ownerSessionId: 'peer-dead-0001', ownerPid: 99999, ownerAlive: false,
       claimType: 'exclusive', acquiredAt: '2026-01-01T00:00:00.000Z', lastTouchedAt: '2026-01-01T00:00:00.000Z',
     })
     const deps = makeDeps({
-      sessionRegistry: registry as any, sessionId: 'mine', isPathClean: async () => true,
+      sessionRegistry: registry as any, sessionId: 'mine',
+      isPathClean: async () => { probeCalls++; return false },
       harness: { executeTool: async ({ execute }: any) => { executed = true; const r = await execute(); return { content: r.content, isError: false, retried: false } } } as any,
     })
     const result = await executeToolUse(
@@ -1202,18 +1231,54 @@ describe('executeToolUse', () => {
     assert.equal(executed, true, 'L1 自动接管后必须执行写入')
     assert.equal(approvalAsked, false, 'L1 自动接管不应再问用户')
     assert.deepEqual(released[0], ['peer-dead-0001', 'foo.ts'], '必须先释放死持有方的认领')
+    // §6：注记点名「对方工作区里还留着什么」——死持有方不会刷新凭据，探测安全
+    assert.equal(probeCalls, 1, 'L1 注记需要脏态，探针恰好一次')
+    assert.match((result.toolResult as any).content as string, /\[claim-takeover\]/)
+    assert.match((result.toolResult as any).content as string, /仍留有未提交改动/)
+  })
+
+  it('R2 自动回收 L0：幽灵认领（sessions 行已不存在）→ 不探测脏态直接回收重抢并点名', async () => {
+    let executed = false
+    let approvalAsked = false
+    let probeCalls = 0
+    const ghost = '2026-01-01T00:00:00.000Z'
+    const { registry, released } = makeClaimRegistry({
+      ownerSessionId: 'peer-ghost-0009', ownerPid: null, ownerAlive: false,
+      claimType: 'exclusive', acquiredAt: ghost, lastTouchedAt: ghost,
+    })
+    const deps = makeDeps({
+      sessionRegistry: registry as any, sessionId: 'mine',
+      isPathClean: async () => { probeCalls++; return true },
+      harness: { executeTool: async ({ execute }: any) => { executed = true; const r = await execute(); return { content: r.content, isError: false, retried: false } } } as any,
+    })
+    const result = await executeToolUse(
+      { id: 'tu-auto-l0', name: 'write_file', input: { file_path: 'foo.ts', content: 'x' } },
+      deps,
+      { ...noopCallbacks, onApprovalRequired: async () => { approvalAsked = true; return false } } as any,
+      1, false,
+    )
+    assert.notEqual((result.toolResult as any).is_error, true, `L0 应回收后放行，got: ${(result.toolResult as any).content}`)
+    assert.equal(executed, true, 'L0 回收重抢后必须执行写入')
+    assert.equal(approvalAsked, false, '幽灵认领无主可问——回收不该走批准')
+    assert.equal(probeCalls, 0, 'L0 回收不需要脏态，不得 spawn git status（探针惰性化）')
+    assert.deepEqual(released[0], ['peer-ghost-0009', 'foo.ts'], '必须先回收幽灵认领行')
+    const content = (result.toolResult as any).content as string
+    assert.match(content, /\[claim-takeover\]/)
+    assert.match(content, /判据 L0/)
   })
 
   it('R2 自动接管 L2：持有方 5h 未触碰该文件 ∧ 工作区干净 → 自动放行（动机案例）', async () => {
     let executed = false
     let approvalAsked = false
+    let probeCalls = 0
     const { registry } = makeClaimRegistry({
       ownerSessionId: 'peer-idle-0002', ownerPid: process.pid, ownerAlive: true,
       claimType: 'exclusive', acquiredAt: new Date(Date.now() - 5 * 3600_000).toISOString(),
       lastTouchedAt: new Date(Date.now() - 5 * 3600_000).toISOString(),
     })
     const deps = makeDeps({
-      sessionRegistry: registry as any, sessionId: 'mine', isPathClean: async () => true,
+      sessionRegistry: registry as any, sessionId: 'mine',
+      isPathClean: async () => { probeCalls++; return true },
       harness: { executeTool: async ({ execute }: any) => { executed = true; const r = await execute(); return { content: r.content, isError: false, retried: false } } } as any,
     })
     const result = await executeToolUse(
@@ -1225,6 +1290,7 @@ describe('executeToolUse', () => {
     assert.notEqual((result.toolResult as any).is_error, true, `L2 应自动放行，got: ${(result.toolResult as any).content}`)
     assert.equal(executed, true, 'L2 自动接管后必须执行写入')
     assert.equal(approvalAsked, false, 'L2 自动接管不应再问用户')
+    assert.equal(probeCalls, 1, 'L2 判定需要脏态，探针恰好一次')
     // 静默接管是禁止的：结果尾部必须点名（判据 + 被接管会话）
     assert.match((result.toolResult as any).content as string, /\[claim-takeover\]/)
     assert.match((result.toolResult as any).content as string, /peer-idl/)
@@ -1253,13 +1319,15 @@ describe('executeToolUse', () => {
 
   it('R2 不自动接管 L4：持有方刚触碰过（真并发）→ 仍要问', async () => {
     let executed = false
+    let probeCalls = 0
     const { registry } = makeClaimRegistry({
       ownerSessionId: 'peer-live-0004', ownerPid: process.pid, ownerAlive: true,
       claimType: 'exclusive', acquiredAt: new Date(Date.now() - 10_000).toISOString(),
       lastTouchedAt: new Date(Date.now() - 10_000).toISOString(),
     })
     const deps = makeDeps({
-      sessionRegistry: registry as any, sessionId: 'mine', isPathClean: async () => true,
+      sessionRegistry: registry as any, sessionId: 'mine',
+      isPathClean: async () => { probeCalls++; return true },
       harness: { executeTool: async ({ execute }: any) => { executed = true; const r = await execute(); return { content: r.content, isError: false, retried: false } } } as any,
     })
     const result = await executeToolUse(
@@ -1270,6 +1338,183 @@ describe('executeToolUse', () => {
     )
     assert.equal((result.toolResult as any).is_error, true, 'L4 新鲜认领不得自动夺走')
     assert.equal(executed, false)
+    assert.equal(probeCalls, 0, 'L4「问」不需要脏态——不得白 spawn git status（探针惰性化）')
+  })
+
+  // TOCTOU 回归（2026-10-08 审查）：判定（claimLiveness 读取 + isPathClean/审批等待）
+  // 与释放之间存在 await 窗口，持有方可在窗口内经同会话写路径（acquireClaim 同会话
+  // 分支）合法刷新 last_touched_at。接管释放必须是 CAS：凭据失配 → 放弃接管 →
+  // 落回「问」/阻断，且对方已刷新的认领行仍在。该 fake 把 claims 行建成有状态的，
+  // touchAsOwner 模拟窗口内的那次刷新。
+  function makeCasRegistry(opts: { ownerSid: string; lastTouchedAt: string }) {
+    let claim: { sessionId: string; lastTouchedAt: string } | null = {
+      sessionId: opts.ownerSid, lastTouchedAt: opts.lastTouchedAt,
+    }
+    return {
+      touchAsOwner: () => { if (claim) claim.lastTouchedAt = '2099-01-01T00:00:00.000Z' },
+      claimHeldBy: () => claim?.sessionId ?? null,
+      registry: {
+        acquireClaim: (sid: string) => {
+          if (claim) return false
+          claim = { sessionId: sid, lastTouchedAt: new Date().toISOString() }
+          return true
+        },
+        checkClaim: (filePath: string) => claim ? { sessionId: claim.sessionId, claimType: 'exclusive', filePath } : null,
+        claimLiveness: () => claim
+          ? {
+              ownerSessionId: claim.sessionId, ownerPid: process.pid, ownerAlive: true,
+              claimType: 'exclusive', acquiredAt: opts.lastTouchedAt, lastTouchedAt: claim.lastTouchedAt,
+            }
+          : null,
+        releaseClaim: (sid: string) => { if (claim?.sessionId === sid) claim = null },
+        releaseClaimIfUnchanged: (sid: string, _path: string, expected: string) => {
+          if (claim && claim.sessionId === sid && claim.lastTouchedAt === expected) { claim = null; return true }
+          return false
+        },
+      },
+    }
+  }
+
+  it('R2 TOCTOU 自动接管：判定后、release 前对方刷新了凭据 → 放弃接管落回「问」，对方认领仍在', async () => {
+    let executed = false
+    let approvalAsked = false
+    const stale = new Date(Date.now() - 5 * 3600_000).toISOString()
+    const { registry, touchAsOwner, claimHeldBy } = makeCasRegistry({ ownerSid: 'peer-race-0005', lastTouchedAt: stale })
+    const deps = makeDeps({
+      sessionRegistry: registry as any, sessionId: 'mine',
+      // await 窗口：isPathClean（spawn git）期间持有方经自己的写路径刷新了租约凭据
+      isPathClean: async () => { touchAsOwner(); return true },
+      harness: { executeTool: async ({ execute }: any) => { executed = true; const r = await execute(); return { content: r.content, isError: false, retried: false } } } as any,
+    })
+    const result = await executeToolUse(
+      { id: 'tu-toctou-auto', name: 'write_file', input: { file_path: 'foo.ts', content: 'x' } },
+      deps,
+      { ...noopCallbacks, onApprovalRequired: async () => { approvalAsked = true; return false } } as any,
+      1, false,
+    )
+    assert.equal(executed, false, '凭据已变时不得夺走认领并执行写入')
+    assert.equal((result.toolResult as any).is_error, true, '接管放弃后落回 fail-closed 阻断')
+    assert.equal(approvalAsked, true, '自动接管放弃后必须落回「问」流程')
+    assert.equal(claimHeldBy(), 'peer-race-0005', '对方已刷新的认领行必须仍在（不得按陈旧判定删行）')
+  })
+
+  it('R2 TOCTOU 显式接管：审批等待期间对方刷新了凭据 → 批准作废落回阻断，对方认领仍在', async () => {
+    let executed = false
+    const fresh = new Date(Date.now() - 10_000).toISOString()
+    const { registry, touchAsOwner, claimHeldBy } = makeCasRegistry({ ownerSid: 'peer-race-0006', lastTouchedAt: fresh })
+    const deps = makeDeps({
+      sessionRegistry: registry as any, sessionId: 'mine', isPathClean: async () => true,
+      harness: { executeTool: async ({ execute }: any) => { executed = true; const r = await execute(); return { content: r.content, isError: false, retried: false } } } as any,
+    })
+    const result = await executeToolUse(
+      { id: 'tu-toctou-explicit', name: 'write_file', input: { file_path: 'foo.ts', content: 'x' } },
+      deps,
+      {
+        ...noopCallbacks,
+        // 分钟级审批等待期间持有方刷新了凭据；用户的「同意」基于旧状态，不得再用
+        onApprovalRequired: async () => { touchAsOwner(); return true },
+      } as any,
+      1, false,
+    )
+    assert.equal(executed, false, '批准所依据的状态已失效——不得按陈旧批准删行写入')
+    assert.equal((result.toolResult as any).is_error, true)
+    assert.match((result.toolResult as any).content as string, /另一个会话/)
+    assert.equal(claimHeldBy(), 'peer-race-0006', '对方已刷新的认领行必须仍在')
+  })
+
+  it('R2 回滚还原：多路径补丁中途被拦时，已自动接管的认领还回原持有方', async () => {
+    // a.ts 由死持有方持有（L1 自动接管成功）；b.ts 由新鲜持有方持有且用户拒绝接管
+    // → 补丁整体被拦。被拦时不仅要把我们抢到的 a.ts 放回，还要把认领**还回原持有
+    // 方**——夺走再放弃会让对方以为仍持有、实际无人持有（claims 表无 TTL，最坏形状）。
+    const deadTouched = '2026-01-01T00:00:00.000Z'
+    const claims = new Map<string, { sid: string; lastTouchedAt: string; alive: boolean }>([
+      ['src/a.ts', { sid: 'peer-dead-0007', lastTouchedAt: deadTouched, alive: false }],
+      ['src/b.ts', { sid: 'peer-live-0008', lastTouchedAt: new Date().toISOString(), alive: true }],
+    ])
+    let executed = false
+    let probeCalls = 0
+    const registry = {
+      acquireClaim: (sid: string, path: string) => {
+        if (claims.has(path)) return false
+        claims.set(path, { sid, lastTouchedAt: new Date().toISOString(), alive: true })
+        return true
+      },
+      checkClaim: (path: string) => {
+        const c = claims.get(path)
+        return c ? { sessionId: c.sid, claimType: 'exclusive', filePath: path } : null
+      },
+      claimLiveness: (path: string) => {
+        const c = claims.get(path)
+        if (!c) return null
+        return {
+          ownerSessionId: c.sid,
+          ownerPid: c.alive ? process.pid : 99999,
+          ownerAlive: c.alive,
+          claimType: 'exclusive', acquiredAt: c.lastTouchedAt, lastTouchedAt: c.lastTouchedAt,
+        }
+      },
+      releaseClaim: (sid: string, path: string) => { if (claims.get(path)?.sid === sid) claims.delete(path) },
+      releaseClaimIfUnchanged: (sid: string, path: string, expected: string) => {
+        const c = claims.get(path)
+        if (!c || c.sid !== sid || c.lastTouchedAt !== expected) return false
+        claims.delete(path)
+        return true
+      },
+    }
+    const deps = makeDeps({
+      sessionRegistry: registry as any, sessionId: 'mine',
+      isPathClean: async () => { probeCalls++; return false },
+      harness: { executeTool: async ({ execute }: any) => { executed = true; const r = await execute(); return { content: r.content, isError: false, retried: false } } } as any,
+    })
+    const diff = [
+      '--- a/src/a.ts', '+++ b/src/a.ts', '@@ -1,1 +1,1 @@', '-a', '+b',
+      '--- a/src/b.ts', '+++ b/src/b.ts', '@@ -1,1 +1,1 @@', '-a', '+b',
+    ].join('\n')
+    const result = await executeToolUse(
+      { id: 'tu-rollback-restore', name: 'apply_patch', input: { diff } },
+      deps,
+      { ...noopCallbacks, onApprovalRequired: async () => false } as any,
+      1, false,
+    )
+    assert.equal((result.toolResult as any).is_error, true, 'b.ts 接管被拒 → 补丁整体阻断')
+    assert.equal(executed, false)
+    assert.equal(claims.get('src/a.ts')?.sid, 'peer-dead-0007', '已接管的 a.ts 必须还回原持有方，不得留无主空窗')
+    assert.equal(claims.get('src/b.ts')?.sid, 'peer-live-0008', 'b.ts 持有方不受波及')
+    assert.ok([...claims.values()].every((c) => c.sid !== 'mine'), '阻断后我方不得残留任何认领')
+    assert.equal(probeCalls, 1, '只有 a.ts 的 L1 注记需要脏态；b.ts 落 L4 问不探测')
+  })
+
+  it("R2 缺省全仓认领（ast_edit 无路径 → '.'）：跳过脏态探针直接落 L3 问（2026-10-08 审查）", async () => {
+    // `git status -- .` 是全仓扫描：大仓开销，且任何无关脏文件都会把判定推向 L3。
+    // 写前拿不到 ast_edit 实际命中文件（要 collectFiles + AST 计算后才知道），认领
+    // 粒度无法收窄；探针侧收口为「'.' 键恒不探测、按 unknown 落 L3 问」——失效方向
+    // 选「多问少夺」：不按干净自动接管，也不付全仓扫描的账。
+    let executed = false
+    let approvalAsked = false
+    let probeCalls = 0
+    let approvalInput: Record<string, unknown> | undefined
+    const stale = new Date(Date.now() - 5 * 3600_000).toISOString()
+    const { registry } = makeClaimRegistry({
+      ownerSessionId: 'peer-idle-0010', ownerPid: process.pid, ownerAlive: true,
+      claimType: 'exclusive', acquiredAt: stale, lastTouchedAt: stale,
+    })
+    const deps = makeDeps({
+      sessionRegistry: registry as any, sessionId: 'mine',
+      isPathClean: async () => { probeCalls++; return true },
+      harness: { executeTool: async ({ execute }: any) => { executed = true; const r = await execute(); return { content: r.content, isError: false, retried: false } } } as any,
+    })
+    const result = await executeToolUse(
+      { id: 'tu-ast-dot', name: 'ast_edit', input: { ops: [{ replace: 'x' }], dryRun: false } },
+      deps,
+      { ...noopCallbacks, onApprovalRequired: async (_id: string, _name: string, input: Record<string, unknown>) => { approvalAsked = true; approvalInput = input; return false } } as any,
+      1, false,
+    )
+    assert.equal(probeCalls, 0, "全仓认领键不做 git status -- . 全仓扫描")
+    assert.equal(approvalAsked, true, '缺证据（脏态未探测）→ 落 L3 问，不按干净自动接管')
+    assert.equal(executed, false, '拒绝后必须阻断')
+    assert.equal((result.toolResult as any).is_error, true)
+    const conflict = readClaimConflict(approvalInput!)
+    assert.match(conflict!.reason ?? '', /不可判定/, '脏态未探测时审批卡要如实渲染「缺证据」，不得谎称有改动')
   })
 
   it('R2: allows write_file when the claim is uncontended (acquireClaim true)', async () => {
