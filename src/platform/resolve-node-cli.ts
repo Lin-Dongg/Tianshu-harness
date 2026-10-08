@@ -75,6 +75,29 @@ export function resolveNpmCliCommand(
   return { command, args: [...args] }
 }
 
+/** Use the current Windows host for Node aliases after the desktop host rename.
+ * Explicit external runtimes remain authoritative; only a missing legacy sibling
+ * node.exe is migrated. Unknown commands pass through rather than guessing. */
+export function resolveNodeStdioCommand(
+  command: string,
+  args: string[] = [],
+  deps: ResolveNodeCliDeps = {},
+): ResolvedStdioCommand {
+  const platform = deps.platform ?? process.platform
+  const execPath = deps.execPath ?? process.execPath
+  if (platform === 'win32') {
+    const bare = !/[\\/]/.test(command)
+    const alias = /^(?:node(?:\.(?:exe|cmd))?|tianshu-runtime\.exe)$/i.test(command)
+    const legacySibling = winPath.isAbsolute(command)
+      && winPath.basename(command).toLowerCase() === 'node.exe'
+      && winPath.basename(execPath).toLowerCase() === 'tianshu-runtime.exe'
+      && winPath.dirname(command).toLowerCase() === winPath.dirname(execPath).toLowerCase()
+      && !(deps.existsSync ?? existsSync)(command)
+    if ((bare && alias) || legacySibling) return { command: execPath, args: [...args] }
+  }
+  return resolveNpmCliCommand(command, args, deps)
+}
+
 /**
  * 基座 PATH 读不到时的系统目录兜底。
  *

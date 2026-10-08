@@ -16,7 +16,7 @@ import {
 import { armInventoryApproval, evaluateInventoryGate, formatInventoryNotice, type InventoryPendingPayload } from './tool-inventory.js'
 import { readSubAgentWorkspacePolicy, subAgentScratchRoot, workspaceDeclarationFor } from './workspace-policy.js'
 import { classifyMcpError, describeTransportLoss } from './failure-classifier.js'
-import { createTransport, type TransportResult } from './transport-factory.js'
+import { createTransport, StdioConnectError, type TransportResult } from './transport-factory.js'
 import { LogRingBuffer } from './log-buffer.js'
 import { getNetworkConfig } from '../config/manager.js'
 import type { McpNetworkConfig } from './stdio-env.js'
@@ -534,9 +534,10 @@ export class McpManager {
         throw err
       }
     } catch (err) {
-      // stderrTail 在上面 _connectServer 成功后就已取出（L259）——此前只喂给了
-      // formatConnectError，没喂给分类器：于是 PATH 缺失 / 包不存在 / 缓存损坏
-      // 三种根因全部回落成同一句通用提示（issue #149 要拆的正是这里）。
+      if (err instanceof StdioConnectError) {
+        stderrTail = err.stderrTail
+        if (stderrTail) this.logBuffers.get(serverId)?.push({ ts: Date.now(), stream: 'stderr', text: stderrTail })
+      }
       const classified = classifyMcpError(err, {
         transport: transport === 'stdio' ? 'stdio' : 'remote',
         stderr: stderrTail,

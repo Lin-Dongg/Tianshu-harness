@@ -71,7 +71,7 @@ export const MCP_PRESETS: McpPreset[] = [
   {
     id: 'tianshu-mcp',
     name: 'Tianshu MCP',
-    description: '天枢官方 MCP server —— 调度 TraeWork / ZCode / Codex 三个桌面端 Agent 完成「开发 → 验收 → 失败返修 → 再验收」闭环（run_task / verify_task / rework_task 等 9 个工具）。默认关闭：点「启用」才会写入配置并拉起进程，首次 npx 拉包可能需要数十秒。',
+    description: '天枢官方 MCP server —— 调度 TraeWork / ZCode / Codex 三个桌面端 Agent 完成「开发 → 验收 → 失败返修 → 再验收」闭环（run_task / verify_task / manage_task 等 8 个工具）。默认关闭：点「启用」才会写入配置并拉起进程，首次 npx 拉包可能需要数十秒。',
     category: 'dev',
     transport: 'stdio',
     // 走 npx 分发（与生态其余预设一致）：零前置即可试用。若握手超时，
@@ -89,18 +89,18 @@ export const MCP_PRESETS: McpPreset[] = [
     // 握手毫秒数随机器与 npm 缓存浮动，看的是「能不能连上、工具面覆盖声明」。
     // 2026-09-14 冒烟复跑：工具面已是 11 个（该包在持续升版，上面那个 9 是当时的
     // 快照）。expectedTools 列的 9 个仍全部返回——它是代表性列举，不是全集。
+    // 2026-10-08：0.9.0 真实握手返回 8 个工具；管理/返修收口到 manage_task。
     command: 'npx',
     args: ['-y', 'tianshu-mcp'],
     expectedTools: [
       'run_task',
-      'continue_task',
       'query_task',
-      'list_tasks',
-      'get_task_report',
-      'cancel_task',
+      'manage_task',
       'verify_task',
-      'rework_task',
-      'get_profiles',
+      'query_info',
+      'wait_task',
+      'prepare_visual_baseline',
+      'approve_visual_baseline',
     ],
     author: { name: 'lanlan0811', url: 'https://github.com/lanlan0811' },
     repoUrl: 'https://github.com/lanlan0811/tianshu-mcp',

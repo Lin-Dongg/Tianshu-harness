@@ -1,7 +1,7 @@
 /**
  * Host 策略与远程可达性测试（P1 Mobile Remote）。
  *
- * 覆盖：startServer host 绑定、Host header 三分支判定（回环 / allowlist / LAN 放行）、
+ * 覆盖：startServer host 绑定、Host header 三分支判定（回环 / allowlist / TLS LAN 本机地址）、
  * Bearer 强制、CORS 头回归、GET /remote/info 端点。
  *
  * 基建说明：node fetch 禁止设置 Host 头（forbidden header），而 Host 判定正是被测对象，
@@ -10,7 +10,7 @@
  */
 import { test, describe, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { connect, createServer } from 'node:net'
+import { connect } from 'node:net'
 import { startServer } from '../index.js'
 import { buildRemoteInfoRoutes, sortLanUrls } from '../remote-info-routes.js'
 import { isLoopbackBind, isLoopbackHostHeader } from '../host-policy.js'
@@ -189,25 +189,12 @@ describe('/health 鉴权旁路边界（2026-10-07 审计加固）', () => {
   })
 })
 
-describe('LAN bind (0.0.0.0) — bearer-gated host passthrough', () => {
-  test('foreign host with bearer is accepted', async () => {
-    await withServer({ host: '0.0.0.0' }, async ({ port }) => {
-      const r = await rawRequest(port, { path: '/ping', hostHeader: 'evil.com', extraHeaders: auth() })
-      assert.equal(r.status, 200)
+describe('LAN bind requires encrypted transport', () => {
+  for (const host of ['0.0.0.0', '::', '192.168.1.5']) {
+    test(`plaintext ${host} is refused before listening`, async () => {
+      await assert.rejects(startTestServer({ host }), /requires TLS/)
     })
-  })
-  test('foreign host without bearer -> 401', async () => {
-    await withServer({ host: '0.0.0.0' }, async ({ port }) => {
-      const r = await rawRequest(port, { hostHeader: 'evil.com' })
-      assert.equal(r.status, 401)
-    })
-  })
-  test('/health stays token-exempt on foreign host (cold-start probe)', async () => {
-    await withServer({ host: '0.0.0.0' }, async ({ port }) => {
-      const r = await rawRequest(port, { path: '/health', hostHeader: 'evil.com' })
-      assert.equal(r.status, 200)
-    })
-  })
+  }
 })
 
 describe('allowlist (RIVET_SERVE_HOSTS_ALLOW)', () => {
@@ -235,11 +222,8 @@ describe('allowlist (RIVET_SERVE_HOSTS_ALLOW)', () => {
       assert.equal(r.status, 200)
     })
   })
-  test('allowlist tightens LAN mode too (no implicit passthrough)', async () => {
-    await withServer({ host: '0.0.0.0', allowedHosts: ['192.168.1.5'] }, async ({ port }) => {
-      const r = await rawRequest(port, { hostHeader: 'evil.com', extraHeaders: auth() })
-      assert.equal(r.status, 403)
-    })
+  test('an allowlist cannot authorize plaintext LAN transport', async () => {
+    await assert.rejects(startTestServer({ host: '0.0.0.0', allowedHosts: ['192.168.1.5'] }), /requires TLS/)
   })
 })
 
@@ -328,14 +312,11 @@ describe('GET /remote/info', () => {
       assert.ok(Array.isArray(body.lanUrls))
     })
   })
-  test('LAN bind reports mode lan', async () => {
-    await withServer({ host: '0.0.0.0', withRemoteInfo: true }, async ({ port }) => {
-      const r = await rawRequest(port, { path: '/remote/info', hostHeader: `127.0.0.1:${port}`, extraHeaders: auth() })
-      assert.equal(r.status, 200)
-      const body = JSON.parse(r.body)
-      assert.equal(body.mode, 'lan')
-      assert.equal(body.listenHost, '0.0.0.0')
-    })
+  test('LAN metadata reports HTTPS when TLS is configured', async () => {
+    const route = buildRemoteInfoRoutes(TOKEN, { host: '0.0.0.0', protocol: 'https' })['GET /remote/info']!
+    const result = await route({}, {}, auth())
+    assert.equal((result.body as { mode: string }).mode, 'lan')
+    assert.equal((result.body as { protocol: string }).protocol, 'https')
   })
   test('requires bearer token', async () => {
     await withServer({ withRemoteInfo: true }, async ({ port }) => {
@@ -383,41 +364,9 @@ describe('host-policy 回环判定（单一真源）', () => {
   })
 })
 
-/** IPv6 回环可用性探测：缺 IPv6 的机器上跳过 :: 绑定用例，而不是假红。 */
-function ipv6LoopbackAvailable(): Promise<boolean> {
-  return new Promise((resolve) => {
-    const probe = createServer()
-    probe.once('error', () => resolve(false))
-    probe.listen(0, '::1', () => probe.close(() => resolve(true)))
-  })
-}
-
 describe('IPv6 通配绑定 (::) — 与 0.0.0.0 同等 LAN 语义', () => {
-  test('非回环 Host + bearer 放行（回归：:: 曾被判回环 → 一律 403）', async (t) => {
-    if (!(await ipv6LoopbackAvailable())) { t.skip('本机无 IPv6 回环'); return }
-    await withServer({ host: '::' }, async ({ port }) => {
-      const r = await rawRequest(port, { path: '/ping', hostHeader: 'evil.com', extraHeaders: auth(), connectHost: '::1' })
-      assert.equal(r.status, 200)
-    })
-  })
-
-  test('非回环 Host 无 bearer → 401（LAN 语义下 Bearer 是唯一凭证）', async (t) => {
-    if (!(await ipv6LoopbackAvailable())) { t.skip('本机无 IPv6 回环'); return }
-    await withServer({ host: '::' }, async ({ port }) => {
-      const r = await rawRequest(port, { hostHeader: 'evil.com', connectHost: '::1' })
-      assert.equal(r.status, 401)
-    })
-  })
-
-  test("/remote/info 报 mode:'lan'（回归：曾误报 loopback → 设置页不画二维码）", async (t) => {
-    if (!(await ipv6LoopbackAvailable())) { t.skip('本机无 IPv6 回环'); return }
-    await withServer({ host: '::', withRemoteInfo: true }, async ({ port }) => {
-      const r = await rawRequest(port, { path: '/remote/info', hostHeader: `127.0.0.1:${port}`, extraHeaders: auth(), connectHost: '::1' })
-      assert.equal(r.status, 200)
-      const body = JSON.parse(r.body)
-      assert.equal(body.mode, 'lan')
-      assert.equal(body.listenHost, '::')
-    })
+  test('IPv6 wildcard plaintext is refused before listening', async () => {
+    await assert.rejects(startTestServer({ host: '::' }), /requires TLS/)
   })
 
   test('Host 头 127.0.0.2:port 判回环放行（默认 127.0.0.1 绑定）', async () => {

@@ -27,14 +27,16 @@ class FakeAgent {
 }
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'pr353-dev-'))
-  const prior = { home: process.env.RIVET_HOME, config: process.env.RIVET_CONFIG_PATH }
+  const prior = { home: process.env.RIVET_HOME, config: process.env.RIVET_CONFIG_PATH, trust: process.env.RIVET_TRUST_PROJECT }
   process.env.RIVET_HOME = join(root, 'data'); process.env.RIVET_CONFIG_PATH = join(root, 'config.json')
+  // 项目技能装载自 2667803f6 起受信任门约束；fixture 的项目目录未授信，显式放行。
+  process.env.RIVET_TRUST_PROJECT = '1'
   writeFileSync(process.env.RIVET_CONFIG_PATH, '{}')
   const a = join(root, 'A'), b = join(root, 'B'); mkdirSync(a); mkdirSync(b)
   const addSkill = (dir: string, name: string) => { mkdirSync(join(dir, '.rivet', 'skills'), { recursive: true }); writeFileSync(join(dir, '.rivet', 'skills', `${name}.md`), `---\nname: ${name}\ndescription: Local\n---\nBODY_${name}`) }
   const agent = new FakeAgent(); const manager = new RuntimeSessionManager({ defaultCwd: a, createAgent: () => agent as any, maxEvents: 12, maxEventBytes: 2000 })
   const router = createRouter(buildSessionRoutes(manager, 'review-auth'))
-  return { root, a, b, agent, manager, router, addSkill, cleanup() { agent.abort(); for (const [key, value] of [['RIVET_HOME',prior.home],['RIVET_CONFIG_PATH',prior.config]]) { if(value===undefined)delete process.env[key!];else process.env[key!]=value } rmSync(root,{recursive:true,force:true}) } }
+  return { root, a, b, agent, manager, router, addSkill, cleanup() { agent.abort(); for (const [key, value] of [['RIVET_HOME',prior.home],['RIVET_CONFIG_PATH',prior.config],['RIVET_TRUST_PROJECT',prior.trust]]) { if(value===undefined)delete process.env[key!];else process.env[key!]=value } rmSync(root,{recursive:true,force:true}) } }
 }
 const auth = { authorization: 'Bearer review-auth' }
 

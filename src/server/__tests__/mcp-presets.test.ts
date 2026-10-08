@@ -120,7 +120,10 @@ test('tianshu-mcp preset: 官方 MCP 条目契约（作者 / 仓库 / 工具面�
   assert.equal(p.author?.name, 'lanlan0811', '作者信息缺失则卡片无从归因')
   assert.equal(p.author?.url, 'https://github.com/lanlan0811')
   assert.equal(p.repoUrl, 'https://github.com/lanlan0811/tianshu-mcp')
-  assert.equal(p.expectedTools?.length, 9, '上游暴露 9 个工具')
+  assert.deepEqual(p.expectedTools, [
+    'run_task', 'query_task', 'manage_task', 'verify_task', 'query_info',
+    'wait_task', 'prepare_visual_baseline', 'approve_visual_baseline',
+  ], '0.9.0 真实握手工具面')
 })
 
 // ── 默认关闭 / 显式开启（用户对本次接入的硬要求） ─────────────────────

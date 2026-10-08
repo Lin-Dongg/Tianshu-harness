@@ -1,4 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import { createServer as createHttpsServer, type ServerOptions as TlsServerOptions } from 'node:https'
+import { assertSecureBind } from './serve-transport.js'
+import { defaultLanHosts } from './host-policy.js'
 import { readFileSync, realpathSync } from 'node:fs'
 import { join, resolve, sep, extname } from 'node:path'
 import { isAuthorizedRequest } from './auth.js'
@@ -111,6 +114,7 @@ export function createRouter(routes: Record<string, RouteHandler>) {
 }
 
 export interface StartServerOptions {
+  tls?: TlsServerOptions
   /** 监听地址。默认 127.0.0.1；显式设 LAN IP / 0.0.0.0 开启远程访问。 */
   host?: string
   /** Host header allowlist（不带端口）。配置后非回环 Host 仅 allowlist 放行。 */
@@ -238,9 +242,10 @@ export async function startServer(
   const corsOrigin = allowedCorsOrigin
 
   const bindHost = opts.host?.trim() || '127.0.0.1'
+  assertSecureBind(bindHost, opts.tls)
   // LAN 模式：显式绑定到非回环地址（0.0.0.0 / LAN IP / ::）。
   const lanMode = !isLoopbackBind(bindHost)
-  const allowlist = (opts.allowedHosts ?? []).map((h) => h.trim().toLowerCase()).filter(Boolean)
+  const allowlist = (opts.allowedHosts ?? (lanMode ? defaultLanHosts(bindHost) : [])).map((h) => h.trim().toLowerCase()).filter(Boolean)
   const allowlistConfigured = allowlist.length > 0
   const mobileRoot = opts.mobileDir?.trim() ? resolve(opts.mobileDir.trim()) : undefined
   // root 的 realpath 启动时解析一次——逐请求符号链接防护的比较基准（root 自身
@@ -258,17 +263,16 @@ export async function startServer(
   // Host 校验三分支：DNS rebinding 让浏览器带着攻击者域名的 Host 直连本机端口。
   // ① 无 Host（HTTP/1.0 工具客户端）与回环形态恒放行（默认行为，回归保护）；
   // ② allowlist 配置后非回环 Host 仅精确匹配（去端口比较）；
-  // ③ 未配 allowlist 的 LAN 模式放行任意 Host——此时 Bearer 是唯一凭证
-  // （auth 校验紧随其后强制执行），DNS-rebinding 取舍见 P1 Mobile Remote 文档。
+  // ③ 未配置时，TLS LAN 绑定仅接受本机接口地址；其余 Host 拒绝。
   const isHostAllowed = (host: string | undefined, p: number): boolean => {
     if (host === undefined) return true
     const h = host.toLowerCase()
     if (isLoopbackHostHeader(h, p)) return true
     if (allowlistConfigured) return allowlist.includes(stripHostPort(h))
-    return lanMode
+    return false
   }
 
-  const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+  const listener = async (req: IncomingMessage, res: ServerResponse) => {
     // P0-5 路由异常兜底：此前回调体是裸 async——任一 handler 抛错（现场：
     // POST /project-templates/apply 对已被删除的目录抛 ENOENT）都会变成无人
     // catch 的 rejected promise，Node 默认 --unhandled-rejections=throw 直接
@@ -386,8 +390,9 @@ export async function startServer(
         res.destroy()
       }
     }
-  })
+  }
 
+  const server = opts.tls ? createHttpsServer({ ...opts.tls, minVersion: 'TLSv1.2' }, listener) : createServer(listener)
   let boundPort = port
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject)

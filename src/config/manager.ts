@@ -12,7 +12,7 @@ import { findPresetModel, isProviderPresetKey, type ProviderPresetKey } from './
 import { cloneResolvedPreset, resolvePreset } from '../api/pro-registry.js'
 import { normalizeBaseUrl } from '../api/endpoint-map.js'
 import { backfillPresetModelFields, migratePresetModelBackfill } from './preset-model-backfill.js'
-import { migrateProviderToKeys, keyRefFor, defaultKeyOf, keyRefReferrers } from './provider-keys.js'
+import { migrateProviderToKeys, keyRefFor, defaultKeyOf, keyRefReferrers, applyProviderCredential, alignModelsWithDefaultKey, writeModelsToDefaultKey } from './provider-keys.js'
 import { injectProviderKeys, stripProviderKeys, writeProviderKeysFile, providerKeysPath } from './provider-keys-store.js'
 import { assertDefaultModelRef } from './contract-models.js'
 import { migrateDeepseekVisionExpRetirement, migrateDeepseekV4FlashRetirement } from './preset-model-retirement.js'
@@ -2087,16 +2087,12 @@ export function setupProvider(options: SetupProviderOptions): void {
   if (options.baseUrl) {
     next.baseUrl = resolveProviderBaseUrl(options.baseUrl)
   }
-  if (options.apiKey) {
-    next.keyRef = options.providerName
-    ;(next as unknown as { apiKey?: string | null }).apiKey = null
-    ;(next as unknown as { apiKeyEnv?: string | null }).apiKeyEnv = null
-  }
-  if (options.apiKeyEnv) {
-    next.apiKeyEnv = options.apiKeyEnv
-    ;(next as unknown as { apiKey?: string | null }).apiKey = null
-    ;(next as unknown as { keyRef?: string | null }).keyRef = null
-  }
+  // 池形态下请求端读的是默认 key 的槽——顶层写了不同步过去，就是「重连后模型/凭据
+  // 看起来存上了、实际仍走旧的」（2026-10-08 收编公开仓 PR #381）。
+  if (options.apiKey) applyProviderCredential(next, { providerName: options.providerName })
+  if (options.apiKeyEnv) applyProviderCredential(next, { apiKeyEnv: options.apiKeyEnv })
+  const syncKeyModels = !!(options.model || options.models)
+  if (syncKeyModels) alignModelsWithDefaultKey(next)
   if (options.model) {
     const model = clampModelTokens(options.model)
     const existingIndex = next.models.findIndex(item => item.id === model.id)
@@ -2144,6 +2140,7 @@ export function setupProvider(options: SetupProviderOptions): void {
       next.models = merged
     }
   }
+  if (syncKeyModels) writeModelsToDefaultKey(next)
   cfg.provider.providers[options.providerName] = next
   next.userSaved = true
   if (options.makeDefault) cfg.provider.default = options.providerName

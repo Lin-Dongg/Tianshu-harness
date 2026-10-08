@@ -179,3 +179,15 @@ sidecar 进程不受影响（模块已在内存），守护进程随后即时还
 - 覆盖安装文件锁与 purge 宏的由来：`2026-09-10-windows-installer-file-lock.md`
 - 用户侧四类现象处置：`docs/guides/troubleshooting.md` 第 11 节
 - 完整性清单与 block 策略：`src/config/runtime-integrity.ts`、`desktop/src-tauri/src/integrity.rs`
+
+## 7. MCP 启动兼容（2026-10-08）
+
+MCP stdio 的 Windows `node` / `node.exe` / `node.cmd` / `tianshu-runtime.exe`
+裸命令统一解析到当前 `process.execPath`，新桌面包即 `tianshu-runtime.exe`。
+同目录旧绝对路径 `node.exe` 仅在文件已不存在时迁移；显式外部 Node 路径不覆盖。
+`npx/npm` 继续以当前宿主直接执行随包 CLI，PATH 保留宿主目录及系统命令目录，
+包内 `node.cmd` 继续负责 npm 安装脚本和 bin shim 的 `node` 调用。
+
+失效方向：仅迁移已确证的 Node 别名和缺失的旧同目录文件，无法识别的路径原样执行，
+通过启动 stderr 报告故障，不猜测用户外部运行时。改名兼容不代表网络、代理、
+包下载或杀毒软件拦截已被排除；Windows 实机连接及卡巴行为仍需另行验证。

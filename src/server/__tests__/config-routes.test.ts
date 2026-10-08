@@ -701,6 +701,21 @@ describe('provider delete: preset-name deadlock', () => {
     assert.equal(body.providers.find(p => p.name === 'zhipu-vision'), undefined)
   })
 
+  it('GET /config/providers exposes saved credential-less providers for management and actual deletion', async () => {
+    writeFileSync(join(home, 'config.json'), JSON.stringify({ provider: { default: 'deepseek', providers: {
+      r4code: { name: 'r4code', baseUrl: 'https://relay.example/v1', apiKeyEnv: 'RIVET_TEST_NO_CREDENTIAL', userSaved: true, models: [] },
+    } } }))
+    const router = createRouter(buildConfigRoutes(TOKEN))
+    const list = await router('GET', '/config/providers', {}, AUTH)
+    const saved = (list.body as { providers: { name: string; userSaved?: boolean; keyStatus: { source: string } }[] }).providers.find(p => p.name === 'r4code')
+    assert.ok(saved)
+    assert.equal(saved.userSaved, true)
+    assert.equal(saved.keyStatus.source, 'none')
+    assert.equal((await router('DELETE', '/config/providers/r4code', {}, AUTH)).status, 200)
+    const after = await router('GET', '/config/providers', {}, AUTH)
+    assert.equal((after.body as { providers: { name: string }[] }).providers.some(p => p.name === 'r4code'), false)
+  })
+
   it('GET /config/providers returns presetKeys for frontend name-collision validation', async () => {
     writeConfig(home, {})
     const router = createRouter(buildConfigRoutes(TOKEN))

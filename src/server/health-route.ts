@@ -5,7 +5,7 @@
  * need to probe it from cold-start / token-rotation windows where the Bearer
  * token may not be available yet. Rich fields (session/running counts, uptime,
  * loop lag) are the 「用户正在跑 agent」活动侧信道——带 token 的请求（Rust 壳/
- * webview 的全部真实消费方）拿全量；无 token 的匿名探测只拿 {ok, version}。
+ * webview 的全部真实消费方）拿全量；无 token 的匿名探测只拿 {ok}。
  */
 import type { RouteHandler } from './index.js'
 import type { RuntimeSessionManager } from './session-manager.js'
@@ -120,7 +120,7 @@ export function buildHealthRoute(
         const configuredOk = configured?.() ?? true
         return {
           status: 200,
-          body: { ok: registryOk && configuredOk, version },
+          body: { ok: registryOk && configuredOk },
         }
       }
       return { status: 200, body: snapshot() }

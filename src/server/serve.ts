@@ -12,6 +12,8 @@ import { disposeSessionFilePreviews } from './file-open-routes.js'
 import { randomUUID } from 'node:crypto'
 import { join, dirname } from 'node:path'
 import { mkdirSync, writeFileSync } from 'node:fs'
+import { assertSecureBind, readServeTlsArgs } from './serve-transport.js'
+import type { ServerOptions as TlsServerOptions } from 'node:https'
 import { startServer } from './index.js'
 import { loadProModule, resolvePresetLabel } from '../api/pro-registry.js'
 import { resolveEffortSupported } from '../api/provider.js'
@@ -50,11 +52,11 @@ import { buildProjectDocsRoutes } from './project-docs-routes.js'
 import { buildTrustRoutes } from './trust-api.js'
 import { buildCacheRoutes } from './cache-routes.js'
 import { buildSpeechRoutes, createSpeechEngineFromEnv, type SpeechEngine } from './speech-routes.js'
-import { existsSync } from 'node:fs'
 import { CronScheduler, setActiveScheduler, setScheduleWriteGuard, setUnattendedAutomationGate } from './cron-scheduler.js'
 export { installParentWatchdog, probeParentAlive, maxMissesFromGraceEnv, type ParentWatchdogOptions } from './parent-watchdog.js'
 import { writeServerInfo, clearServerInfo, enableJsonModeStdoutPurity, attachOrExit, printSpawnedHandshake, type ServerInfo } from './server-info.js'
-import { isLoopbackBind, parseHostsAllow } from './host-policy.js'
+import { defaultLanHosts, isLoopbackBind, parseHostsAllow } from './host-policy.js'
+import { ensurePrivateDirectory } from '../platform/private-path.js'
 import { setShutdownHandler } from './shutdown-registry.js'
 import { CronWiring } from './cron-wiring.js'
 import { buildMcpRoutes } from './mcp-api.js'
@@ -613,6 +615,7 @@ export function buildDelegateSummary(
 
 
 export interface RunServeOptions {
+  tls?: TlsServerOptions
   port?: number
   /** 监听地址。默认 127.0.0.1（RIVET_SERVE_HOST / --host 覆盖）。 */
   host?: string
@@ -675,17 +678,13 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
   if (!apiToken) {
     throw new Error('RIVET_SERVER_TOKEN is required for rivet serve')
   }
+  if (!opts.ephemeral) ensurePrivateDirectory(profileRivetHome())
   const port = opts.port ?? DEFAULT_PORT
   // 监听地址：显式 opts（serveCommand --host / 测试注入）> env（桌面壳经父 env 继承
   // RIVET_SERVE_HOST 可达，零 Rust 改动）> 默认 127.0.0.1（行为不变）。
   const host = (opts.host ?? process.env.RIVET_SERVE_HOST)?.trim() || '127.0.0.1'
-  const allowedHosts = opts.allowedHosts ?? parseHostsAllow(process.env.RIVET_SERVE_HOSTS_ALLOW)
-  // LAN 模式提醒（2026-10-07 审计 Finding 3 的文档侧缓解）：非回环绑定 = 明文 HTTP
-  // 无 TLS，Bearer 是唯一凭证。刻意不改默认行为（强制 allowlist 会破坏「手机远程」
-  // 既有流），只做如实提醒；配了 allowlist 的不重复唠叨。
-  if (!isLoopbackBind(host) && !(allowedHosts && allowedHosts.length > 0)) {
-    console.warn('[serve] LAN 模式（非回环绑定）为明文 HTTP，Bearer 是唯一凭证；且未配置 RIVET_SERVE_HOSTS_ALLOW（任意 Host 放行）。请仅在可信网络使用。')
-  }
+  const allowedHosts = opts.allowedHosts ?? parseHostsAllow(process.env.RIVET_SERVE_HOSTS_ALLOW) ?? (!isLoopbackBind(host) ? defaultLanHosts(host) : undefined)
+  assertSecureBind(host, opts.tls)
   // /mobile 静态目录：显式 opts（--mobile-dir / 测试注入）> env（桌面壳注入）> 未配置。
   const mobileDir = (opts.mobileDir ?? process.env.RIVET_MOBILE_DIR)?.trim() || undefined
   const ctx = opts.context ?? resolveServeContext()
@@ -1031,7 +1030,7 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
 
   // Remote-info route (P1 Mobile Remote): GET /remote/info — 桌面远程访问区块
   // 数据源 + 手机连通自检。mode 由实际绑定地址决定（127.0.0.1 → loopback）。
-  Object.assign(routes, buildRemoteInfoRoutes(apiToken, { host, allowedHosts }))
+  Object.assign(routes, buildRemoteInfoRoutes(apiToken, { host, allowedHosts, protocol: opts.tls ? 'https' : 'http' }))
 
   // Config routes: provider + API key management for the desktop settings UI.
   Object.assign(routes, buildConfigRoutes(apiToken, {
@@ -1273,9 +1272,9 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
   installStallObserver()
   timing.mark('routes')
   const listenT0 = performance.now()
-  const server = await startServer(port, routes, apiToken, { host, allowedHosts, mobileDir })
+  const server = await startServer(port, routes, apiToken, { host, allowedHosts, mobileDir, tls: opts.tls })
   timing.mark('listen', `bind=${Math.round(performance.now() - listenT0)}ms wall=${Date.now() - startedAt}ms`)
-  const serverInfo: ServerInfo = { port, host, token: apiToken, pid: process.pid, startedAt: new Date(startedAt).toISOString() }
+  const serverInfo: ServerInfo = { port, host, ...(opts.tls ? { protocol: 'https' as const } : {}), token: apiToken, pid: process.pid, startedAt: new Date(startedAt).toISOString() }
   // 首批 UI 请求里的 GET /environment 此前是这些探针的首个调用方，同步 spawnSync
   // 卡主线程几百 ms，并发的 /config/* 与 /git/branches 全排在它后面——实测就是
   // 「就绪后首秒所有路由 300–600ms」的主因（agent chunk 预热只是次因）。
@@ -1447,7 +1446,7 @@ export async function serveCommand(args: string[]): Promise<void> {
 
   let server: RunningServer
   try {
-    server = await runServe({ port, ...(host ? { host } : {}), ...(mobileDir ? { mobileDir } : {}) })
+    server = await runServe({ tls: readServeTlsArgs(args), port, ...(host ? { host } : {}), ...(mobileDir ? { mobileDir } : {}) })
   } catch (err) {
     console.error((err as Error).message)
     process.exit(1)
@@ -1522,10 +1521,10 @@ export async function serveCommand(args: string[]): Promise<void> {
   if (jsonMode) {
     // 握手模式：banner 走 stderr；坐标来自 RunningServer.serverInfo（内存真源，
     // 不回读磁盘——双实例竞态下回读会输出成别人的坐标）。
-    console.error(`Rivet Runtime API listening on http://${displayHost}:${port}`)
+    console.error(`Rivet Runtime API listening on ${server.serverInfo.protocol ?? 'http'}://${displayHost}:${port}`)
     printSpawnedHandshake(server.serverInfo, (l) => console.log(l))
   } else {
-    console.log(`Rivet Runtime API listening on http://${displayHost}:${port}`)
+    console.log(`Rivet Runtime API listening on ${server.serverInfo.protocol ?? 'http'}://${displayHost}:${port}`)
     console.log('Endpoints: GET /status, POST /abort, POST /prompt, /sessions/*')
   }
 }

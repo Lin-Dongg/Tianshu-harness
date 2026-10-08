@@ -12,7 +12,7 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport, getDefaultEnvironment } from '@modelcontextprotocol/sdk/client/stdio.js'
 import type { McpServerConfig } from './config.js'
-import { resolveNpmCliCommand } from '../platform/resolve-node-cli.js'
+import { resolveNodeStdioCommand } from '../platform/resolve-node-cli.js'
 import { buildStdioChildEnv, type McpNetworkConfig } from './stdio-env.js'
 
 const DEFAULT_MCP_TIMEOUT_MS = 60_000
@@ -43,6 +43,13 @@ export interface TransportResult {
 }
 
 const STDERR_TAIL_MAX = 4_096
+
+export class StdioConnectError extends Error {
+  constructor(cause: unknown, readonly stderrTail: string) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause })
+    this.name = 'StdioConnectError'
+  }
+}
 
 function trimStderrTail(chunks: string[]): string {
   let text = chunks.join('').replace(/\s+$/u, '')
@@ -101,9 +108,9 @@ async function createStdioTransport(
   cfg: McpServerConfig,
   opts: TransportFactoryOptions,
 ): Promise<TransportResult> {
-  // MCP SDK hardcodes shell:false — rewrite bare npx/npm to node+cli.js so
-  // Windows GUI / bundled-node launches don't ENOENT on npx.cmd.
-  const resolved = resolveNpmCliCommand(cfg.command!, cfg.args ?? [])
+  // Resolve Node aliases and npm entrypoints through the current host, including
+  // the renamed Windows desktop binary (tianshu-runtime.exe).
+  const resolved = resolveNodeStdioCommand(cfg.command!, cfg.args ?? [])
   const bare = cfg.command!.replace(/\\/g, '/').split('/').pop()?.replace(/\.(cmd|bat|exe)$/i, '').toLowerCase()
   const fellBackToBareNpx = (bare === 'npx' || bare === 'npm')
     && resolved.command === cfg.command!
@@ -129,8 +136,7 @@ async function createStdioTransport(
   if (stderrStream && typeof stderrStream.on === 'function') {
     stderrStream.on('data', (chunk: Buffer | string) => {
       const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8')
-      stderrChunks.push(text)
-      while (stderrChunks.join('').length > STDERR_TAIL_MAX) stderrChunks.shift()
+      stderrChunks.splice(0, stderrChunks.length, (stderrChunks.join('') + text).slice(-STDERR_TAIL_MAX))
     })
   }
 
@@ -142,12 +148,12 @@ async function createStdioTransport(
     try { await transport.close() } catch { /* already gone */ }
     if (fellBackToBareNpx) {
       const msg = err instanceof Error ? err.message : String(err)
-      throw new Error(
+      throw new StdioConnectError(new Error(
         `${msg} — npx/npm-cli.js was not found next to this Node binary `
         + `(${process.execPath}); packaged builds need fetch-node-runtime to bundle npm`,
-      )
+      ), trimStderrTail(stderrChunks))
     }
-    throw err
+    throw new StdioConnectError(err, trimStderrTail(stderrChunks))
   }
 
   return {

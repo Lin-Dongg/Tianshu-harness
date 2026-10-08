@@ -146,4 +146,46 @@ describe('退役迁移不制造悬空引用 — loadConfig 端到端', () => {
     assert.equal(cfg.agent.defaultModel, 'deepseek:deepseek-flash')
     assertResolvable(cfg, cfg.agent.defaultModel, 'defaultModel')
   })
+
+  // ── 2026-10-08 补漏：3.28→3.29「已迁移」存量（缺口探针 A/C/D）──────────
+  // 上面场景都从「引用还是旧 id」出发——重定向动作发生，顺带触发补池。
+  // 已迁移用户引用早已 = deepseek-flash，升级后不再产生任何重定向动作，
+  // 补池永不触发、悬空持续（每次启动告警 + 位置性回退）。守卫必须不依赖
+  // 动作，无条件复查「被引用的 REPLACEMENT 在契约池可达」。
+
+  it('D(已迁移存量, userSaved 剪枝): defaultModel 已是 flash 但池缺它——启动补池', () => {
+    writeUserPrunedPool({ agent: { defaultModel: 'deepseek:deepseek-flash' } })
+    const cfg = loadConfig()
+    assertResolvable(cfg, cfg.agent.defaultModel, 'defaultModel')
+  })
+
+  it('D(已迁移存量, keys 池): 同上', () => {
+    writeKeysPool({ agent: { defaultModel: 'deepseek:deepseek-flash' } })
+    const cfg = loadConfig()
+    assertResolvable(cfg, cfg.agent.defaultModel, 'defaultModel')
+  })
+
+  it('D(已迁移存量): 视觉引用指向 flash 时同样补池', () => {
+    writeUserPrunedPool({ agent: { visionModel: { provider: 'deepseek', model: 'deepseek-flash', maxTokens: 1024 } } })
+    const cfg = loadConfig()
+    const vm = cfg.agent.visionModel
+    const pool = contractModels(cfg.provider.providers.deepseek!).map(m => m.id)
+    assert.ok(vm && pool.includes(vm.model), `visionModel "${vm?.model}" 指向池外（契约池 = [${pool.join(', ')}]）`)
+  })
+
+  it('D(幂等): 补池落盘后二次加载不再改写', () => {
+    writeUserPrunedPool({ agent: { defaultModel: 'deepseek:deepseek-flash' } })
+    loadConfig()
+    const afterFirst = readFileSync(configPath, 'utf-8')
+    loadConfig()
+    assert.equal(readFileSync(configPath, 'utf-8'), afterFirst, '第二次加载不得再改写磁盘')
+  })
+
+  it('D(负例): 无引用指向 flash 时不得无差别回流（剪枝语义保留）', () => {
+    writeUserPrunedPool({ agent: { defaultModel: 'deepseek:deepseek-v4-pro' } })
+    loadConfig()
+    const onDisk = JSON.parse(readFileSync(configPath, 'utf-8')) as { provider: { providers: { deepseek: { models: Array<{ id: string }> } } } }
+    const ids = onDisk.provider.providers.deepseek.models.map(m => m.id)
+    assert.ok(!ids.includes('deepseek-flash'), `未引用 flash 时不得把 flash 回流进池（实际池 = [${ids.join(', ')}]）`)
+  })
 })

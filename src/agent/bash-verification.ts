@@ -7,7 +7,15 @@ import type { ToolResult, VerificationMetadata } from '../tools/types.js'
 
 /** 受支持运行器出现在**命令位置**（段首，可带 cd/rtk/npx 前缀）的判据。
  *  先剥离引号内容——`grep -rn "npm test" src/` 是查询，不是验证。 */
-const VERIFICATION_SEGMENT = /(?:^|[;&|]\s*)(?:cd\s+[^\s;|&]+\s*&&\s*)?(?:rtk\s+(?:proxy\s+)?)?(?:(?:npm|pnpm|yarn)\s+(?:test|run\s+(?:test|typecheck|lint|build))\b|(?:npx\s+)?(?:node|tsx)\b[^;&|]*--test\b|(?:npx\s+)?(?:tsc|vitest|jest|pytest|eslint|mocha|ava)\b|cargo\s+(?:test|check)\b|go\s+(?:test|vet|build)\b)/
+const VERIFICATION_SEGMENT = /(?:^|[;&|]\s*)(?:cd\s+[^\s;|&]+\s*&&\s*)?(?:rtk\s+(?:proxy\s+)?)?(?:(?:npm|pnpm|yarn)\s+(?:test|run\s+(?:test|typecheck|lint|build))\b|(?:npx\s+)?(?:node|tsx)\b[^;&|]*--test\b|(?:npx\s+)?(?:node|tsx)\b[^;&|]*(?:scripts\/run-node-tests\.ts|desktop\/scripts\/run-tests\.ts)\b|(?:npx\s+)?(?:tsc|vitest|jest|pytest|eslint|mocha|ava)\b|cargo\s+(?:test|check)\b|go\s+(?:test|vet|build)\b|dotnet\s+(?:test|build|run)\b|(?:\.\/)?(?:mvn|mvnw|gradle|gradlew)\b(?=[^;&|]*\s(?:test|verify|build|check|assemble|compile|package|install)(?=\s|$)))/
+
+/** 非 JS 生态 runner（.NET / Maven / Gradle）的验证调用。
+ *  dotnet 的目标子命令紧跟可执行名（flag 在后）：`dotnet test tests/X.csproj`。
+ *  Maven/Gradle 是「阶段 / 任务序列」（`mvn clean test`、`./gradlew clean build`）——目标词
+ *  可在任意位置，前面排生命周期阶段（clean）或全局选项（-q / -B）都不改变语义，故用前瞻匹配。
+ *  项目路径等定位参数同样不改「全量」语义；只有明确的选择/过滤标志才表示只跑了子集（→ unknown）。 */
+const NON_JS_VERIFICATION_RUNNER = /^(?:dotnet (?:test|build|run)(?:\s|$)|(?:mvn|mvnw|gradle|gradlew)\b(?=[^;&|]*\s(?:test|verify|build|check|assemble|compile|package|install)(?=\s|$)))/
+const NON_JS_SELECTION_FLAG = /(?:^|\s)(?:--filter|--testcasefilter|--tests|--test-case-filter|-Dtest=)/i
 
 function containsVerificationInvocation(command: string): boolean {
   return VERIFICATION_SEGMENT.test(command.replace(/'[^']*'|"[^"]*"/g, ' '))
@@ -36,15 +44,15 @@ function classifyBashVerification(command: string): Pick<VerificationMetadata, '
   if (tokens.some(arg => arg === '--version' || arg === '--help')) return null
   if (tokens[0] === 'rtk') { tokens.shift(); if (String(tokens[0]) === 'proxy') tokens.shift() }
   if (tokens[0] === 'rtk') return { scope: 'unknown' }
-  const executable = basename((tokens[0] ?? '').replaceAll('\\', '/')).replace(/\.(?:exe|cmd)$/i, '')
+  const executable = basename((tokens[0] ?? '').replaceAll('\\', '/')).replace(/\.(?:exe|cmd|bat)$/i, '')
   const args = tokens.slice(1)
   const invocation = [executable, ...args].join(' ')
   const kind: VerificationMetadata['kind'] =
-    /^(?:(?:npm|pnpm|yarn) (?:test|run test)|(?:npx )?(?:(?:node|tsx) --test|vitest(?: run)?|jest|pytest)|cargo test|go test)(?:\s|$)/.test(invocation) ? 'test'
+    /^(?:(?:npm|pnpm|yarn) (?:test|run test)|(?:npx )?(?:(?:node|tsx) --test|vitest(?: run)?|jest|pytest)|cargo test|go test|dotnet test|(?:mvn|mvnw|gradle|gradlew)\b(?=[^;&|]*\s(?:test|verify)(?=\s|$)))(?:\s|$)/.test(invocation) ? 'test'
     : /^(?:(?:npm|pnpm|yarn) run typecheck|(?:npx )?tsc)(?:\s|$)/.test(invocation) ? 'typecheck'
     : /^(?:(?:npm|pnpm|yarn) run lint|(?:npx )?eslint)(?:\s|$)/.test(invocation) ? 'lint'
-    : /^(?:(?:npm|pnpm|yarn) run build|go build)(?:\s|$)/.test(invocation) ? 'build'
-    : /^(?:cargo check|go vet)(?:\s|$)/.test(invocation) ? 'check' : undefined
+    : /^(?:(?:npm|pnpm|yarn) run build|go build|dotnet (?:build|run)|(?:mvn|mvnw|gradle|gradlew)\b(?=[^;&|]*\s(?:build|assemble|compile|package|install)(?=\s|$)))(?:\s|$)/.test(invocation) ? 'build'
+    : /^(?:cargo check|go vet|(?:mvn|mvnw|gradle|gradlew)\b(?=[^;&|]*\scheck(?=\s|$)))(?:\s|$)/.test(invocation) ? 'check' : undefined
   // A name/tag selector proves only a subset within each selected file.
   if (kind === 'test' && /(?:^|\s)(?:--test-name-pattern|--testNamePattern|--grep|-t|-k|-m)(?:[=\s]|$)/.test(invocation)) {
     return { scope: 'unknown', kind }
@@ -67,6 +75,10 @@ function classifyBashVerification(command: string): Pick<VerificationMetadata, '
   if (/^(?:npm|pnpm|yarn) run build$/.test(invocation)
     || /^go build \.\/\.\.\.$/.test(invocation)) return { scope: 'full', kind: 'build' }
   if (/^(?:cargo check|go vet \.\/\.\.\.)$/.test(invocation)) return { scope: 'full', kind: 'check' }
+  // 非 JS 生态 runner：项目路径等定位参数不改变「全量」语义；带选择/过滤标志才是子集。
+  if (NON_JS_VERIFICATION_RUNNER.test(invocation)) {
+    return NON_JS_SELECTION_FLAG.test(invocation) ? { scope: 'unknown', kind } : { scope: 'full', kind }
+  }
   // 仍未识别出 kind：区分「验证意图但归因不了」与「根本不是验证」。
   // 前者（`custom node --test a.test.ts`、`node --test --unknown`）要留在台账里
   // 标 blocked 并给写法指引；后者（wc / ls / grep / sed / gh run list）不得进台账。

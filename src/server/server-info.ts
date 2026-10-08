@@ -18,15 +18,16 @@
  * 读写全部 best-effort（对齐 writeExitBreadcrumb）：发现文件是优化面不是正确性
  * 面——写不进磁盘时 serve 照常服务，只是桌面壳发现不了它。
  */
-import { mkdirSync, writeFileSync, renameSync, readFileSync, unlinkSync, existsSync } from 'node:fs'
-import { execFileSync } from 'node:child_process'
-import { userInfo } from 'node:os'
+import { writeFileSync, renameSync, readFileSync, unlinkSync, existsSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import { join, dirname } from 'node:path'
 import { rivetHome } from '../config/paths.js'
 import { setServerLogger, formatLog } from './logger.js'
+import { ensurePrivateDirectory, protectPrivatePath } from '../platform/private-path.js'
 
 /** 发现文件记录的坐标。字段最小化：port/token/pid 是握手必需，host/startedAt 供诊断。 */
 export interface ServerInfo {
+  protocol?: 'http' | 'https'
   port: number
   /** 监听地址（serve 的 --host/RIVET_SERVE_HOST 解析结果）。 */
   host: string
@@ -41,38 +42,24 @@ export function serverInfoPath(): string {
 }
 
 /**
- * Windows 上 POSIX mode 0o600 对 NTFS 无效（走 ACL；secure-store.ts 同款教训，
- * 2026-10-07 审计 Finding 4）——用 icacls 把发现文件收紧到「当前用户 + SYSTEM +
- * Administrators」，防止低权沙箱进程读取明文 Bearer token 或替换文件劫持发现面。
- * 权限给 F（完全控制）而非 R：rename 覆盖已存在文件需要目标 delete/file-write
- * 权限。SID 形式（*S-1-5-*）规避本地化组名。best-effort——收紧失败不阻塞 serve
- *（发现文件是优化面不是正确性面，与文件头契约一致）。
- */
-function hardenServerInfoAclWin32(filePath: string): void {
-  if (process.platform !== 'win32') return
-  try {
-    const user = userInfo().username
-    execFileSync('icacls', [filePath, '/inheritance:r',
-      '/grant:r', `${user}:F`, '*S-1-5-18:F', '*S-1-5-32-544:F'],
-      { stdio: 'ignore', windowsHide: true, timeout: 5_000 })
-  } catch { /* best-effort */ }
-}
-
-/**
  * 原子写发现文件：先写同目录临时文件再 rename，读者永远看不到半截 JSON。
  * 语义「最后写的赢」——见文件头竞态契约。
  * 文件含明文 Bearer token，mode 0600（owner-only）——rename 原子保持权限，
- * 不按 umask 落 644。Windows 上 mode 无效，由 hardenServerInfoAclWin32 补 ACL。
+ * 不按 umask 落 644。Windows 在写入令牌前收紧目录与空临时文件 ACL；失败不发布发现文件。
  */
-export function writeServerInfo(info: ServerInfo, filePath = serverInfoPath()): void {
+export function writeServerInfo(info: ServerInfo, filePath = serverInfoPath(), protection = { ensurePrivateDirectory, protectPrivatePath }): void {
+  const tmp = `${filePath}.${process.pid}.${randomUUID()}.tmp`
+  let created = false
   try {
-    const tmp = `${filePath}.${process.pid}.tmp`
-    mkdirSync(dirname(filePath), { recursive: true })
-    writeFileSync(tmp, JSON.stringify(info, null, 2), { mode: 0o600 })
+    protection.ensurePrivateDirectory(dirname(filePath))
+    writeFileSync(tmp, '', { mode: 0o600, flag: 'wx' })
+    created = true
+    protection.protectPrivatePath(tmp)
+    writeFileSync(tmp, JSON.stringify(info, null, 2))
     renameSync(tmp, filePath)
-    hardenServerInfoAclWin32(filePath)
   } catch {
-    // best-effort — 发现文件写不进磁盘不阻塞 serve
+    // Discovery is optional; never publish plaintext when protection fails.
+    if (created) { try { unlinkSync(tmp) } catch { /* best-effort cleanup */ } }
   }
 }
 
@@ -89,6 +76,7 @@ export function readServerInfo(filePath = serverInfoPath()): ServerInfo | undefi
       typeof parsed.token === 'string' && parsed.token.length > 0 &&
       typeof parsed.pid === 'number' && Number.isInteger(parsed.pid) &&
       typeof parsed.startedAt === 'string' &&
+      (parsed.protocol === undefined || parsed.protocol === 'http' || parsed.protocol === 'https') &&
       (parsed.host === undefined || (typeof parsed.host === 'string' && parsed.host.length > 0))
     ) {
       // host 缺省视为回环（v1 无 host 字段的旧文件 / 手写场景）
@@ -139,7 +127,7 @@ export async function isServerInfoAlive(
  */
 export function probeUrlFor(info: ServerInfo): string {
   const host = info.host.includes(':') ? `[${info.host}]` : info.host
-  return `http://${host}:${info.port}/status`
+  return `${info.protocol ?? 'http'}://${host}:${info.port}/status`
 }
 
 /** 默认探测：Bearer token 打 /status，200 + 可解析 JSON 即活。 */
@@ -173,7 +161,7 @@ export async function resolveAttachHandshake(opts: AttachHandshakeOptions): Prom
   const existing = readServerInfo()
   if (!existing || !(await isServerInfoAlive(existing))) return false
   if (opts.jsonMode) {
-    opts.print(JSON.stringify({ attached: true, port: existing.port, host: existing.host, token: existing.token, pid: existing.pid }))
+    opts.print(JSON.stringify({ attached: true, port: existing.port, host: existing.host, ...(existing.protocol ? { protocol: existing.protocol } : {}), token: existing.token, pid: existing.pid }))
   } else {
     opts.print(`Rivet serve already running (pid ${existing.pid}) — attaching`)
     opts.print(`Rivet Runtime API at ${probeUrlFor(existing)}`)
@@ -193,6 +181,7 @@ export function printSpawnedHandshake(info: ServerInfo, print: (line: string) =>
     attached: false,
     port: info.port,
     host: info.host,
+    ...(info.protocol ? { protocol: info.protocol } : {}),
     token: info.token,
     pid: info.pid,
   }))

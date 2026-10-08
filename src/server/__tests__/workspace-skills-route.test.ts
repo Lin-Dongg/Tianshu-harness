@@ -7,7 +7,22 @@ import { previewWorkspaceSkills } from '../workspace-skills-route.js'
 import { buildWorkspaceRoutes } from '../workspace-route.js'
 import { skillRegistry } from '../../skills/skill-loader.js'
 
+/** 项目技能装载自 2667803f6（信任门下沉到 workspaceSkillSnapshot）起要求项目已授信。
+ *  fixture 是 mkdtemp 临时目录、天然未授信。RIVET_TRUST_PROJECT 是文档明示的
+ *  CI/无头授信开关（project-trust.ts:10）——不写信任文件、不污染真实 home。
+ *  每个用例内联设置并在 finally 恢复；不要把恢复写在 async 回调外层。 */
+const TRUST_ENV = 'RIVET_TRUST_PROJECT'
+function setTrust(): () => void {
+  const prior = process.env[TRUST_ENV]
+  process.env[TRUST_ENV] = '1'
+  return () => {
+    if (prior === undefined) delete process.env[TRUST_ENV]
+    else process.env[TRUST_ENV] = prior
+  }
+}
+
 test('welcome discovery follows skill precedence, isolates projects and leaves live registry/files untouched', () => {
+  const restoreTrust = setTrust()
   const root = mkdtempSync(join(tmpdir(), 'welcome-skills-'))
   const home = join(root, 'home')
   const project = join(root, 'project')
@@ -31,10 +46,11 @@ test('welcome discovery follows skill precedence, isolates projects and leaves l
     assert.ok(!previewWorkspaceSkills(other, home).skills.some(s => s.name === 'project-only'))
     assert.deepEqual(skillRegistry.list(), before)
     assert.equal(existsSync(join(other, '.rivet')), false)
-  } finally { rmSync(root, { recursive: true, force: true }) }
+  } finally { rmSync(root, { recursive: true, force: true }); restoreTrust() }
 })
 
 test('welcome skill route is wired and authenticated without creating a session', async () => {
+  const restoreTrust = setTrust()
   const root = mkdtempSync(join(tmpdir(), 'welcome-skills-route-'))
   const handler = buildWorkspaceRoutes('welcome-test')['GET /workspace/skills']!
   const auth = { authorization: 'Bearer welcome-test' }
@@ -47,5 +63,5 @@ test('welcome skill route is wired and authenticated without creating a session'
     assert.ok((result.body as { skills: { name: string }[] }).skills.some(s => s.name === 'welcome-test'))
     assert.equal((await handler(undefined, { cwd: 'relative' }, auth)).status, 400)
     assert.equal((await handler(undefined, { cwd: join(root, 'missing') }, auth)).status, 404)
-  } finally { rmSync(root, { recursive: true, force: true }) }
+  } finally { rmSync(root, { recursive: true, force: true }); restoreTrust() }
 })

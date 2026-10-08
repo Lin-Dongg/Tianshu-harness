@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { buildBashVerification, inferBashVerificationScope } from '../bash-verification.js'
+import { buildBashVerification, inferBashVerificationScope, isVerificationCommand } from '../bash-verification.js'
 
 describe('bash verification facts', () => {
   it('preserves domain failure exit codes even when the command executed normally', () => {
@@ -93,4 +93,92 @@ it('pipeline success cannot attest to the hidden test process and later batches 
   const mixed = { content: '# pass 2\n# fail 0\n# pass 3\n# fail 1', isError: false, exitCode: 0 }
   const result = buildBashVerification('npm test', mixed, mixed)
   assert.equal(result.status, 'failed'); assert.equal(result.failed, 1); assert.equal(result.passed, 5)
+})
+
+
+describe('非 JavaScript 生态 runner（dotnet / maven / gradle）', () => {
+  it('识别验证子命令为 full 覆盖并区分类别', () => {
+    for (const [command, kind] of [
+      ['dotnet test', 'test'],
+      ['dotnet test tests/SelfTest.csproj', 'test'],
+      ['dotnet build MonitorApp.csproj --nologo', 'build'],
+      ['dotnet run --project tests/SelfTest.csproj', 'build'],
+      ['mvn test', 'test'],
+      ['./mvnw verify', 'test'],
+      ['mvn compile', 'build'],
+      ['gradle test', 'test'],
+      ['./gradlew build', 'build'],
+      ['./gradlew check', 'check'],
+    ] as Array<[string, string]>) {
+      const inferred = inferBashVerificationScope(command)
+      assert.equal(inferred.scope, 'full', command)
+      assert.equal(inferred.kind, kind, command)
+    }
+  })
+
+  it('带过滤选择的调用只跑了子集，保留 unknown', () => {
+    for (const command of [
+      'dotnet test --filter FullyQualifiedName~CacheTests',
+      'mvn test -Dtest=CacheTest',
+      'gradle test --tests CacheTest',
+    ]) {
+      assert.equal(inferBashVerificationScope(command).scope, 'unknown', command)
+    }
+  })
+
+  it('管道中的非 JS runner 保留 unknown 意图；透明 cd 包装仍为 full', () => {
+    assert.equal(inferBashVerificationScope('dotnet test | tail -5').scope, 'unknown')
+    assert.equal(inferBashVerificationScope('cd repo && dotnet test').scope, 'full')
+  })
+
+  // Maven/Gradle 是「阶段/任务序列」语法：目标词不必紧跟可执行名，前面可以排
+  // 生命周期阶段（clean）与全局选项（-q/-B/--no-daemon）。#380 的样本全是 dotnet
+  // （flag 在子命令后），这一族没有现场，最初按 npm 的「子命令紧跟」形状实现 → 漏。
+  it('生命周期阶段前缀与全局选项不遮挡识别（mvn clean test / gradlew clean build）', () => {
+    for (const [command, kind] of [
+      ['mvn clean test', 'test'],
+      ['mvn clean verify', 'test'],
+      ['mvn clean install', 'build'],
+      ['mvn -q test', 'test'],
+      ['mvn -B clean package', 'build'],
+      ['gradle clean test', 'test'],
+      ['./gradlew clean build', 'build'],
+      ['./gradlew clean check', 'check'],
+    ] as Array<[string, string]>) {
+      assert.equal(inferBashVerificationScope(command).scope, 'full', command)
+      assert.equal(inferBashVerificationScope(command).kind, kind, command)
+    }
+  })
+
+  it('带选择标志的阶段序列仍降级 unknown；纯 clean / 版本查询不入账', () => {
+    assert.equal(inferBashVerificationScope('mvn clean test -Dtest=CacheTest').scope, 'unknown')
+    assert.equal(inferBashVerificationScope('gradle clean test --tests CacheTest').scope, 'unknown')
+    // clean 本身不是验证；--version/-v 已被上游排除。
+    assert.equal(isVerificationCommand('mvn clean'), false)
+    assert.equal(isVerificationCommand('mvn -v'), false)
+    assert.equal(isVerificationCommand('gradle --version'), false)
+  })
+
+  it('Windows 批处理 wrapper（.bat / .cmd）同样识别', () => {
+    assert.equal(inferBashVerificationScope('gradlew.bat build').scope, 'full')
+    assert.equal(inferBashVerificationScope('gradlew.bat clean build').scope, 'full')
+    assert.equal(inferBashVerificationScope('mvnw.cmd test').scope, 'full')
+  })
+})
+
+it('批处理 runner 被管道/复合包裹时不致静默消失——保留验证意图（记 blocked 并给单条建议）', () => {
+  // 静默失效比噪音贵：`… run-node-tests.ts f | tail` 以前完全不入台账
+  // （VERIFICATION_SEGMENT 只认 `--test` 字面量），跑了几千个用例却零记录。
+  for (const command of [
+    'npx tsx scripts/run-node-tests.ts src/a.test.ts | tail -5',
+    'cd src && npx tsx scripts/run-node-tests.ts a.test.ts',
+    'rtk node --import tsx scripts/run-node-tests.ts x.test.ts | tail -3',
+  ]) {
+    assert.equal(isVerificationCommand(command), true, command)
+  }
+  // 但归因不到逐文件证明 → unknown（不冒充 full）
+  assert.equal(inferBashVerificationScope('npx tsx scripts/run-node-tests.ts src/a.test.ts | tail -5').scope, 'unknown')
+  // 纯查询仍不得因 runner 字样进台账
+  assert.equal(isVerificationCommand('ls scripts/run-node-tests.ts'), false)
+  assert.equal(isVerificationCommand('wc -l desktop/scripts/run-tests.ts'), false)
 })

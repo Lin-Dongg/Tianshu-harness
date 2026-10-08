@@ -72,7 +72,7 @@ export interface TlsTrustProbe {
 
 /** 排障建议（三条，按信任降级程度从低到高）。CLI/桌面共用同一份措辞。 */
 export const TLS_MITM_ADVICE: readonly string[] = [
-  '① 在杀毒软件/代理里为天枢排除接口域名（首选，零信任降级）：卡巴斯基 → 设置 → 安全 → 网络设置 → 加密连接扫描 → 管理排除项；并给 tianshu-desktop.exe 与 node-runtime\\node.exe 加受信任应用程序规则。',
+  '① 在杀毒软件/代理里为天枢排除接口域名（首选，零信任降级）：卡巴斯基 → 设置 → 安全 → 网络设置 → 加密连接扫描 → 管理排除项；并给 tianshu-desktop.exe 与 node-runtime\\win-x64\\tianshu-runtime.exe 加受信任应用程序规则。',
   '② 只多信一张证书：NODE_EXTRA_CA_CERTS=<导出的扫描根证书路径> 后重启天枢。',
   '③ 信任整个系统 CA 存储：NODE_OPTIONS=--use-system-ca 后重启天枢（等于信任系统存储里的全部 CA，收敛性最差）。',
 ]

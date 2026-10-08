@@ -18,6 +18,8 @@ import { dirname, join } from 'node:path'
 import { writeFileAtomicSync } from '../fs-atomic.js'
 import { rivetHome, userConfigPath } from './paths.js'
 import { providerKeySchema, type ProviderKeyConfig, type ProviderConfig } from './schema.js'
+import { migrateDeepseekVisionExpRetirement, migrateDeepseekV4FlashRetirement } from './preset-model-retirement.js'
+import { backfillModelFromPreset } from './preset-model-backfill.js'
 
 /** 文件形状版本：与 secrets-store 的 `version: 1` 同规。 */
 export const PROVIDER_KEYS_FILE_VERSION = 1
@@ -103,6 +105,28 @@ export function injectProviderKeys(providers: Record<string, ProviderConfig>): v
   for (const [name, provider] of Object.entries(providers)) {
     const fromFile = file?.providers[name]
     if (fromFile && fromFile.length > 0) provider.keys = fromFile
+  }
+  // loadConfig 里的退役迁移发生在**这些外部池注入之前**——池里的退役 id 不在它的
+  // 视野内，于是「设置页剪过的池 / 老 provider-keys.json」会把退役档复活，而选择器
+  // 与请求端读的正是 keys[].models。这里对事实源再跑一遍退役与预设元数据回填，
+  // 结果幂等落盘（stale → 写文件；重新加载得到同一份文件）。
+  const raw = { provider: { providers } } as unknown as Record<string, unknown>
+  if (migrateDeepseekVisionExpRetirement(raw)) stale = true
+  if (migrateDeepseekV4FlashRetirement(raw)) stale = true
+  for (const [name, provider] of Object.entries(providers)) {
+    for (const key of provider.keys ?? []) {
+      let repairedAny = false
+      const repairedModels = key.models.map(model => {
+        const repaired = backfillModelFromPreset(name, model)
+        if (repaired !== model) { repairedAny = true; stale = true }
+        return repaired
+      })
+      // 无改动时保持原数组引用：内存合成路径靠 `keys[0].models === models` 维持兼容
+      // 槽位的共身份（provider-keys.test.ts 的 legacy 形态断言）。无条件替换会断开它
+      // ——PR 原版如此，作者自述未跑全量，收编时由该既有测试抓出。
+      if (repairedAny) key.models = repairedModels
+    }
+    const fromFile = file?.providers[name]
     const effective = provider.keys
     if (effective && effective.length > 0) {
       toPersist.providers[name] = effective

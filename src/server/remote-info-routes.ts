@@ -13,6 +13,7 @@ import { isLoopbackBind } from './host-policy.js'
 import { networkInterfaces } from 'node:os'
 
 export interface RemoteInfoOptions {
+  protocol?: 'http' | 'https'
   /** 实际绑定地址（startServer opts.host 同源）。 */
   host: string
   /** Host allowlist（有配置时随响应返回，供 UI 显示收紧状态）。 */
@@ -62,6 +63,7 @@ export function buildRemoteInfoRoutes(apiToken?: string, opts?: RemoteInfoOption
         status: 200,
         body: {
           mode: lanMode ? 'lan' : 'loopback',
+          protocol: opts?.protocol ?? 'http',
           listenHost: opts?.host ?? '127.0.0.1',
           lanUrls: sortLanUrls(rawUrls),
           ...(opts?.allowedHosts && opts.allowedHosts.length > 0 ? { allowedHosts: opts.allowedHosts } : {}),

@@ -26,7 +26,7 @@ export function sessionSkillSnapshot(cwd: string, sessionId?: string, management
     // 快照被 slash 解析消费，正文经 /skill 或裸名进用户消息）。
     const listCwd = projectSurfaceAllowed(cwd, 'skills') ? cwd : undefined
     snapshot = { v: 1, skills: management.list(listCwd).skills.filter(s => !s.shadowedBy).map(s => {
-      const pkg = s.path ? readPackage(s.path.endsWith('/SKILL.md') ? join(s.path, '..') : s.path) : undefined
+      const pkg = s.path ? readPackage(s.path) : undefined
       const definition = pkg?.definition ?? skillRegistry.get(s.name) ?? BUILTIN_SKILLS.find(def => def.name === s.name)
       if (!definition) throw new Error(`Missing skill definition: ${s.name}`)
       return { ...definition, skillId: s.skillId, version: s.version, origin: s.origin, name: s.name, source: s.source, bodyPath: s.path, mode: s.mode,

@@ -16,6 +16,7 @@ Usage:
   rivet -p "<prompt>" [--json] [--stream-json]   headless one-shot
   rivet --goal "<task>" [--budget N] [--json] [--stream-json]   headless goal mode
   rivet serve [--port N] [--host ADDR] [--attach] [--json]   runtime API server
+    --tls-cert <pem> --tls-key <pem>   required when serve binds outside loopback
   rivet sessions | rivet logs        list sessions / log locations and exit
 
 Options:

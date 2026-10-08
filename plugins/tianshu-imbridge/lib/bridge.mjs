@@ -54,7 +54,7 @@ export class MessageQueue {
 
 // ── 交互闭环：审批回决与提问回答的文本处理（纯函数，单测覆盖）──
 
-const APPROVE_WORDS = new Set(['批准', '同意', '允许', '通过', '确认', '可以', 'approve', 'ok'])
+const APPROVE_WORDS = new Set(['批准', '同意批准', 'approve'])
 const DENY_WORDS = new Set(['拒绝', '驳回', '不同意', '不许', '取消', 'deny', 'reject'])
 
 /**

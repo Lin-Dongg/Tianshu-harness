@@ -1075,9 +1075,11 @@ test('审批: 提交 404（已失效）→ 清等待态并提示，后续消息�
 test('parseApprovalReply: 批准/拒绝词表与边界', async () => {
   const { parseApprovalReply } = await import('../lib/bridge.mjs')
   assert.equal(parseApprovalReply('批准'), 'approve')
-  assert.equal(parseApprovalReply(' 同意。'), 'approve')
-  assert.equal(parseApprovalReply('OK'), 'approve')
-  assert.equal(parseApprovalReply('可以'), 'approve')
+  assert.equal(parseApprovalReply(' 同意批准。'), 'approve')
+  assert.equal(parseApprovalReply('APPROVE!'), 'approve')
+  for (const reply of ['同意', 'OK', 'ok!', '可以', '允许', '通过', '确认']) {
+    assert.equal(parseApprovalReply(reply), null, 'casual acknowledgement must not approve a pending tool')
+  }
   assert.equal(parseApprovalReply('拒绝'), 'deny')
   assert.equal(parseApprovalReply('deny'), 'deny')
   assert.equal(parseApprovalReply('不同意'), 'deny')

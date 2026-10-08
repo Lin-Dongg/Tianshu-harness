@@ -31,6 +31,7 @@ test('GET /health is intentionally open (desktop monitor probes without token)',
   const res = await router('GET', '/health', {}, {})
   assert.equal(res.status, 200)
   assert.equal((res.body as { ok: boolean }).ok, true)
+  assert.deepEqual(res.body, { ok: true }, 'anonymous probes must not expose a version fingerprint')
 })
 
 test('GET /health reports version, uptime and counts', async () => {

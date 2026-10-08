@@ -12,6 +12,9 @@
  * 收敛到本模块后两端共用同一实现，避免再次漂移。
  */
 
+import { networkInterfaces } from 'node:os'
+import { isIP } from 'node:net'
+
 /** 去掉 IPv6 字面量的方括号包裹，并归一大小写/空白（`[::1]` → `::1`）。 */
 function unbracket(addr: string): string {
   const a = addr.trim().toLowerCase()
@@ -32,7 +35,17 @@ function isLoopbackAddress(addr: string): boolean {
  */
 export function isLoopbackBind(addr: string): boolean {
   const a = unbracket(addr)
-  return a === 'localhost' || a === '::1' || isLoopbackAddress(a)
+  return a === 'localhost' || a === '::1' || (isIP(a) !== 0 && isLoopbackAddress(a))
+}
+
+/** Default to this machine's literal addresses; unknown hosts remain denied. */
+export function defaultLanHosts(bindHost: string): string[] {
+  const hosts = new Set<string>()
+  if (!['0.0.0.0', '::'].includes(bindHost)) hosts.add(bindHost.toLowerCase())
+  for (const addresses of Object.values(networkInterfaces())) for (const address of addresses ?? []) {
+    hosts.add(address.family === 'IPv6' ? `[${address.address.toLowerCase()}]` : address.address)
+  }
+  return [...hosts]
 }
 
 /** 拆 Host 头为 host / port 两部分（port 缺省为 undefined）。 */
@@ -98,8 +111,8 @@ export function parseHostsAllow(raw: string | undefined): string[] | undefined {
   if (out.length === 0) {
     console.warn(
       `[serve] RIVET_SERVE_HOSTS_ALLOW="${raw}" had no valid host entries ` +
-        '(each must be a bare hostname/IP without "/" or ":"); allowlist stays ' +
-        'unconfigured — on a LAN bind any Host passes (Bearer remains the only gate).',
+        '(each must be a bare hostname/IP without "/" or ":"); allowlist uses ' +
+        'the default local-address list; unknown hosts remain denied.',
     )
   }
   return out.length > 0 ? out : undefined

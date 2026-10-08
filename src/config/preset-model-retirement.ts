@@ -11,6 +11,48 @@
 import { findPresetModel } from './provider-presets.js'
 import type { ModelConfig } from './schema.js'
 
+/** 把退役条目在**顶层快照**与**每个权威 key 池**（`keys[].models`）里一并处理——
+ *  选择器与请求端读的是后者，只改顶层等于没改（2026-10-08 收编公开仓 PR #381）。
+ *  语义：池里已有替代档 → 删掉退役条目；没有 → 就地改名（保留用户调过的窗口与字段）。
+ *  Returns true if any value was changed. */
+function retireProviderModel(
+  prov: Record<string, unknown> | undefined,
+  retiredId: string,
+  replacementId: string,
+): boolean {
+  if (!prov) return false
+  let changed = false
+  const rewrite = (target: Record<string, unknown>): void => {
+    if (!Array.isArray(target.models)) return
+    let hasReplacement = target.models.some(m =>
+      !!m && typeof m === 'object' && (m as { id?: unknown }).id === replacementId,
+    )
+    let local = false
+    const models: unknown[] = []
+    for (const item of target.models) {
+      if (!item || typeof item !== 'object' || (item as { id?: unknown }).id !== retiredId) {
+        models.push(item)
+        continue
+      }
+      local = true
+      if (hasReplacement) continue
+      models.push({ ...item, id: replacementId })
+      hasReplacement = true
+    }
+    if (local) {
+      target.models = models
+      changed = true
+    }
+  }
+  rewrite(prov)
+  if (Array.isArray(prov.keys)) {
+    for (const key of prov.keys) {
+      if (key && typeof key === 'object') rewrite(key as Record<string, unknown>)
+    }
+  }
+  return changed
+}
+
 /**
  * 重定向前保证 REPLACEMENT 在契约池中可达（2026-10-06，开源仓 3.28 用户反馈族）。
  *
@@ -93,7 +135,7 @@ function ensureReplacementInPool(
  * 回退 models[0]（本轮已在 bootstrap/main 两处补了该回退的告警，但仍应避免发生）。
  *
  * 边界：只动 deepseek provider 下 id 完全等于该型号的条目——用户在别的 provider 下
- * 自建的同名模型（第三方中转）不受影响；删空了则不删（空 models 过不了 schema 校验）。
+ * 自建的同名模型（第三方中转）不受影响；只剩退役档时改名，保留用户调过的窗口。
  * 幂等：删干净、改到位之后返回 false。Mutates `raw` in place.
  * Returns true if any value was changed.
  */
@@ -106,14 +148,7 @@ export function migrateDeepseekVisionExpRetirement(raw: Record<string, unknown>)
   const provider = raw.provider as Record<string, unknown> | undefined
   const providers = provider?.providers as Record<string, unknown> | undefined
   const ds = providers?.['deepseek'] as Record<string, unknown> | undefined
-  const models = ds?.models as Array<Record<string, unknown>> | undefined
-  if (Array.isArray(models)) {
-    const kept = models.filter(m => (m as { id?: unknown })?.id !== RETIRED)
-    if (kept.length !== models.length && kept.length > 0) {
-      ds!.models = kept
-      changed = true
-    }
-  }
+  if (retireProviderModel(ds, RETIRED, REPLACEMENT)) changed = true
 
   const agent = raw.agent as Record<string, unknown> | undefined
   if (agent) {
@@ -163,42 +198,10 @@ export function migrateDeepseekV4FlashRetirement(raw: Record<string, unknown>): 
 
   const isRetired = (name: unknown): boolean => name === RETIRED || name === RETIRED_ALIAS
 
-  const rewriteModels = (models: unknown): unknown[] | undefined => {
-    if (!Array.isArray(models)) return undefined
-    const hasReplacement = models.some(m =>
-      !!m && typeof m === 'object' && (m as { id?: unknown }).id === REPLACEMENT,
-    )
-    let local = false
-    const next: unknown[] = []
-    for (const item of models) {
-      if (!item || typeof item !== 'object') { next.push(item); continue }
-      const m = item as Record<string, unknown>
-      if (m.id !== RETIRED) { next.push(item); continue }
-      local = true
-      if (hasReplacement) continue
-      next.push({ ...m, id: REPLACEMENT })
-    }
-    if (!local || next.length === 0) return undefined
-    changed = true
-    return next
-  }
-
   const provider = raw.provider as Record<string, unknown> | undefined
   const providers = provider?.providers as Record<string, unknown> | undefined
   const ds = providers?.['deepseek'] as Record<string, unknown> | undefined
-  if (ds) {
-    const rewritten = rewriteModels(ds.models)
-    if (rewritten) ds.models = rewritten
-    const keys = ds.keys
-    if (Array.isArray(keys)) {
-      for (const key of keys) {
-        if (!key || typeof key !== 'object') continue
-        const slot = key as Record<string, unknown>
-        const keyModels = rewriteModels(slot.models)
-        if (keyModels) slot.models = keyModels
-      }
-    }
-  }
+  if (retireProviderModel(ds, RETIRED, REPLACEMENT)) changed = true
 
   const redirectRef = (value: string): string | undefined => {
     const parts = value.split(':')
@@ -268,6 +271,33 @@ export function migrateDeepseekV4FlashRetirement(raw: Record<string, unknown>): 
   if (profiles) {
     for (const profile of Object.values(profiles)) redirectProfile(profile)
   }
+
+  // 悬空守卫（2026-10-08，3.28→3.29 已迁移用户缺口）：上面的补池只在「确有引用
+  // 被重定向」时发生。已迁移用户（引用早已 = REPLACEMENT、池里却没有它——设置页
+  // 剪枝或 keys 池形态）升级后不再产生任何重定向动作，补池永不触发、悬空持续
+  // （每次启动报「不在 provider 下」并位置性回退；桌面 resume 链在默认模型也不可
+  // 用时直接 fail-closed「请开新会话继续」）。这里不依赖动作，复查**硬引用位点**
+  // （defaultModel / visionModel）：指向 REPLACEMENT 而契约池不可达 → 补池
+  // （幂等——池内查重；仅当确有引用时补）。
+  //
+  // 范围刻意不收 greeting / compact / workers / review（弱引用位点）：preset 建立的
+  // config 快照在磁盘上就带着这些缺省引用（compact.model / greeting.model /
+  // worker[cheap-flash].model 均 = 'deepseek-flash'——provider 建立时写入、几乎人人
+  // 都有）。把它们纳入守卫会让「用户在设置页主动把 flash 剪掉」被反复补回
+  // （remove-model 语义被破坏，探针实测）。弱引用悬空由各自回退链兜底；硬引用
+  // 悬空没有可接受的回退（改指=静默换档，不补=启动告警+resume 死路）。
+  const pointsToReplacement = (ref: unknown): boolean => {
+    if (typeof ref !== 'string') return false
+    if (ref === REPLACEMENT) return true
+    const parts = ref.split(':')
+    return parts.length >= 2 && parts[0] === 'deepseek' && parts[parts.length - 1] === REPLACEMENT
+  }
+  let replacementReferenced = pointsToReplacement(agent?.defaultModel)
+  if (!replacementReferenced && agent) {
+    const vm = agent.visionModel as Record<string, unknown> | undefined
+    replacementReferenced = !!vm && vm.provider === 'deepseek' && vm.model === REPLACEMENT
+  }
+  if (replacementReferenced && ensureReplacementInPool(raw, 'deepseek', REPLACEMENT)) changed = true
 
   return changed
 }

@@ -147,7 +147,7 @@ related: [../reference/observability-harness.md, ../user-guide-sandbox-permissio
 **现象 A：安装包被 SmartScreen / 杀毒软件拦下，提示"未知发布者"。** Windows 安装包正在接入 Authenticode 代码签名（见 [`desktop/DISTRIBUTION.md`](../../desktop/DISTRIBUTION.md)「Windows」）；**未签名的版本**只能手动放行一次：
 
 - SmartScreen：点「更多信息」→「仍要运行」。企业策略禁止时需管理员放行。
-- 卡巴斯基：「更多」→「添加到排除项」，或在 设置 → 安全 → 威胁与排除 → 管理排除项 里把安装包所在目录加进去；装好后在 设置 → 安全 → [受信任应用程序](https://support.kaspersky.cn/ksv-light-agent/5.2/65921) 里放行 `tianshu-desktop.exe` **和** 安装目录下 `node-runtime\node.exe`（子进程有独立规则）。
+- 卡巴斯基：「更多」→「添加到排除项」，或在 设置 → 安全 → 威胁与排除 → 管理排除项 里把安装包所在目录加进去；装好后在 设置 → 安全 → [受信任应用程序](https://support.kaspersky.cn/ksv-light-agent/5.2/65921) 里放行 `tianshu-desktop.exe` **和** 安装目录下 `node-runtime\win-x64\tianshu-runtime.exe`（子进程有独立规则；旧安装包宿主名为 `node.exe`）。
 
 **现象 B：双击安装包"没反应"，或覆盖安装报 `Can't write ... node.exe`。** 安装器会先结束占用 `node.exe` 的残留进程（sidecar，以及你在集成终端里跑的 node/npx/tsx）。若杀毒软件拦了这一步，安装就停在无提示状态。处置：先在 受信任应用程序 里放行安装包，或临时暂停防护；也可以先手动退出天枢、关掉用着内置终端的窗口，再安装。诊断日志在 `%TEMP%\tianshu-update-hook.log`。
 
@@ -157,9 +157,9 @@ related: [../reference/observability-harness.md, ../user-guide-sandbox-permissio
 2. `NODE_EXTRA_CA_CERTS=<导出的根证书路径>` 后重启天枢（只多信这一张）。
 3. `NODE_OPTIONS=--use-system-ca` 后重启天枢（信任系统 CA 存储里的全部 CA，收敛性最差）。
 
-**现象 D：连接超时 / `ECONNRESET` / 连不上 443。** 多为防火墙的应用程序规则拦了出站（新装的"未知发布者"默认询问或阻止；`node.exe` 常需单独放行）。放行后仍不通，就走代理：`rivet config set-proxy http://127.0.0.1:7890`（或设置 → 网络），也可在 provider 上单配 `proxy`。
+**现象 D：连接超时 / `ECONNRESET` / 连不上 443。** 多为防火墙的应用程序规则拦了出站（新装的"未知发布者"默认询问或阻止；当前宿主 `tianshu-runtime.exe` 常需单独放行；旧包为 `node.exe`）。放行后仍不通，就走代理：`rivet config set-proxy http://127.0.0.1:7890`（或设置 → 网络），也可在 provider 上单配 `proxy`。
 
-**现象 E：界面能打开、但 agent 完全不可用（发消息没反应），sidecar 日志刷 `integrity-blocked: file_count_mismatch`。** 这是杀毒软件**行为检测**（卡巴斯基 PDM）拦在了 sidecar 的宿主形态上：它把「`node.exe` 执行 `rivet-runtime\cli\entry.js`」判为 `PDM:Trojan.Win32.Generic`，动作是结束进程**并隔离那个脚本文件**。文件没了，壳启动前的完整性自检就会拒绝拉起 sidecar——所以表现是"界面正常但什么都不干"，而且手动把文件还原也没用（sidecar 一执行又会在约 1 秒内被删）。先试 受信任应用程序 里放行安装目录下的 `node.exe`；企业策略不允许加白时，见 [`docs/known-issues/2026-09-26-windows-kaspersky-sidecar-pdm.md`](../known-issues/2026-09-26-windows-kaspersky-sidecar-pdm.md) 的用户侧规避方案（把 sidecar 宿主换成 electron）——**那是社区用户自建的规避路径、非官方支持**，照做前先读该篇第 5 节的代价（原生模块 ABI 降级等）。
+**现象 E：界面能打开、但 agent 完全不可用（发消息没反应），sidecar 日志刷 `integrity-blocked: file_count_mismatch`。** 这是杀毒软件**行为检测**（卡巴斯基 PDM）拦在了 sidecar 的宿主形态上：它把「`node.exe` 执行 `rivet-runtime\cli\entry.js`」判为 `PDM:Trojan.Win32.Generic`，动作是结束进程**并隔离那个脚本文件**。文件没了，壳启动前的完整性自检就会拒绝拉起 sidecar——所以表现是"界面正常但什么都不干"，而且手动把文件还原也没用（sidecar 一执行又会在约 1 秒内被删）。先试 受信任应用程序 里放行安装目录下的 `node-runtime\win-x64\tianshu-runtime.exe`（旧包为 `node.exe`）；企业策略不允许加白时，见 [`docs/known-issues/2026-09-26-windows-kaspersky-sidecar-pdm.md`](../known-issues/2026-09-26-windows-kaspersky-sidecar-pdm.md) 的用户侧规避方案（把 sidecar 宿主换成 electron）——**那是社区用户自建的规避路径、非官方支持**，照做前先读该篇第 5 节的代价（原生模块 ABI 降级等）。
 
 ## 12. npm 全局安装 / 升级失败（EEXIST / EPERM）
 

@@ -7,6 +7,10 @@ import { RuntimeSessionManager } from '../session-manager.js'
 import { skillRegistry } from '../../skills/skill-loader.js'
 
 test('welcome skill selection loads the skill body for the first agent run and retains user text', async () => {
+  // 项目技能装载自 2667803f6 起受信任门约束；mkdtemp fixture 未授信，显式放行。
+  // RIVET_TRUST_PROJECT 是文档明示的 CI/无头授信开关（project-trust.ts:10）。
+  const priorTrust = process.env.RIVET_TRUST_PROJECT
+  process.env.RIVET_TRUST_PROJECT = '1'
   const cwd = mkdtempSync(join(tmpdir(), 'welcome-first-skill-'))
   const name = `welcome-first-${Date.now()}`
   mkdirSync(join(cwd, '.rivet', 'skills'), { recursive: true })
@@ -37,5 +41,7 @@ test('welcome skill selection loads the skill body for the first agent run and r
     await manager.shutdownAll()
     skillRegistry.unregister(name)
     rmSync(cwd, { recursive: true, force: true })
+    if (priorTrust === undefined) delete process.env.RIVET_TRUST_PROJECT
+    else process.env.RIVET_TRUST_PROJECT = priorTrust
   }
 })

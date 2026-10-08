@@ -220,6 +220,49 @@ export function defaultKeyOf(provider: ProviderConfig): ProviderKeyConfig | unde
   return provider.keys.find(k => k.id === DEFAULT_KEY_ID) ?? provider.keys[0]
 }
 
+/** 写顶层凭据槽**并同步默认 key**——池形态下请求端读的是后者，只写顶层等于没写
+ *  （2026-10-08 收编公开仓 PR #381：重连后「看起来存上了、实际仍走旧的」）。
+ *  patch 二者择一：providerName=内联密钥，apiKeyEnv=环境变量引用。 */
+export function applyProviderCredential(
+  provider: ProviderConfig,
+  patch: { providerName?: string; apiKeyEnv?: string },
+): void {
+  const key = defaultKeyOf(provider)
+  if (patch.providerName !== undefined) {
+    provider.keyRef = patch.providerName
+    ;(provider as unknown as { apiKey?: string | null }).apiKey = null
+    ;(provider as unknown as { apiKeyEnv?: string | null }).apiKeyEnv = null
+    if (key) {
+      key.keyRef = patch.providerName
+      key.apiKey = undefined
+      key.apiKeyEnv = undefined
+    }
+  }
+  if (patch.apiKeyEnv !== undefined) {
+    provider.apiKeyEnv = patch.apiKeyEnv
+    ;(provider as unknown as { apiKey?: string | null }).apiKey = null
+    ;(provider as unknown as { keyRef?: string | null }).keyRef = null
+    if (key) {
+      key.apiKeyEnv = patch.apiKeyEnv
+      key.keyRef = undefined
+      key.apiKey = undefined
+    }
+  }
+}
+
+/** 模型改动**以默认 key 的池为基准**（消除顶层快照与池的历史漂移），改完用
+ *  `writeModelsToDefaultKey` 同步回去——成对使用，见 setupProvider。 */
+export function alignModelsWithDefaultKey(provider: ProviderConfig): void {
+  const key = defaultKeyOf(provider)
+  if (key) provider.models = structuredClone(key.models)
+}
+
+/** 见 `alignModelsWithDefaultKey`。 */
+export function writeModelsToDefaultKey(provider: ProviderConfig): void {
+  const key = defaultKeyOf(provider)
+  if (key) key.models = structuredClone(provider.models)
+}
+
 /**
  * 全仓扫描 keyRef 的引用方（provider 顶层槽 + 所有 key 槽）——删除/改写凭据前
  * 判定密钥能否回收。exclude 用于排除「正在被改写的那个 key 自己」。

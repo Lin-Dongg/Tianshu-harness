@@ -1,5 +1,5 @@
 import { lstatSync, readdirSync, readFileSync, realpathSync } from 'node:fs'
-import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep, win32 } from 'node:path'
 import { createHash } from 'node:crypto'
 import { parseSkillMarkdown, type SkillDefinition } from './skill-loader.js'
 import { parseSkillYaml, skillMetadata } from './skill-metadata.js'
@@ -7,6 +7,11 @@ import { parseSkillYaml, skillMetadata } from './skill-metadata.js'
 export interface PackageFile { path: string; data: string; executable: boolean }
 export interface SkillPackage { definition: SkillDefinition; files: PackageFile[]; fingerprint: string; subpath: string }
 const MAX_BYTES = 32 * 1024 * 1024
+/** SKILL.md is the entry point of its directory package, on either platform. */
+export function skillPackagePath(path: string): string {
+  const paths = path.includes('\\') ? win32 : { basename, dirname }
+  return paths.basename(path) === 'SKILL.md' ? paths.dirname(path) : path
+}
 export function inside(root: string, path: string): string {
   const target = resolve(root, path)
   if (target !== resolve(root) && !target.startsWith(resolve(root) + sep)) throw new Error('Path escapes skill package')
@@ -20,6 +25,7 @@ export function fingerprint(files: PackageFile[]): string {
   return createHash('sha256').update(JSON.stringify([...files].sort((a, b) => a.path.localeCompare(b.path)))).digest('hex')
 }
 export function readPackage(path: string): SkillPackage {
+  path = skillPackagePath(path)
   const stat = lstatSync(path)
   if (stat.isSymbolicLink()) throw new Error('Symbolic links are not supported in skill packages')
   const root = stat.isDirectory() ? path : resolve(path, '..')
