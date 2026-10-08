@@ -408,3 +408,4 @@ contributions for this graph`；`including commit co-authors` 仅 GHES 版本成
 - #395 fix(server): 同一 Provider 多 Key 时余额查询按 keyId 独立（CLOSED）
 - #393 fix(api): SSE 缺 [DONE] 但有终态 finish_reason 时宽容收尾（CLOSED）
 - #391 feat(updater): GitHub API 查版本支持国内代理回退与网络自动检测（CLOSED）
+- #396 fix(utils): isSafeFileName 补 Windows 保留设备名——CON/NUL/COM1-9 形态落 Win32 打开设备而非建文件（CLOSED）
