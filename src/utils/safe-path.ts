@@ -30,11 +30,21 @@ export function stripTerminalEscapes(text: string): string {
  */
 const MAX_NAME_LENGTH = 200
 
+/**
+ * Windows 保留设备名。与 orderFileKey 拦冒号（ADS）同一族：这类名字在 Win32
+ * 上不创建文件而是打开设备（`CON.txt` 即控制台），同名写入会无声挂起或"成功"
+ * 却无文件落盘。比对前做两级归一：① 主干（首个 `.` 之前）——设备名后的扩展名
+ * 不改变语义；② 去尾随点/空格——Win32 打开时会剥离它们（`CON ` == `CON`）。
+ */
+const WINDOWS_RESERVED_DEVICE_RE = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i
+
 export function isSafeFileName(name: string): boolean {
   if (!name || name.length > MAX_NAME_LENGTH) return false
   if (name.includes('/') || name.includes('\\') || name.includes('\0')) return false
   if (name.startsWith('.')) return false
   if (name.includes('..')) return false
+  const stem = name.split('.')[0]!.replace(/[. ]+$/, '')
+  if (WINDOWS_RESERVED_DEVICE_RE.test(stem)) return false
   return true
 }
 
