@@ -12,6 +12,7 @@ import {
 import type { AgentCallbacks } from '../../agent/loop-types.js'
 import type { Artifact } from '../../artifact/types.js'
 import type { OaiMessage } from '../../api/oai-types.js'
+import { configSchema } from '../../config/schema.js'
 
 class NoopAgent implements ManagedAgent {
   run(_p: string, _cb: AgentCallbacks): Promise<void> { return Promise.resolve() }
@@ -750,6 +751,7 @@ test('resumeRun 原模型不可用且无兜底 → 显式降级默认模型续�
     },
     persistence: mem,
     listModels: () => [{ id: 'v4-pro', alias: 'v4', provider: 'p' }],
+    readSessionConfig: () => { throw new Error('config unavailable') },
     defaultModelId: 'v4-pro',
   })
   const res = await mgr.resumeRun('crash')
@@ -767,6 +769,7 @@ test('resumeRun 会话未记录原模型 → 同样显式降级默认模型续�
     createAgent: () => new NoopAgent(),
     persistence: mem,
     listModels: () => [{ id: 'v4-pro', alias: 'v4', provider: 'p' }],
+    readSessionConfig: () => { throw new Error('config unavailable') },
     defaultModelId: 'v4-pro',
   })
   const res = await mgr.resumeRun('crash')
@@ -1254,3 +1257,71 @@ test('adopt 进来的会话首次打开（since=0）回放磁盘上的完整历�
   assert.equal(replay?.lastSeq, 2)
   assert.deepEqual(p.loadEventsCalls, ['c'], '懒加载在首次打开时触发')
 })
+
+// #399: exercise the actual resume decision and agent factory, not a copied predicate.
+for (const original of [
+  'global:deepseek-v4.1-flash', 'cn:glm-5.3-flash', 'regional-alias',
+  'WorkBuddy:global:deepseek-v4.1-flash', 'WorkBuddy:default:global:deepseek-v4.1-flash',
+  'WorkBuddy:default:regional-alias',
+]) {
+  test(`resumeRun #399 preserves complete reference ${original}`, async () => {
+    const built: Array<string | undefined> = []
+    const mgr = new RuntimeSessionManager({
+      createAgent: (_cwd, _id, _mode, model) => { built.push(model); return new NoopAgent() },
+      persistence: new LazyMemoryPersistence(crashSeed(original, 'qiming')),
+      listModels: () => [
+        { id: 'global:deepseek-v4.1-flash', alias: 'regional-alias', provider: 'other', keyId: 'default' },
+        { id: 'global:deepseek-v4.1-flash', alias: 'regional-alias', provider: 'WorkBuddy', keyId: 'other-key' },
+        { id: 'global:deepseek-v4.1-flash', alias: 'regional-alias', provider: 'WorkBuddy', keyId: 'default' },
+        { id: 'cn:glm-5.3-flash', alias: 'glm', provider: 'WorkBuddy', keyId: 'default' },
+      ],
+    })
+    assert.deepEqual(await mgr.resumeRun('crash'), { ok: true, model: original, switched: false })
+    assert.deepEqual(built, [original])
+    assert.ok(!mgr.getEvents('crash', 0)!.events.some(e => e.type === 'model_switched'))
+  })
+}
+
+for (const original of ['missing:global:deepseek-v4.1-flash', 'WorkBuddy:missing:global:deepseek-v4.1-flash']) {
+  test(`resumeRun #399 rejects unavailable provider/key ${original}`, async () => {
+    let built = false
+    const mgr = new RuntimeSessionManager({
+      createAgent: () => { built = true; return new NoopAgent() },
+      persistence: new LazyMemoryPersistence(crashSeed(original)),
+      listModels: () => [{ id: 'global:deepseek-v4.1-flash', alias: 'flash', provider: 'WorkBuddy', keyId: 'default' }],
+      readSessionConfig: () => { throw new Error('config unavailable') },
+    })
+    assert.equal((await mgr.resumeRun('crash')).ok, false)
+    assert.equal(built, false)
+  })
+}
+
+for (const configured of [undefined, 'WorkBuddy:default:global:hy4-preview-f', 'WorkBuddy:missing:no-model']) {
+  test(`resumeRun #399 reads fresh defaults (${configured ?? 'pool'})`, async () => {
+    const built: Array<string | undefined> = []
+    const fresh = configSchema.parse({
+      agent: { defaultModel: configured, defaultDomain: 'qiming' },
+      provider: { default: 'WorkBuddy', providers: { WorkBuddy: {
+        name: 'WorkBuddy', baseUrl: 'https://example.test/v1', models: [{ id: 'hy4-preview-f' }],
+        keys: [{ id: 'default', models: [{ id: 'cn:hy4-preview-f' }, { id: 'global:hy4-preview-f' }] }],
+      } } },
+    })
+    const expected = configured?.includes(':default:') ? configured : 'WorkBuddy:cn:hy4-preview-f'
+    const mgr = new RuntimeSessionManager({
+      createAgent: (_cwd, _id, _mode, model) => { built.push(model); return new NoopAgent() },
+      persistence: new LazyMemoryPersistence(crashSeed('gone')),
+      defaultModelId: 'hy4-preview-f',
+      readSessionConfig: options => { assert.equal(options?.cwd, '/work'); return fresh },
+      listModels: () => [
+        { id: 'cn:hy4-preview-f', alias: 'cn:hy4-preview-f', provider: 'WorkBuddy', keyId: 'default' },
+        { id: 'global:hy4-preview-f', alias: 'global:hy4-preview-f', provider: 'WorkBuddy', keyId: 'default' },
+      ],
+    })
+    const result = await mgr.resumeRun('crash')
+    assert.equal(result.ok, true)
+    assert.equal(result.model, expected)
+    assert.equal(result.degraded, true)
+    assert.deepEqual(built, [expected])
+    assert.equal(mgr.getEvents('crash', 0)!.events.find(e => e.type === 'model_switched')?.data.reason, 'resume-degraded-default')
+  })
+}

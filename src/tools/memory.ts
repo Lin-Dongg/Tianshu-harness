@@ -190,17 +190,27 @@ export function createMemoryTool(store: ContextClaimStore, ctx?: MemoryContext):
         if (candidates.length === 0) {
           return { content: `历史会话中没有与「${query}」相关的片段——deep_recall 无可蒸馏素材。` }
         }
-        let raw: string
-        try {
-          raw = await ctx.deepRecallComplete(buildDeepRecallPrompt(query, candidates), 20_000)
-        } catch {
-          return { content: '深召回失败（侧路模型不可用/超时）——fail-closed 不编造，可改用 recall。', isError: true }
+        const prompt = buildDeepRecallPrompt(query, candidates)
+        const deadline = performance.now() + 20_000
+        const budgetError = '深召回失败（20 秒总预算已耗尽）——可改用 recall。'
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const remaining = Math.floor(deadline - performance.now())
+          if (remaining <= 0) return { content: budgetError, isError: true }
+          let raw: string
+          try {
+            const requestPrompt = attempt === 0 ? prompt
+              : `${prompt}\n上次输出不符合 JSON 契约。请重新基于以上相同片段回答，只输出一个合法 JSON 对象，必须包含非空字符串 answer；不要解释、不要 markdown 围栏。`
+            raw = await ctx.deepRecallComplete(requestPrompt, remaining)
+          } catch {
+            if (performance.now() >= deadline) return { content: budgetError, isError: true }
+            const phase = attempt === 0 ? '侧路模型不可用/超时' : '格式重试时侧路模型不可用/超时'
+            return { content: `深召回失败（${phase}）——fail-closed 不编造，可改用 recall。`, isError: true }
+          }
+          if (performance.now() >= deadline) return { content: budgetError, isError: true }
+          const result = parseDeepRecallOutput(raw)
+          if (result) return { content: renderDeepRecallText(result) }
         }
-        const result = parseDeepRecallOutput(raw)
-        if (!result) {
-          return { content: '深召回失败（蒸馏输出不可解析）——fail-closed 不编造，可改用 recall。', isError: true }
-        }
-        return { content: renderDeepRecallText(result) }
+        return { content: '深召回失败（蒸馏输出格式重试一次后仍不可解析）——fail-closed 不编造，可改用 recall。', isError: true }
       }
 
       if (action === 'recall_feedback') {

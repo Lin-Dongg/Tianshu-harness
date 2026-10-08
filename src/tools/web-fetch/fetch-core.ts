@@ -109,6 +109,8 @@ export async function fetchMarkdown(
     maxResponseBytes: opts.maxResponseBytes ?? DEFAULT_MAX_BYTES,
     maxRedirects: opts.maxRedirects ?? DEFAULT_MAX_REDIRECTS,
     userAgent: opts.userAgent ?? DEFAULT_USER_AGENT,
+    proxy: opts.proxy,
+    trustProxyFakeIp: opts.trustProxyFakeIp,
   }
   const extractMainContentEnabled = opts.extractMainContent ?? true
 

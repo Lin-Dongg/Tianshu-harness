@@ -21,6 +21,8 @@ export interface HttpFetchOptions {
    * HTTPS_PROXY/HTTP_PROXY 环境变量。每跳（含重定向）独立解析。
    */
   proxy?: ProxyResolverOptions
+  /** Explicit trust in proxy-side resolution of domain fake-IP answers; default false. */
+  trustProxyFakeIp?: boolean
 }
 
 export interface HttpFetchResult {
@@ -89,7 +91,8 @@ export function buildPinnedLookup(address: string, family: number | undefined): 
  * interceptor 只有 cache/decompress/deduplicate/dns/dump/redirect/response-error/
  * retry）。既然钉不住，就不要传一个被忽略的 connect 让读者以为目标已被钉住。
  *
- * 结果：代理模式下目标**只有**请求前的一次性 `resolveAndAssertPublic` 预检——攻击者
+ * 结果：代理模式下目标**只有**请求前的一次性 `resolveAndAssertPublic` 预检；显式
+ * trustProxyFakeIp 还允许域名的 198.18.0.0/15 DNS 答案，最终解析依赖受信代理。攻击者
  * 让 DNS 在预检与代理实际解析之间翻转为私网地址即可穿透，代理模式的 SSRF 保证弱于
  * 直连。这是能力边界而不是已修复项，不要在别处当作强保证使用。
  */
@@ -168,8 +171,10 @@ export async function httpFetchGuarded(
       if (hopUrl.protocol !== 'http:' && hopUrl.protocol !== 'https:') {
         throw new Error(`Redirect to unsupported protocol: ${hopUrl.protocol}`)
       }
-      const resolved = await resolveAndAssertPublic(hopUrl.hostname, lookup)
       const proxyUrl = useDispatcher ? resolveProxyForUrl(currentUrl, opts.proxy) : undefined
+      const resolved = await resolveAndAssertPublic(hopUrl.hostname, lookup, {
+        allowProxyFakeIp: opts.trustProxyFakeIp === true && !!proxyUrl,
+      })
       const dispatcher = useDispatcher
         ? buildDispatcher({ pin, address: resolved.address, family: resolved.family, proxyUrl })
         : undefined

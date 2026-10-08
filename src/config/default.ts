@@ -203,7 +203,7 @@ export const DEFAULT_CONFIG: Config = {
     cacheMaxAgeMs: 172_800_000,
     jinaBaseUrl: 'https://r.jina.ai',
   },
-  network: {},
+  network: { trustProxyFakeIp: false },
   mcp: {
     enabled: true,
     servers: {},

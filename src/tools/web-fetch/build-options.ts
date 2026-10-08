@@ -18,6 +18,7 @@ export function buildFetchOptions(config: Config): WebFetchOptions {
     renderWaitMs: Math.min(config.fetch.renderWaitMs, Math.floor(config.fetch.renderTimeoutMs / 2)),
     cacheMaxAgeMs: config.fetch.cacheMaxAgeMs,
     jinaBaseUrl: config.fetch.jinaBaseUrl,
+    trustProxyFakeIp: config.network.trustProxyFakeIp,
     proxy: {
       ...(config.network.proxy ? { proxyUrl: config.network.proxy } : {}),
       ...(config.network.noProxy ? { noProxy: config.network.noProxy } : {}),

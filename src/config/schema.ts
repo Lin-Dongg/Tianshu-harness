@@ -747,6 +747,8 @@ export const networkSchema = z.object({
   /** 不走代理的域名列表（逗号分隔，支持 * 通配和 . 前缀）。
    *  匹配语义对齐 curl/wget 的 NO_PROXY。留空则跟随 NO_PROXY 环境变量。 */
   noProxy: z.string().optional(),
+  /** 仅实际 HTTP/HTTPS 代理路径可信任域名的 198.18.0.0/15 fake-IP；不适用于纯 TUN。 */
+  trustProxyFakeIp: z.boolean().default(false),
 }).default({})
 export type NetworkConfig = z.infer<typeof networkSchema>
 export const editorSchema = z.object({

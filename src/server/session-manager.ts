@@ -134,7 +134,7 @@ import { redactValue, redactText, truncateUtf16Safe } from './redact.js'
 import { MAX_ARCHIVES, MAX_ARCHIVE_BYTES, MAX_DOCUMENTS, MAX_IMAGES } from './attachment-limits.js'
 import type { SessionArchivePayload } from './attachment-validation.js'
 import { applyRingLimits } from './session-ring-limits.js'
-import { assertDefaultModelRef, contractModels } from '../config/contract-models.js'
+import { resolveSessionDefaults } from './session-defaults.js'
 
 // The session wire contract (event types, records, statuses) lives in
 // protocol.ts so the desktop can share it type-only. Re-export so existing
@@ -882,6 +882,8 @@ export interface RuntimeSessionManagerOptions {
    * initial record.model and the picker's `current` flag.
    */
   defaultModelId?: string
+  /** Session defaults loader; injected tests must not read the host configuration. */
+  readSessionConfig?: typeof loadConfig
   titleCompletion?: typeof buildTitleCompletion
   /** PlusMenu (domain) — the default domain key new sessions start on. */
   defaultDomain?: string
@@ -1401,6 +1403,7 @@ export class RuntimeSessionManager {
   private readonly titles: SessionTitleCoordinator
   private readonly listModelsFn?: () => ModelOption[]
   private readonly defaultModelId?: string
+  private readonly readSessionConfig: typeof loadConfig
   private readonly defaultDomain?: string
   private readonly resumeFallbackModel?: string
   private readonly idleAgentTtlMs: number
@@ -1475,6 +1478,7 @@ export class RuntimeSessionManager {
     })
     this.listModelsFn = opts.listModels
     this.defaultModelId = opts.defaultModelId
+    this.readSessionConfig = opts.readSessionConfig ?? loadConfig
     this.resumeFallbackModel = opts.resumeFallbackModel
     this.idleAgentTtlMs = opts.idleAgentTtlMs ?? 30 * 60_000
     this.resolveGoalHandles = opts.resolveGoalHandles
@@ -2650,37 +2654,9 @@ export class RuntimeSessionManager {
     input.preparePrompt?.(cwd)
     const ts = this.now()
 
-    // Per-project defaults: load .rivet-config.json from the session cwd so
-    // agent.defaultDomain and provider.default override the global startup
-    // values. Priority: explicit input.model/domain (user chose in the
-    // new-session dialog) > agent.defaultModel（设置页「默认模型」）>
-    // 默认 provider 首模型 > the global startup snapshot.
-    let sessionModel = this.defaultModelId
-    let sessionDomain = this.defaultDomain ?? 'qiming'
-    try {
-      const projectConfig = loadConfig({ cwd })
-      // loadConfig 合并全局+项目层：取新鲜值（含 'auto'），设置页运行期改
-      // agent.defaultDomain 后新会话即生效，不用重启 sidecar；启动快照仅作
-      // config 加载失败时的回退。
-      const projectDomain = projectConfig.agent?.defaultDomain
-      if (projectDomain) sessionDomain = projectDomain
-      const projectProvider = projectConfig.provider.providers[projectConfig.provider.default]
-      // 多 key：走 keys 池派生（contractModels）——顶层 models 是迁移时的快照。
-      if (projectProvider) {
-        const sessionPool = contractModels(projectProvider)
-        if (sessionPool[0]?.id) sessionModel = sessionPool[0].id
-      }
-      // agent.defaultModel（"provider:modelId"）：此前桌面新会话完全没消费它，
-      // 设置页钉的默认模型对桌面形同虚设（CLI 启动解析 main.ts 早已同源消费）。
-      // 无效引用（手改配置）回落默认 provider 首模型。
-      const configuredDefault = projectConfig.agent?.defaultModel
-      if (configuredDefault) {
-        try {
-          assertDefaultModelRef(projectConfig.provider.providers, configuredDefault)
-          sessionModel = configuredDefault
-        } catch { /* invalid ref — fall back to the default provider's first model */ }
-      }
-    } catch { /* project config load failure is non-fatal — fall back to global defaults */ }
+    const defaults = resolveSessionDefaults(cwd, this.defaultModelId, this.defaultDomain, this.readSessionConfig)
+    let sessionModel = defaults.model
+    let sessionDomain = defaults.domain
     if (input.model) sessionModel = input.model
     if (input.domain) sessionDomain = input.domain
 
@@ -3243,26 +3219,10 @@ export class RuntimeSessionManager {
     if (session.running) return { ok: false, code: 'busy', error: 'Session is already running' }
     const original = session.record.model
     const available = this.listModelsFn?.()
-    // No injected model source (tests / minimal setups): trust the record —
-    // there is nothing to validate against, and the factory resolves it.
-    //
-    // Session records persist models as `provider:modelId` (switchModel writes
-    // that form to disambiguate providers sharing a wire id). Availability
-    // must parse the prefix — a bare id/alias comparison against
-    // "deepseek:deepseek-v4-flash" was the 2026-09-08 false-negative that
-    // made one-click resume claim the current model was gone.
-    const isAvailable = (m: string | undefined): m is string => {
-      if (!m) return false
-      if (!available) return true
-      const colon = m.indexOf(':')
-      const pinnedProvider = colon > 0 ? m.slice(0, colon) : undefined
-      const modelRef = pinnedProvider ? m.slice(colon + 1) : m
-      if (!modelRef) return false
-      return available.some((o) => {
-        if (pinnedProvider && o.provider !== pinnedProvider) return false
-        return o.id === modelRef || o.alias === modelRef || o.id === m || o.alias === m
-      })
-    }
+    // Match complete references; a colon can belong to the model id (#399).
+    // Without an injected catalogue, the factory remains the source of truth.
+    const isAvailable = (m: string | undefined): m is string =>
+      !!m && (!available || available.some(option => modelOptionMatches(m, option)))
     let target = original
     let switched = false
     let degraded = false
@@ -3279,7 +3239,9 @@ export class RuntimeSessionManager {
         const fallbackLabel = fallback
           ? `（续跑兜底 ${fallback} 也不可用）`
           : '（未配置 agent.resumeFallbackModel）'
-        const defaultModel = this.defaultModelId
+        const defaultModel = resolveSessionDefaults(
+          session.record.cwd, this.defaultModelId, this.defaultDomain, this.readSessionConfig,
+        ).modelRef
         if (!isAvailable(defaultModel)) {
           return {
             ok: false,

@@ -29,6 +29,12 @@ const RESERVED_IPV6 = [
 ] as const
 
 const RESERVED_IPS = new BlockList()
+const PROXY_FAKE_IPV4 = new BlockList()
+PROXY_FAKE_IPV4.addSubnet('198.18.0.0', 15, 'ipv4')
+
+export function isProxyFakeIPv4(ip: string): boolean {
+  return isIP(ip) === 4 && PROXY_FAKE_IPV4.check(ip, 'ipv4')
+}
 
 for (const [network, prefix] of RESERVED_IPV4) {
   RESERVED_IPS.addSubnet(network, prefix, 'ipv4')
@@ -88,7 +94,10 @@ export class SSRFError extends Error {
     readonly hostname: string,
     readonly address: string,
   ) {
-    super(`Access denied: ${hostname} resolves to a private/reserved IP (${address})`)
+    super(`Access denied: ${hostname} resolves to a private/reserved IP (${address})`
+      + (isProxyFakeIPv4(address)
+        ? ' — 疑似代理 fake-IP：请配置实际 HTTP/HTTPS 代理并显式开启 network.trustProxyFakeIp，或调整代理 DNS 模式。纯 TUN / NO_PROXY 直连不适用此例外。'
+        : ''))
     this.name = 'SSRFError'
   }
 }
@@ -104,13 +113,19 @@ export type LookupFn = (hostname: string) => Promise<ResolvedAddress>
 export async function resolveAndAssertPublic(
   hostname: string,
   lookup: LookupFn,
+  options: { allowProxyFakeIp?: boolean } = {},
 ): Promise<ResolvedAddress> {
   // URL.hostname 对 IPv6 literal 返回带方括号的形式（"[::1]"）：isIP 返回 0，dns.lookup
   // 也解析不了它，校验会形同失效。四个消费点（http-fetch 1 处、render-fetch 3 处）都传
   // URL.hostname，故在最靠内的一层统一剥括号。
   const host = hostname.replace(/^\[|\]$/g, '')
   const { address, family } = await lookup(host)
-  if (isPrivateIP(address)) {
+  const literalFamily = isIP(host)
+  if (literalFamily && isPrivateIP(host)) throw new SSRFError(hostname, host)
+  // Narrow opt-in: only domain DNS answers in the exact IPv4 fake-IP pool.
+  // Missed cases stay rejected; literals and IPv6 embeddings never qualify.
+  const trustedFakeIp = options.allowProxyFakeIp === true && !literalFamily && isProxyFakeIPv4(address)
+  if (isPrivateIP(address) && !trustedFakeIp) {
     throw new SSRFError(hostname, address)
   }
   const ipFamily = isIP(address)

@@ -161,6 +161,21 @@ related: [../reference/observability-harness.md, ../user-guide-sandbox-permissio
 
 **现象 E：界面能打开、但 agent 完全不可用（发消息没反应），sidecar 日志刷 `integrity-blocked: file_count_mismatch`。** 这是杀毒软件**行为检测**（卡巴斯基 PDM）拦在了 sidecar 的宿主形态上：它把「`node.exe` 执行 `rivet-runtime\cli\entry.js`」判为 `PDM:Trojan.Win32.Generic`，动作是结束进程**并隔离那个脚本文件**。文件没了，壳启动前的完整性自检就会拒绝拉起 sidecar——所以表现是"界面正常但什么都不干"，而且手动把文件还原也没用（sidecar 一执行又会在约 1 秒内被删）。先试 受信任应用程序 里放行安装目录下的 `node-runtime\win-x64\tianshu-runtime.exe`（旧包为 `node.exe`）；企业策略不允许加白时，见 [`docs/known-issues/2026-09-26-windows-kaspersky-sidecar-pdm.md`](../known-issues/2026-09-26-windows-kaspersky-sidecar-pdm.md) 的用户侧规避方案（把 sidecar 宿主换成 electron）——**那是社区用户自建的规避路径、非官方支持**，照做前先读该篇第 5 节的代价（原生模块 ABI 降级等）。
 
+**现象 F：`web_fetch` 报 `Access denied`，地址是 `198.18.x.x` 或 `198.19.x.x`，浏览器却能访问。** 可能是 Clash / mihomo 的 fake-IP DNS 模式：本机 DNS 返回代理的虚拟地址，HTTP 抓取守卫按保留段拒绝。确认使用可信代理后，可在用户配置 `config.json` 的 `network` 段合并以下配置（代理端口按本机实际值填写），重启会话生效：
+
+```json
+{
+  "network": {
+    "proxy": "http://127.0.0.1:7890",
+    "trustProxyFakeIp": true
+  }
+}
+```
+
+`trustProxyFakeIp` 默认关闭。开启后，仅域名解析得到 `198.18.0.0/15` 且该请求实际经 HTTP/HTTPS 代理时允许抓取；每次重定向重新检查。直接访问该段 IP、其他私网/保留地址、命中 `NO_PROXY` 或纯 TUN 且没有实际 HTTP 代理，仍会拒绝。也可以调整代理 DNS 模式，使其返回真实公网地址。
+
+此选项适用于 HTTP 抓取和 Jina 请求；Playwright 渲染及 actions 仍执行原有守卫。目标的最终解析由受信代理完成，客户端不能验证代理实际连接的地址，因此不具备直连的连接地址钉定保证。代理连接失败不会转为直连。
+
 ## 12. npm 全局安装 / 升级失败（EEXIST / EPERM）
 
 CLI 通过 `npm install -g tianshu-harness` 安装与升级。若中途失败，日志尾部通常是一行 `npm error code EEXIST`——但**真正的起点往往在更上面**。先分清是下面两种中的哪一种：
