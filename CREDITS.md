@@ -404,3 +404,4 @@ contributions for this graph`；`including commit co-authors` 仅 GHES 版本成
 - #387 docs: refresh model versions, descriptions and setup examples（OPEN）
 - #384 fix(cli): synchronize connect and model across providers and gateways（OPEN）
 - #383 fix(tui): align reasoning effort controls with model capabilities（CLOSED）
+- #389 fix: 修复 CLI 跨平台生命周期并优化问答与计划预览（OPEN）
