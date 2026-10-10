@@ -414,3 +414,4 @@ contributions for this graph`；`including commit co-authors` 仅 GHES 版本成
 - #426 fix(memory): 补齐 13 种常见 token 形态的写入前 scrub 覆盖（CLOSED）
 - #425 fix(plan): plan slug 路径穿越——planFilePath 加 isSafeFileName fail-closed 门（CLOSED）
 - #424 fix(security): review-job 校验 PR baseRefName 前导横线并补 -- 终止符，堵 git fetch 选项注入（CLOSED）
+- #423 fix(security): appendMemoryEntry 写入前 scrub 收口，纯敏感条目丢弃不落盘（CLOSED）
