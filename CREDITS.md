@@ -416,3 +416,4 @@ contributions for this graph`；`including commit co-authors` 仅 GHES 版本成
 - #424 fix(security): review-job 校验 PR baseRefName 前导横线并补 -- 终止符，堵 git fetch 选项注入（CLOSED）
 - #423 fix(security): appendMemoryEntry 写入前 scrub 收口，纯敏感条目丢弃不落盘（CLOSED）
 - #421 fix(security): snapshot import 路由加 cwd 沙箱校验（CLOSED）
+- #420 fix(approval): 审批 answer 路由 fail-closed + editedInput 重跑 deny/self-kill 门（CLOSED）
