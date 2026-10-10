@@ -417,3 +417,4 @@ contributions for this graph`；`including commit co-authors` 仅 GHES 版本成
 - #423 fix(security): appendMemoryEntry 写入前 scrub 收口，纯敏感条目丢弃不落盘（CLOSED）
 - #421 fix(security): snapshot import 路由加 cwd 沙箱校验（CLOSED）
 - #420 fix(approval): 审批 answer 路由 fail-closed + editedInput 重跑 deny/self-kill 门（CLOSED）
+- #419 fix(starflow): 预览阶段文案改为未来时态，与实际落盘行为一致（CLOSED）
