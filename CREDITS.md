@@ -420,3 +420,4 @@ contributions for this graph`；`including commit co-authors` 仅 GHES 版本成
 - #419 fix(starflow): 预览阶段文案改为未来时态，与实际落盘行为一致（CLOSED）
 - #418 fix(tools): memory recall 未授信时明示「未检索」而非裸「未找到」（CLOSED）
 - #417 fix(tools): authority 接受中文星名并归一化为规范 id，修正 yuheng 错误示例（CLOSED）
+- #409 fix(platform): node-runtime 无真 node 时不抢占 PATH 首位（CLOSED）
