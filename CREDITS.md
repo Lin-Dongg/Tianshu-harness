@@ -421,3 +421,4 @@ contributions for this graph`；`including commit co-authors` 仅 GHES 版本成
 - #418 fix(tools): memory recall 未授信时明示「未检索」而非裸「未找到」（CLOSED）
 - #417 fix(tools): authority 接受中文星名并归一化为规范 id，修正 yuheng 错误示例（CLOSED）
 - #409 fix(platform): node-runtime 无真 node 时不抢占 PATH 首位（CLOSED）
+- #403 fix(server): 续跑不再把模型 id 的区域前缀误判为 provider 名（CLOSED）
