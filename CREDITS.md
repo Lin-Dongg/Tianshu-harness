@@ -423,3 +423,4 @@ contributions for this graph`；`including commit co-authors` 仅 GHES 版本成
 - #409 fix(platform): node-runtime 无真 node 时不抢占 PATH 首位（CLOSED）
 - #403 fix(server): 续跑不再把模型 id 的区域前缀误判为 provider 名（CLOSED）
 - #410 fix: git 全局参数绕过危险命令审批门；修复 semver prerelease 解析与 Bearer 大小写（CLOSED）
+- #406 fix(tui): 优化消息排队与插队引导机制（对齐 Codex CLI 排队契约）（CLOSED）
