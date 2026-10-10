@@ -410,3 +410,4 @@ contributions for this graph`；`including commit co-authors` 仅 GHES 版本成
 - #391 feat(updater): GitHub API 查版本支持国内代理回退与网络自动检测（CLOSED）
 - #396 fix(utils): isSafeFileName 补 Windows 保留设备名——CON/NUL/COM1-9 形态落 Win32 打开设备而非建文件（CLOSED）
 - #405 fix(tui): 修复提问卡与计划审批卡被截断（CLOSED）
+- #404 fix(shutdown): 退出/注销路径零 spawn taskkill——进程内直杀，消除关机硬错误框（#398）（CLOSED）
