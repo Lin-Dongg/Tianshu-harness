@@ -412,3 +412,4 @@ contributions for this graph`；`including commit co-authors` 仅 GHES 版本成
 - #405 fix(tui): 修复提问卡与计划审批卡被截断（CLOSED）
 - #404 fix(shutdown): 退出/注销路径零 spawn taskkill——进程内直杀，消除关机硬错误框（#398）（CLOSED）
 - #426 fix(memory): 补齐 13 种常见 token 形态的写入前 scrub 覆盖（CLOSED）
+- #425 fix(plan): plan slug 路径穿越——planFilePath 加 isSafeFileName fail-closed 门（CLOSED）
